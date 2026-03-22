@@ -1065,7 +1065,7 @@ def get_market_trend(force=False):
     now = time.time()
     if not force and now - _market_trend_cache["ts"] < _MARKET_TREND_TTL:
         c = _market_trend_cache
-        return c["down"] >= _MARKET_TREND_DOWN_LIMIT, c["down"], c["total"], c["names"]
+        return c.get("is_down", False), c["down"], c["total"], c["names"]
 
     try:
         _api_throttle()
@@ -1102,17 +1102,14 @@ def get_market_trend(force=False):
         tickers = [t for t in tickers if t["market"] not in _EXCLUDE_TICKERS]
         top = tickers[:_MARKET_TREND_TOP_N]
 
-        # ④ 하락 여부 (signed_change_rate < 0)
-        down_list = [
-            t["market"].replace("KRW-", "")
-            for t in top
-            if float(t.get("signed_change_rate", 0)) < 0
-        ]
+        # ④ 평균 등락률 계산
+        rates = [float(t.get("signed_change_rate", 0)) * 100 for t in top]
+        avg_rate = sum(rates) / len(rates) if rates else 0
         names = [t["market"].replace("KRW-", "") for t in top]
-        down  = len(down_list)
         total = len(top)
-
-        _market_trend_cache = {"ts": now, "down": down, "total": total, "names": names}
+        is_down = avg_rate < -1.0
+        _market_trend_cache = {"ts": now, "down": avg_rate, "total": total, "names": names, "is_down": is_down}
+        return is_down, avg_rate, total, names
         return down >= _MARKET_TREND_DOWN_LIMIT, down, total, names
 
     except Exception as e:
@@ -1121,11 +1118,11 @@ def get_market_trend(force=False):
         return False, c.get("down", 0), c.get("total", 0), c.get("names", [])
 
 
-def market_trend_msg(down, total, names):
+def market_trend_msg(avg_rate, total, names):
     """시장 하락 상태 메시지 조각 반환."""
-    status = "📉 하락세" if down >= _MARKET_TREND_DOWN_LIMIT else "📈 상승세"
+    status = "📉 하락세" if avg_rate < -1.0 else "📈 상승세"
     names_str = ", ".join(names)
-    return status + "  거래대금 상위 " + str(total) + "종목 중 " + str(down) + "개 하락 중\n  (" + names_str + ")"
+    return status + "  거래대금 상위 " + str(total) + "종목 평균 " + f"{avg_rate:+.2f}%" + "\n  (" + names_str + ")"
 
 
 # ============================================================
@@ -3590,8 +3587,8 @@ def handle_command(text):
 
             mode_str   = "공격적 모드 (RSI V-Turn + 눌림만)" if _aggressive_mode else "일반 모드 (전체 조건 필요)"
             _mkt_down_w, _mkt_d_w, _mkt_t_w, _mkt_names_w = get_market_trend()
-            if _mkt_down_w:
-                reasons.insert(0, "❌ 시장 하락세  " + market_trend_msg(_mkt_d_w, _mkt_t_w, _mkt_names_w))
+            _mkt_icon = "❌" if _mkt_down_w else "✅"
+            reasons.insert(0, _mkt_icon + " 시장동향  " + market_trend_msg(_mkt_d_w, _mkt_t_w, _mkt_names_w))
             pre_block  = "\n".join(reasons) if reasons else "✅ 시스템 운용 정상"
             cond_block = "\n".join(signal_lines)
             final_note = "⏳ 매수 신호 대기 중 (위 조건 충족 시 진입)" if not reasons else ""
