@@ -1048,21 +1048,47 @@ def log_change(category, detail):
 # ============================================================
 # [MARKET FILTER] 시장 전체 하락 감지
 # ============================================================
-_market_trend_cache      = {"ts": 0.0, "down": 0, "total": 0, "names": []}
-_MARKET_TREND_TTL        = 60.0   # 1분 캐시 (API 절약)
+_market_trend_cache      = {"ts": 0.0, "down": 0, "total": 0, "names": [], "is_down": False}
+_MARKET_TREND_TTL        = 300.0  # 5분 캐시
 _MARKET_TREND_TOP_N      = 5      # 거래대금 상위 N개
-_MARKET_TREND_DOWN_LIMIT = 3      # 이 개수 이상 하락이면 시장 하락으로 판정
+_MARKET_TREND_DOWN_LIMIT = 3      # 이 개수 이상 -1% 하락이면 시장 하락
+_MARKET_BLOCK_UNTIL      = 0.0    # 차단 쿨다운 종료 시각
+
+def _get_5m_change(market):
+    """5분봉 2개로 변화율 계산. 실패 시 0.0 반환."""
+    try:
+        _api_throttle()
+        res = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/5",
+            params={"market": market, "count": 2},
+            timeout=5
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if len(data) >= 2:
+                curr = float(data[0]["trade_price"])
+                prev = float(data[1]["trade_price"])
+                return (curr - prev) / prev * 100
+    except Exception as e:
+        cprint(f"[5분봉 조회 오류] {market}: {e}", Fore.YELLOW)
+    return 0.0
+
 
 def get_market_trend(force=False):
     """
-    업비트 KRW 마켓에서 거래대금 상위 5개 종목을 실시간으로 가져와
-    3개 이상 하락 중이면 (change_rate < 0) True 반환.
+    거래대금 상위 5개 종목의 5분 변화율 기준으로 시장 하락 판정.
+    - 3개 이상이 -1% 이하 하락 시 차단
+    - BTC 단독 -0.7% 이하 시 차단
+    - 차단 후 5분 쿨다운
 
-    반환: (is_down: bool, down_count: int, total: int, names: list[str])
-    캐시: 60초 (API 호출 최소화)
+    반환: (is_down: bool, avg_rate: float, total: int, names: list[str])
+    캐시: 5분
     """
-    global _market_trend_cache
+    global _market_trend_cache, _MARKET_BLOCK_UNTIL
     now = time.time()
+    if not force and now < _MARKET_BLOCK_UNTIL:
+        c = _market_trend_cache
+        return True, c.get("down", 0.0), c.get("total", 0), c.get("names", [])
     if not force and now - _market_trend_cache["ts"] < _MARKET_TREND_TTL:
         c = _market_trend_cache
         return c.get("is_down", False), c["down"], c["total"], c["names"]
@@ -1102,14 +1128,29 @@ def get_market_trend(force=False):
         tickers = [t for t in tickers if t["market"] not in _EXCLUDE_TICKERS]
         top = tickers[:_MARKET_TREND_TOP_N]
 
-        # ④ 평균 등락률 계산
-        rates = [float(t.get("signed_change_rate", 0)) * 100 for t in top]
-        avg_rate = sum(rates) / len(rates) if rates else 0
-        names = [t["market"].replace("KRW-", "") for t in top]
+        # ④ 5분 변화율 계산
+        names = [t["market"] for t in top]
+        changes = {m: _get_5m_change(m) for m in names}
+
+        # BTC 단독 필터 (top5에 없으면 별도 호출)
+        if "KRW-BTC" not in changes:
+            changes["KRW-BTC"] = _get_5m_change("KRW-BTC")
+        btc_drop = changes["KRW-BTC"]
+        btc_block = btc_drop <= -0.7
+
+        # 3개 이상 -1% 이하
+        down_count = sum(1 for v in changes.values() if v <= -1.0)
+        is_down = down_count >= _MARKET_TREND_DOWN_LIMIT or btc_block
+
+        # 차단 시 쿨다운 설정
+        if is_down:
+            _MARKET_BLOCK_UNTIL = now + 300
+
+        avg_rate = sum(changes.values()) / len(changes) if changes else 0
+        name_list = [m.replace("KRW-", "") for m in names]
         total = len(top)
-        is_down = avg_rate < -1.0
-        _market_trend_cache = {"ts": now, "down": avg_rate, "total": total, "names": names, "is_down": is_down}
-        return is_down, avg_rate, total, names
+        _market_trend_cache = {"ts": now, "down": avg_rate, "total": total, "names": name_list, "is_down": is_down}
+        return is_down, avg_rate, total, name_list
         return down >= _MARKET_TREND_DOWN_LIMIT, down, total, names
 
     except Exception as e:
