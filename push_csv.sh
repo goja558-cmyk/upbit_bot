@@ -7,8 +7,8 @@ BRANCH="main"
 
 cd "$REPO_DIR" || { echo "[$(date)] ERROR: 디렉토리 없음 $REPO_DIR"; exit 1; }
 
-# 모든 종목의 인디케이터 로그 추가 (새 종목 자동 포함)
-git add logs/*/indicator_log.csv 2>/dev/null
+# 모든 종목의 인디케이터 로그 강제 추가 (-f: .gitignore 무시)
+git add -f logs/*/indicator_log.csv 2>/dev/null
 
 # 변경 없으면 조용히 종료
 if git diff --cached --quiet; then
