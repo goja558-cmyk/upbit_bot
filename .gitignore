@@ -9,14 +9,17 @@
 *.bak*
 *.before_refactor
 
-# 로그
+# 로그 파일
 *.log
-logs/
 
-# CSV - 인디케이터 로그만 올리고 나머지 제외
-trade_log.csv
-coin_trade_log.csv
-KRW-TRUMP_only.csv
+# CSV - 루트의 CSV는 모두 제외
+*.csv
+
+# logs/ 폴더 - 인디케이터 로그만 허용
+logs/
+!logs/
+!logs/*/
+!logs/*/indicator_log.csv
 
 # 파이썬
 __pycache__/
