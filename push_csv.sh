@@ -1,5 +1,5 @@
 #!/bin/bash
-# CSV 자동 깃 푸시 스크립트
+# CSV 자동 깃 푸시 스크립트 (종목별 인디케이터 로그)
 # cron: 0 * * * * /home/trade/upbit_bot/push_csv.sh >> /home/trade/upbit_bot/push_csv.log 2>&1
 
 REPO_DIR="/home/trade/upbit_bot"
@@ -7,8 +7,8 @@ BRANCH="main"
 
 cd "$REPO_DIR" || { echo "[$(date)] ERROR: 디렉토리 없음 $REPO_DIR"; exit 1; }
 
-# 변경된 CSV 확인
-git add *.csv 2>/dev/null
+# 모든 종목의 인디케이터 로그 추가 (새 종목 자동 포함)
+git add logs/*/indicator_log.csv 2>/dev/null
 
 # 변경 없으면 조용히 종료
 if git diff --cached --quiet; then
@@ -16,7 +16,7 @@ if git diff --cached --quiet; then
 fi
 
 # 커밋 & 푸시
-git commit -m "auto: csv update $(date '+%Y-%m-%d %H:%M')"
+git commit -m "auto: indicator log update $(date '+%Y-%m-%d %H:%M')"
 
 if git push origin "$BRANCH"; then
     echo "[$(date)] OK: push 완료"
