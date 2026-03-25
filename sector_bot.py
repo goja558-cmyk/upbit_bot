@@ -1296,6 +1296,7 @@ def main():
     load_config()
     get_kis_token()
     _load_state()
+    _start_ipc_thread()   # 매니저 ↔ 섹터봇 IPC 수신 스레드 시작
 
     send_msg(
         f"🚀 섹터로테이션 봇 v{BOT_VERSION} 시작\n"
@@ -1322,9 +1323,11 @@ def main():
                 get_kis_token()
                 last_token_check = now_ts
 
-            # 텔레그램 폴링 (3초마다)
+            # 텔레그램 폴링 (3초마다) — 매니저 하위에서 실행 중이면 건너뜀
+            # (manager가 callback_query를 처리해야 하므로 sector_bot이 먼저 소비하면 안 됨)
             if now_ts - last_tg_poll >= 3:
-                poll_telegram()
+                if not _manager_is_running():
+                    poll_telegram()
                 last_tg_poll = now_ts
 
             # 일간 리셋
