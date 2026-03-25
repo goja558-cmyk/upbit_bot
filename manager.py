@@ -225,15 +225,15 @@ MGR_REPLY_KEYBOARD = {
 }
 
 MGR_REPLY_CMD_MAP = {
-    "📊 전체현황":  "/status",
+    "📊 전체현황":  "/s status",
     "🪙 코인봇":    "/bot_menu coin",
     "📊 섹터봇":    "/bot_menu stock",
-    "⏯ 시작/정지": "/start",
+    "⏯ 시작/정지": "/s start",
     "🔴 전체정지":  "/stop_all",
     "💰 예산":      "/budget_menu",
     "⚙️ 설정":      "/sys_menu",
     "📋 메뉴":      "/menu",
-    "🔍 왜안사?":   "/bot_cmd coin why",
+    "🔍 왜안사?":   "/s why",
 }
 
 
@@ -328,7 +328,7 @@ def update_mgr_pinned_message():
 # ── 텔레그램 인라인 키보드 ─────────────────────────────────────
 # 메인 메뉴: 조회/조작 2단 구조로 직관적 분리
 KB_MAIN = [
-    [{"text": "📊 전체현황",    "callback_data": "/status"},
+    [{"text": "📊 전체현황",    "callback_data": "/s status"},
      {"text": "📋 오늘요약",    "callback_data": "/summary"},
      {"text": "💼 예산배분",    "callback_data": "/alloc"}],
     [{"text": "🪙 코인봇 →",   "callback_data": "/bot_menu coin"},
@@ -341,7 +341,7 @@ KB_MAIN = [
 # 코인봇 메뉴: 상태조회 먼저, 조작 다음
 KB_COIN_BOT = [
     [{"text": "📊 상태조회",    "callback_data": "/bot_cmd coin status"},
-     {"text": "🔍 왜 안사/팔?", "callback_data": "/bot_cmd coin why"}],
+     {"text": "🔍 왜 안사/팔?", "callback_data": "/s why"}],
     [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd coin start"},
      {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd coin sell"},
      {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd coin aggressive"}],
@@ -913,6 +913,10 @@ def handle_command(text):
         return
     # Reply Keyboard 버튼 텍스트 → 명령어 변환
     text = MGR_REPLY_CMD_MAP.get(text.strip(), text)
+    print(f"[DEBUG] raw text: {repr(text)}")
+    print(f"[DEBUG] raw text: {repr(text)}")
+    print(f"[DEBUG] raw text: {repr(text)}")
+    print(f"[DEBUG] raw text: {repr(text)}")
     if not _cmd_semaphore.acquire(timeout=15):
         cprint(f"[명령 큐 타임아웃] {text[:30]}", Fore.YELLOW)
         return
@@ -924,7 +928,7 @@ def handle_command(text):
 
 def _handle_command_inner(text):
     """handle_command 실제 구현 — 직렬화 래퍼와 분리."""
-    cmd = text.strip().split()
+    text = text.strip().replace("\n","").replace("\r",""); cmd = text.split()
 
     # ── 메인 메뉴 ─────────────────────────────────────────────
     # /start 는 더 이상 매니저가 가로채지 않음 → 각 봇의 토글로 전달됨
@@ -1060,8 +1064,8 @@ def _handle_command_inner(text):
         import uuid as _uuid
         target  = cmd[1]
         sub_cmd = "/" + " ".join(cmd[2:])
-        slow_cmds = ("/analyze", "/why", "/status", "/balance", "/report", "/weekly", "/train")
-        no_kb_cmds = ("/aggressive", "/normal", "/paper", "/test", "/reload", "/start", "/stop", "/pause")
+        slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly", "/train")
+        no_kb_cmds = ("/aggressive", "/normal", "/paper", "/test", "/reload", "/s start", "/stop", "/pause")
         timeout = 20.0 if sub_cmd.startswith("/balance") else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
         use_kb = not any(sub_cmd.startswith(c) for c in no_kb_cmds)
         req_id  = _uuid.uuid4().hex[:8]
@@ -1161,19 +1165,19 @@ def _handle_command_inner(text):
         return
 
     # ── 현황 ─────────────────────────────────────────────────
-    elif cmd[0] in ("/status", "/상태"):
+    elif cmd[0] in ("/s status", "/상태"):
         # 매니저 전체현황 먼저
         _send_status()
         # 각 봇 상세 상태도 함께 조회
         workers_snap = list(_workers)
         for w in [w for w in workers_snap if isinstance(w, CoinWorker)]:
-            _send_ipc_cmd(w.market, "/status")
+            _send_ipc_cmd(w.market, "/s status")
             result = _read_ipc_result(w.market, timeout=5.0)
             if result:
                 clean = result.replace("[critical] ", "").replace("[normal] ", "").replace("[silent] ", "")
                 send_msg(clean, level="normal", source=f"🪙{w.market}", force=True, keyboard=KB_COIN_BOT)
         for w in [w for w in workers_snap if isinstance(w, StockWorker)]:
-            _send_ipc_cmd("stock", "/status")
+            _send_ipc_cmd("stock", "/s status")
             result = _read_ipc_result("stock", timeout=5.0)
             if result:
                 clean = result.replace("[critical] ", "").replace("[normal] ", "").replace("[silent] ", "")
@@ -1354,7 +1358,7 @@ def _handle_command_inner(text):
         if not targets_w: return
         ipc_id = targets_w[0].market if target=="coin" else "stock"
         import re as _re
-        _send_ipc_cmd(ipc_id, "/status")
+        _send_ipc_cmd(ipc_id, "/s status")
         result = _read_ipc_result(ipc_id, timeout=4.0) or ""
         cur_val = None
         m = _re.search(rf"(?:^|\s){_re.escape(key)}[=:\s]+([+-]?[\d.]+)", result, _re.M)
@@ -1688,8 +1692,8 @@ def _forward_to_bot(target, sub_cmd_str):
     """코인봇(/c) 또는 주식봇(/s) 으로 명령 전달."""
     import uuid as _uuid
     sub_cmd = "/" + sub_cmd_str
-    slow_cmds = ("/analyze", "/why", "/status", "/balance", "/report", "/weekly")
-    no_kb_cmds = ("/aggressive", "/normal", "/test", "/reload", "/start", "/stop", "/pause")
+    slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly")
+    no_kb_cmds = ("/aggressive", "/normal", "/test", "/reload", "/s start", "/stop", "/pause")
     timeout = 20.0 if sub_cmd.startswith("/balance") else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
     use_kb = not any(sub_cmd.startswith(c) for c in no_kb_cmds)
     req_id = _uuid.uuid4().hex[:8]
