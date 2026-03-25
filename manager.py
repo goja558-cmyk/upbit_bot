@@ -2045,14 +2045,15 @@ def do_update(force=False):
     _save_local_version(latest)
 
     if updated:
+        need_mgr_restart = "manager.py" in updated
         send_msg(
             f"✅ 업데이트 완료!\n"
             f"변경 파일: {', '.join(updated)}\n"
-            f"→ 3초 후 재시작...",
+            f"→ 3초 후 {'매니저 포함 전체' if need_mgr_restart else '봇'} 재시작...",
             level="critical", source="매니저", force=True
         )
         time.sleep(3)
-        do_restart()
+        do_restart("manager" if need_mgr_restart else "all")
 
 
 def do_restart(target="all"):
