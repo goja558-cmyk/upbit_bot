@@ -66,12 +66,11 @@ def cprint(text, color="", bright=False):
 # ============================================================
 # [1] 경로 설정
 # ============================================================
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))  # /home/trade/upbit_bot
-KIS_BOT_DIR = "/home/trade/kis_bot"                       # 주식봇 분리 경로
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+KIS_BOT_DIR = BASE_DIR                                    # sector_bot.py는 manager.py와 같은 폴더
 CFG_FILE    = os.path.join(BASE_DIR, "manager_cfg.yaml")
 SHARED_DIR  = os.path.join(BASE_DIR, "shared")
-os.makedirs(SHARED_DIR,  exist_ok=True)
-os.makedirs(KIS_BOT_DIR, exist_ok=True)
+os.makedirs(SHARED_DIR, exist_ok=True)
 
 MANAGER_STATE_FILE = os.path.join(SHARED_DIR, "manager_state.json")
 MANAGER_PID_FILE   = os.path.join(SHARED_DIR, "manager.pid")
@@ -763,7 +762,7 @@ class StockWorker:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
-                    cwd=KIS_BOT_DIR                            # /home/trade/kis_bot/
+                    cwd=BASE_DIR
                 )
                 for line in self.process.stdout:
                     line = line.rstrip()
