@@ -134,6 +134,212 @@ _BUCKET_CAP      = 4
 _BUCKET_RATE     = 3.0
 
 # ============================================================
+# [4-B] IPC: 매니저 ↔ 섹터봇 통신
+#   - upbit_bot.py 와 동일한 패턴 사용
+#   - cmd 파일명: shared/cmd_stock.json  (manager가 stock 워커에 쓰는 경로)
+#   - result 파일명: shared/result_stock.json
+# ============================================================
+_IPC_CMD_FILE    = None
+_IPC_RESULT_FILE = None
+_IPC_REQ_ID      = ""
+_is_ipc_context  = False
+_IPC_THREAD_STARTED = False
+_MANAGER_PID_FILE   = os.path.join(SHARED_DIR, "manager.pid")
+
+
+def _init_ipc():
+    global _IPC_CMD_FILE, _IPC_RESULT_FILE
+    _IPC_CMD_FILE    = os.path.join(SHARED_DIR, "cmd_stock.json")
+    _IPC_RESULT_FILE = os.path.join(SHARED_DIR, "result_stock.json")
+
+
+def _manager_is_running():
+    if not os.path.exists(_MANAGER_PID_FILE):
+        return False
+    try:
+        with open(_MANAGER_PID_FILE) as f:
+            pid = int(f.read().strip())
+        return os.path.exists(f"/proc/{pid}")
+    except Exception:
+        return False
+
+
+def _get_result_file():
+    if not _IPC_RESULT_FILE:
+        return None
+    if _IPC_REQ_ID:
+        base = _IPC_RESULT_FILE.replace(".json", "")
+        return f"{base}_{_IPC_REQ_ID}.json"
+    return _IPC_RESULT_FILE
+
+
+def _atomic_write_result(data: dict):
+    rf = _get_result_file()
+    if not rf:
+        return
+    tmp = rf + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, rf)
+    except Exception as e:
+        cprint(f"[IPC 쓰기 오류] {e}", Fore.YELLOW)
+
+
+def _write_ipc_result(result_text, keyboard=None):
+    """IPC 컨텍스트일 때만 결과 파일에 씀."""
+    if not _is_ipc_context:
+        return
+    _atomic_write_result({"result": result_text, "keyboard": keyboard, "ts": time.time()})
+
+
+def _start_ipc_thread():
+    """매니저 명령을 0.3초마다 폴링하는 스레드."""
+    global _IPC_THREAD_STARTED
+    if _IPC_THREAD_STARTED:
+        return
+    _IPC_THREAD_STARTED = True
+
+    def _ipc_loop():
+        while True:
+            try:
+                if _IPC_CMD_FILE and os.path.exists(_IPC_CMD_FILE):
+                    tmp = _IPC_CMD_FILE + ".read"
+                    try:
+                        os.rename(_IPC_CMD_FILE, tmp)
+                    except OSError:
+                        time.sleep(0.3)
+                        continue
+                    try:
+                        with open(tmp, encoding="utf-8") as f:
+                            data = json.load(f)
+                        os.remove(tmp)
+                        cmd_text = data.get("cmd", "")
+                        req_id   = data.get("req_id", "")
+                        if cmd_text:
+                            cprint(f"[IPC] {cmd_text}", Fore.CYAN)
+                            globals()["_IPC_REQ_ID"]     = req_id
+                            globals()["_is_ipc_context"] = True
+                            try:
+                                _handle_ipc_cmd(cmd_text)
+                            finally:
+                                globals()["_is_ipc_context"] = False
+                                globals()["_IPC_REQ_ID"]     = ""
+                    except Exception as e:
+                        cprint(f"[IPC 처리 오류] {e}", Fore.YELLOW)
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+            except Exception as e:
+                cprint(f"[IPC 루프 오류] {e}", Fore.YELLOW)
+            time.sleep(0.3)
+
+    t = threading.Thread(target=_ipc_loop, daemon=True, name="ipc-sector")
+    t.start()
+    cprint("✅ IPC 스레드 시작 (cmd_stock.json 감시 중)", Fore.CYAN)
+
+
+def _handle_ipc_cmd(text):
+    """매니저에서 받은 명령 처리 → _write_ipc_result로 응답."""
+    global kill_switch_active, mdd_active  # elif 안 중복 선언 금지 — 최상단에서 한 번만
+    cmd = text.strip().split()
+    if not cmd:
+        return
+    c = cmd[0].lower()
+
+    if c in ("/status", "/s", "/상태"):
+        _ipc_send_status()
+    elif c in ("/portfolio", "/p", "/포트"):
+        _ipc_send_portfolio()
+    elif c in ("/scores", "/score", "/스코어"):
+        _ipc_send_scores()
+    elif c in ("/rebalance", "/r", "/리밸"):
+        _write_ipc_result("[normal] 🔄 리밸런싱 시작 (백그라운드)...")
+        threading.Thread(target=_do_rebalance, daemon=True).start()
+    elif c in ("/kofr", "/대피"):
+        _write_ipc_result("[critical] 🚨 KOFR 대피 실행 중...")
+        threading.Thread(target=lambda: _evacuate_to_kofr("매니저 명령"), daemon=True).start()
+    elif c in ("/kill", "/킬"):
+        kill_switch_active = True
+        _save_state()
+        _write_ipc_result("[critical] 🔴 킬 스위치 ON")
+    elif c in ("/unkill", "/킬해제"):
+        kill_switch_active = False
+        _save_state()
+        _write_ipc_result("[normal] 🟢 킬 스위치 OFF — 매매 재개")
+    elif c in ("/start",):
+        kill_switch_active = False
+        mdd_active = False
+        _save_state()
+        _write_ipc_result("[normal] 🟢 섹터봇 재개됨")
+    elif c in ("/stop",):
+        kill_switch_active = True
+        _save_state()
+        _write_ipc_result("[critical] ⏹ 섹터봇 정지 (킬스위치 ON)")
+    elif c in ("/help", "/도움말"):
+        _write_ipc_result(
+            "[normal] 📋 섹터봇 명령어\n"
+            "/status    — 현재 상태\n"
+            "/portfolio — 보유 ETF\n"
+            "/scores    — 모멘텀 스코어\n"
+            "/rebalance — 수동 리밸런싱\n"
+            "/kofr      — KOFR 대피\n"
+            "/kill      — 킬 스위치 ON\n"
+            "/unkill    — 킬 스위치 OFF\n"
+            "/start     — 재개\n"
+            "/stop      — 정지"
+        )
+    else:
+        _write_ipc_result(f"[normal] ⚠️ 알 수 없는 명령: {text}")
+
+
+def _ipc_send_status():
+    val  = _calc_portfolio_value()
+    dd   = (val - peak_value) / peak_value * 100 if peak_value > 0 else 0.0
+    lines = [
+        f"📊 섹터봇 현황",
+        f"━━━━━━━━━━━━━━━━━━",
+        f"포트폴리오: {val:,.0f}원",
+        f"오늘 손익:  {daily_pnl_krw:+,}원",
+        f"MDD:        {dd:.1f}%",
+        f"킬스위치:   {'🔴 ON' if kill_switch_active else '🟢 OFF'}",
+        f"MDD모드:    {'🔴 ON' if mdd_active else '🟢 OFF'}",
+        f"보유:       {len(portfolio)}종목",
+    ]
+    for code, pos in portfolio.items():
+        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+        lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
+    _write_ipc_result("[normal] " + "\n".join(lines))
+
+
+def _ipc_send_portfolio():
+    if not portfolio:
+        _write_ipc_result("[normal] 보유 ETF 없음 (현금 대기)")
+        return
+    lines = ["📦 보유 ETF"]
+    for code, pos in portfolio.items():
+        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+        lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원 (편입:{pos['entry_date']})")
+    _write_ipc_result("[normal] " + "\n".join(lines))
+
+
+def _ipc_send_scores():
+    """IPC 컨텍스트에서 스코어 계산 — 동기 실행."""
+    scores = get_all_scores()
+    if not scores:
+        _write_ipc_result("[normal] ❌ 스코어 계산 실패 (데이터 없음)")
+        return
+    ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    lines  = ["📊 모멘텀 스코어 순위"]
+    for i, (code, data) in enumerate(ranked, 1):
+        name = ETF_UNIVERSE.get(code, {}).get("name", code)
+        cd   = " 🚫쿨다운" if is_cooldown(code) else ""
+        held = " 📦보유" if code in portfolio else ""
+        lines.append(f"{i}. {name}{cd}{held}: {data['score']:+.1f}%")
+    _write_ipc_result("[normal] " + "\n".join(lines))
+
+# ============================================================
 # [5] 설정 로드
 # ============================================================
 def load_config():
@@ -153,6 +359,7 @@ def load_config():
     initial_value   = float(_cfg.get("initial_value", TOTAL_BUDGET))
     peak_value      = float(_cfg.get("peak_value",    initial_value))
     daily_loss_base = TOTAL_BUDGET
+    _init_ipc()   # IPC 파일 경로 초기화
     cprint(f"✅ 설정 로드 — 예산:{TOTAL_BUDGET:,}원 / {'모의투자' if IS_MOCK else '실투자'}", Fore.GREEN)
 
 
