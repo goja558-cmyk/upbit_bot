@@ -31,7 +31,7 @@
     stock:
       enabled: true
       budget_ratio: 0.0         # 주식봇은 자체 예산 사용 (0이면 total에서 배분 안 함)
-      script: "kis_bot.py"      # 주식봇 파일명
+      script: "sector_bot.py"   # 주식봇 파일명
 
     alert:
       summary_interval: 3600    # 요약 알림 주기 (초, 기본 1시간)
@@ -66,10 +66,12 @@ def cprint(text, color="", bright=False):
 # ============================================================
 # [1] 경로 설정
 # ============================================================
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-CFG_FILE   = os.path.join(BASE_DIR, "manager_cfg.yaml")
-SHARED_DIR = os.path.join(BASE_DIR, "shared")
-os.makedirs(SHARED_DIR, exist_ok=True)
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))  # /home/trade/upbit_bot
+KIS_BOT_DIR = "/home/trade/kis_bot"                       # 주식봇 분리 경로
+CFG_FILE    = os.path.join(BASE_DIR, "manager_cfg.yaml")
+SHARED_DIR  = os.path.join(BASE_DIR, "shared")
+os.makedirs(SHARED_DIR,  exist_ok=True)
+os.makedirs(KIS_BOT_DIR, exist_ok=True)
 
 MANAGER_STATE_FILE = os.path.join(SHARED_DIR, "manager_state.json")
 MANAGER_PID_FILE   = os.path.join(SHARED_DIR, "manager.pid")
@@ -147,7 +149,7 @@ coins:
 
 stock:
   enabled: false
-  script: "kis_bot.py"       # 주식봇 파일명 (manager.py와 같은 폴더)
+  script: "sector_bot.py"       # 섹터봇 파일명 (manager.py와 같은 폴더)
 
 alert:
   summary_interval: 3600     # 요약 알림 주기 (초, 기본 1시간)
@@ -213,7 +215,7 @@ MGR_PINNED_INTERVAL     = 30
 
 MGR_REPLY_KEYBOARD = {
     "keyboard": [
-        ["📊 전체현황",  "🪙 코인봇",   "📈 주식봇"],
+        ["📊 전체현황",  "🪙 코인봇",   "📊 섹터봇"],
         ["⏯ 시작/정지", "🔴 전체정지", "💰 예산"],
         ["⚙️ 설정",      "📋 메뉴",     "🔍 왜안사?"],
     ],
@@ -225,7 +227,7 @@ MGR_REPLY_KEYBOARD = {
 MGR_REPLY_CMD_MAP = {
     "📊 전체현황":  "/status",
     "🪙 코인봇":    "/bot_menu coin",
-    "📈 주식봇":    "/bot_menu stock",
+    "📊 섹터봇":    "/bot_menu stock",
     "⏯ 시작/정지": "/start",
     "🔴 전체정지":  "/stop_all",
     "💰 예산":      "/budget_menu",
@@ -351,14 +353,15 @@ KB_COIN_BOT = [
     [{"text": "◀️ 메인",        "callback_data": "/menu"}],
 ]
 
-# 주식봇 메뉴
+# 섹터봇 메뉴
 KB_STOCK_BOT = [
     [{"text": "📊 상태조회",    "callback_data": "/bot_cmd stock status"},
-     {"text": "🔍 왜 안사/팔?", "callback_data": "/bot_cmd stock why"}],
+     {"text": "🔍 스코어순위",  "callback_data": "/bot_cmd stock scores"}],
     [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd stock start"},
-     {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd stock sell"},
-     {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd stock aggressive"}],
-    [{"text": "⚙️ 수치설정",    "callback_data": "/stock_set_menu"},
+     {"text": "🚨 KOFR대피",    "callback_data": "/bot_cmd stock kofr"},
+     {"text": "🔄 리밸런싱",    "callback_data": "/bot_cmd stock rebalance"}],
+    [{"text": "🔴 킬스위치",    "callback_data": "/bot_cmd stock kill"},
+     {"text": "🟢 킬해제",      "callback_data": "/bot_cmd stock unkill"},
      {"text": "◀️ 메인",        "callback_data": "/menu"}],
 ]
 
@@ -732,54 +735,68 @@ class CoinWorker:
 
 
 # ============================================================
-# [7] 주식 워커 (kis_bot.py subprocess)
+# [7] 섹터봇 워커 (sector_bot.py subprocess)
+#   - 기존 StockWorker(kis_bot.py) 를 SectorWorker(sector_bot.py) 로 교체
+#   - IPC 파일명(cmd_stock / result_stock)은 그대로 유지 → 명령 중계 코드 변경 없음
+#   - worker_id = "KIS-STOCK" 유지 → 손익 집계 코드 변경 없음
 # ============================================================
 class StockWorker:
-    """KIS 주식 봇을 별도 프로세스로 실행하는 워커."""
+    """섹터 로테이션 봇을 별도 프로세스로 실행하는 워커.
+    클래스명은 하위 호환을 위해 StockWorker 유지."""
 
-    def __init__(self, script="kis_bot.py"):
-        self.script      = os.path.join(BASE_DIR, script)
+    def __init__(self, script="sector_bot.py"):
+        self.script      = os.path.join(KIS_BOT_DIR, script)  # /home/trade/kis_bot/
         self.worker_id   = "KIS-STOCK"
         self.process     = None
         self.thread      = None
         self._stop_event = threading.Event()
+        self._last_lines = []
 
     def _run(self):
         register_worker(self.worker_id)
         while not self._stop_event.is_set():
             try:
-                cprint("▶ [주식봇] KIS 봇 시작", Fore.GREEN, bright=True)
+                cprint(f"▶ [주식봇] {self.script} 시작", Fore.GREEN, bright=True)
                 self.process = subprocess.Popen(
                     [sys.executable, self.script],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
-                    cwd=BASE_DIR
+                    cwd=KIS_BOT_DIR                            # /home/trade/kis_bot/
                 )
                 for line in self.process.stdout:
                     line = line.rstrip()
                     if line:
-                        print(f"  [주식봇] {line}")
+                        print(f"  [섹터봇] {line}")
+                        self._last_lines.append(line)
+                        if len(self._last_lines) > 20:
+                            self._last_lines.pop(0)
                         self._parse_log_line(line)
 
                 self.process.wait()
+                rc = self.process.returncode
                 if self._stop_event.is_set():
                     break
-                cprint("  [주식봇] 10초 후 재시작...", Fore.YELLOW)
+                if rc != 0:
+                    last_log = "\n".join(self._last_lines[-10:]) or "로그없음"
+                    send_msg(f"💀 [섹터봇] 크래시(rc:{rc})\n{last_log[-600:]}",
+                             level="critical", source="매니저", force=True)
+                cprint("  [섹터봇] 10초 후 재시작...", Fore.YELLOW)
                 time.sleep(10)
             except Exception as e:
-                cprint(f"[주식봇] 워커 오류: {e}", Fore.RED)
+                cprint(f"[섹터봇] 워커 오류: {e}", Fore.RED)
                 time.sleep(10)
 
     def _parse_log_line(self, line):
-        if any(k in line for k in ["매수 완료", "팔았어요", "손절", "익절", "트레일링"]):
+        # 섹터봇 매수/매도 키워드
+        if any(k in line for k in ["BUY]", "SELL]", "트레일링", "손절", "KOFR 대피", "리밸런싱 완료"]):
             if TRADE_ALERT:
-                send_msg(line, level="critical", source="📈주식봇")
-            if "팔았어요" in line or "매도" in line:
+                send_msg(line, level="critical", source="📊섹터봇")
+            if "SELL]" in line or "손절" in line or "트레일링" in line:
                 self._try_parse_pnl(line)
-        elif "오류" in line or "ERROR" in line:
-            send_msg(f"⚠️ {line[:100]}", level="normal", source="📈주식봇", force=True)
+        elif "오류" in line or "ERROR" in line or "❌" in line:
+            send_msg(f"⚠️ {line[:120]}", level="normal", source="📊섹터봇", force=True)
 
     def _try_parse_pnl(self, line):
         try:
@@ -792,14 +809,15 @@ class StockWorker:
             cprint(f"[손익 파싱 오류] {e}", Fore.YELLOW)
 
     def start(self):
-        self.thread = threading.Thread(target=self._run, daemon=True, name="worker-stock")
+        self.thread = threading.Thread(target=self._run, daemon=True, name="worker-sector")
         self.thread.start()
-        cprint("✅ [주식봇] 워커 스레드 시작", Fore.GREEN)
+        cprint("✅ [섹터봇] 워커 스레드 시작", Fore.GREEN)
 
     def stop(self):
         self._stop_event.set()
         if self.process and self.process.poll() is None:
             self.process.terminate()
+            cprint("⏹ [섹터봇] 정지 신호 전송", Fore.YELLOW)
 
 
 # ============================================================
@@ -993,14 +1011,14 @@ def _handle_command_inner(text):
         elif target == "stock":
             stock_workers = [w for w in workers_snap if isinstance(w, StockWorker)]
             if not stock_workers:
-                send_msg("📈 주식봇 실행 안 됨\nmanager_cfg.yaml에서 stock.enabled: true 설정하세요.",
+                send_msg("📊 섹터봇 실행 안 됨\nmanager_cfg.yaml에서 stock.enabled: true 설정하세요.",
                          level="normal", source="매니저", force=True, keyboard=KB_STOCK_BOT)
                 return
             with _state_lock:
                 st = dict(_worker_states).get("KIS-STOCK", {})
             holding = "📦보유중" if st.get("holding") else "⏳대기중"
             send_msg(
-                f"📈 주식봇\n"
+                f"📊 섹터봇\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"오늘 손익: {st.get('pnl_today',0):+,}원\n"
                 f"거래: {st.get('trades',0)}회 {holding}",
@@ -1853,7 +1871,7 @@ def check_heartbeat():
 VERSION_FILE = os.path.join(BASE_DIR, ".manager_version.json")
 
 # 관리 대상 파일 목록 (레포에서 다운로드할 파일들)
-MANAGED_FILES = ["upbit_bot.py", "kis_bot.py", "manager.py"]
+MANAGED_FILES = ["upbit_bot.py", "sector_bot.py", "manager.py"]
 
 
 def _gh_headers():
@@ -2082,7 +2100,7 @@ def do_restart(target="all"):
                         _workers.append(new_w)
             elif isinstance(w, StockWorker):
                 stock_cfg = _cfg.get("stock", {})
-                new_w = StockWorker(script=stock_cfg.get("script", "kis_bot.py"))
+                new_w = StockWorker(script=stock_cfg.get("script", "sector_bot.py"))
                 new_w.start()
                 _workers.append(new_w)
 
@@ -2130,11 +2148,11 @@ def run_manager():
     # 주식 워커 생성
     stock_cfg = _cfg.get("stock", {})
     if stock_cfg.get("enabled", False):
-        script = stock_cfg.get("script", "kis_bot.py")
-        if os.path.exists(os.path.join(BASE_DIR, script)):
+        script = stock_cfg.get("script", "sector_bot.py")
+        if os.path.exists(os.path.join(KIS_BOT_DIR, script)):
             _workers.append(StockWorker(script=script))
         else:
-            cprint(f"  [주식봇] {script} 파일 없음 — 건너뜀", Fore.YELLOW)
+            cprint(f"  [주식봇] {KIS_BOT_DIR}/{script} 파일 없음 — 건너뜀", Fore.YELLOW)
 
     if not _workers:
         cprint("❌ 실행할 봇이 없어요. manager_cfg.yaml에서 enabled: true 확인하세요.", Fore.RED)
