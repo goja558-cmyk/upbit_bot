@@ -67,8 +67,10 @@ ETF_UNIVERSE = {
     "091170": {"name": "TIGER 은행",           "max_weight": 0.15, "tag": "방어"},
     "227560": {"name": "TIGER 200 생활소비재", "max_weight": 0.15, "tag": "방어"},
 }
-KOFR_CODE  = "449170"
-KOFR_NAME  = "TIGER KOFR금리액티브"
+KOFR_CODE    = "449170"
+KOFR_NAME    = "TIGER KOFR금리액티브"
+INVERSE_CODE = "114800"
+INVERSE_NAME = "KODEX 인버스"
 
 # ============================================================
 # [3] 전략 파라미터
@@ -78,13 +80,31 @@ MOMENTUM_DAYS_LONG   = 60     # 장기 모멘텀 기간
 MOMENTUM_W_SHORT     = 0.5
 MOMENTUM_W_LONG      = 0.5
 TOP_N_ETF            = 2      # 상위 몇 개 편입 (10만원이라 2개)
-MIN_SCORE_THRESHOLD  = 0.0    # 이하면 KOFR 대피
+MIN_SCORE_THRESHOLD  = 0.0    # 이하면 대피
 
 TRAIL_START_PCT  = 6.0        # 트레일링 스탑 시작 수익률 (%)
 TRAIL_GAP_PCT    = 2.0        # 트레일링 스탑 간격 (%)
 STOP_LOSS_PCT    = -5.0       # 손절 (%)
 MAX_DD_PCT       = -10.0      # 계좌 MDD 한도 (%)
 KILL_DAY_LOSS    = -3.0       # 킬 스위치 일일 손실 (%)
+
+# ── 대피 단계 파라미터 ─────────────────────────────────────
+D1_KOSPI_PCT   = -1.5   # NORMAL→DEFENSE_1 코스피 조건
+D1_PF_PCT      = -2.0   # NORMAL→DEFENSE_1 포트폴리오 수익률 조건
+D2_KOSPI_PCT   = -2.0   # DEFENSE_1→2 코스피 조건
+D2_CONSEC      = 2      # DEFENSE_1→2 연속하락일 조건
+D3_KOSPI_PCT   = -3.0   # DEFENSE_2→3 코스피 조건
+D3_CONSEC      = 3      # DEFENSE_2→3 연속하락일 조건
+
+D_DOWN_3TO2    = -1.5   # DEFENSE_3→2 완화 조건 (코스피)
+D_DOWN_2TO1    = -0.5   # DEFENSE_2→1 완화 조건 (코스피)
+D_DOWN_1WAIT   =  0.0   # DEFENSE_1→복귀대기 조건 (코스피)
+
+INVERSE_TRAIL_GAP   = 2.0    # 인버스 트레일링 스탑 간격 (%)
+INVERSE_STOP_LOSS   = -4.0   # 인버스 손절 (%)
+
+RESUME_KOSPI_PCT    =  1.0   # 자동 복귀 코스피 조건
+RESUME_VOL_RATIO    =  1.2   # 자동 복귀 거래량 비율
 OVERHEAT_PCT     = 15.0       # 과열 필터: 5일 수익률 초과 시 매수 금지
 
 COOLDOWN_DAYS    = 14         # 섹터 쿨다운 일수
@@ -120,6 +140,15 @@ daily_pnl_krw    = 0
 daily_loss_base  = 100_000
 last_reset_day   = None
 trade_count      = 0
+
+# ── 대피 시스템 상태 ──────────────────────────────────────
+# defense_stage: NORMAL / DEFENSE_1 / DEFENSE_2 / DEFENSE_3 / DEFENSE_WAIT
+defense_stage        = "NORMAL"
+kospi_baseline       = 0.0      # 당일 장 시작 시 코스피 기준가
+_kospi_baseline_set  = False    # 당일 기준가 캡처 여부
+consecutive_down_days = 0       # 코스피 연속 하락일수
+inverse_peak_return  = 0.0      # 인버스 보유 중 고점 수익률
+defense_down_date    = None     # 단계 하향 조건 충족 시작일 (1일 유지 확인)
 _last_update_id  = 0
 _tg_lock         = threading.Lock()
 
@@ -258,8 +287,13 @@ def _handle_ipc_cmd(text):
         _write_ipc_result("[normal] 🔄 리밸런싱 시작 (백그라운드)...")
         threading.Thread(target=_do_rebalance, daemon=True).start()
     elif c in ("/kofr", "/대피"):
-        _write_ipc_result("[critical] 🚨 KOFR 대피 실행 중...")
-        threading.Thread(target=lambda: _evacuate_to_kofr("매니저 명령"), daemon=True).start()
+        _write_ipc_result("[critical] 🚨 DEFENSE_1 대피 실행 중...")
+        threading.Thread(target=lambda: _enter_defense_1("매니저 명령"), daemon=True).start()
+    elif c in ("/resume", "/복귀"):
+        _write_ipc_result("[normal] 🟢 복귀 실행 중...")
+        threading.Thread(target=_do_resume, daemon=True).start()
+    elif c in ("/defense", "/대피단계"):
+        _write_ipc_result(f"[normal] 🛡 현재 대피 단계: {defense_stage}")
     elif c in ("/kill", "/킬"):
         kill_switch_active = True
         _save_state()
@@ -284,7 +318,9 @@ def _handle_ipc_cmd(text):
             "/portfolio — 보유 ETF\n"
             "/scores    — 모멘텀 스코어\n"
             "/rebalance — 수동 리밸런싱\n"
-            "/kofr      — KOFR 대피\n"
+            "/kofr      — DEFENSE_1 대피\n"
+            "/resume    — 복귀 (ETF 재매수)\n"
+            "/defense   — 현재 대피 단계\n"
             "/kill      — 킬 스위치 ON\n"
             "/unkill    — 킬 스위치 OFF\n"
             "/start     — 재개\n"
@@ -305,6 +341,7 @@ def _ipc_send_status():
         f"MDD:        {dd:.1f}%",
         f"킬스위치:   {'🔴 ON' if kill_switch_active else '🟢 OFF'}",
         f"MDD모드:    {'🔴 ON' if mdd_active else '🟢 OFF'}",
+        f"대피단계:   {defense_stage}",
         f"보유:       {len(portfolio)}종목",
     ]
     for code, pos in portfolio.items():
@@ -525,8 +562,11 @@ def _handle_cmd(cmd):
         send_msg("🔄 수동 리밸런싱 실행 중...", force=True)
         threading.Thread(target=_do_rebalance, daemon=True).start()
     elif c in ("/kofr", "/대피"):
-        send_msg("🚨 KOFR 대피 실행 중...", force=True)
-        threading.Thread(target=lambda: _evacuate_to_kofr("수동 대피"), daemon=True).start()
+        send_msg("🚨 DEFENSE_1 대피 실행 중...", force=True)
+        threading.Thread(target=lambda: _enter_defense_1("수동 대피"), daemon=True).start()
+    elif c in ("/resume", "/복귀"):
+        send_msg("🟢 복귀 실행 중...", force=True)
+        threading.Thread(target=_do_resume, daemon=True).start()
     elif c in ("/kill", "/킬"):
         kill_switch_active = True
         _save_state()
@@ -542,7 +582,8 @@ def _handle_cmd(cmd):
             "/portfolio — 보유 ETF\n"
             "/scores    — 모멘텀 스코어 순위\n"
             "/rebalance — 수동 리밸런싱\n"
-            "/kofr      — 즉시 KOFR 대피\n"
+            "/kofr      — DEFENSE_1 대피\n"
+            "/resume    — 복귀 (ETF 재매수)\n"
             "/kill      — 킬 스위치 ON\n"
             "/unkill    — 킬 스위치 OFF",
             force=True,
@@ -635,21 +676,147 @@ def get_daily_chart(code, n_days=70):
     return closes_all[-n_days:]
 
 
-def get_kospi_change_pct():
-    """코스피 당일 등락률"""
+def get_kospi_info():
+    """코스피 현재 정보 반환: price, change_pct(전일대비), volume"""
     h = kis_headers("FHKUP03500100")
     if not h:
-        return 0.0
+        return {}
     res = api_call(
         "get",
         f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-price",
         headers=h,
         params={"fid_cond_mrkt_div_code": "U", "fid_input_iscd": "0001"},
     )
+    out = res.get("output", {})
     try:
-        return float(res.get("output", {}).get("bstp_nmix_prdy_ctrt", 0) or 0)
+        return {
+            "price":      float(out.get("bstp_nmix_prpr",      0) or 0),
+            "change_pct": float(out.get("bstp_nmix_prdy_ctrt", 0) or 0),
+            "volume":     int(out.get("acml_vol",              0) or 0),
+        }
     except:
+        return {}
+
+
+def get_kospi_change_pct():
+    """코스피 당일 등락률 (전일 종가 대비) — 기존 호환용"""
+    return get_kospi_info().get("change_pct", 0.0)
+
+
+def get_kospi_intraday_pct():
+    """코스피 장중 등락률 — 당일 기준가(kospi_baseline) 대비"""
+    if kospi_baseline <= 0:
         return 0.0
+    price = get_kospi_info().get("price", 0.0)
+    if price <= 0:
+        return 0.0
+    return (price - kospi_baseline) / kospi_baseline * 100
+
+
+def get_kospi_volume_ratio():
+    """코스피 현재 거래량 / 최근 5일 평균 거래량"""
+    h = kis_headers("FHKST03010100")
+    if not h:
+        return 1.0
+    today_str = date.today().strftime("%Y%m%d")
+    past_str  = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
+    res = api_call(
+        "get",
+        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
+        headers=h,
+        params={
+            "fid_cond_mrkt_div_code": "U",
+            "fid_input_iscd":         "0001",
+            "fid_input_date_1":       past_str,
+            "fid_input_date_2":       today_str,
+            "fid_period_div_code":    "D",
+        },
+    )
+    rows = res.get("output2", []) or res.get("output", [])
+    vols = []
+    for r in rows:
+        try:
+            v = int(r.get("acml_vol", 0) or 0)
+            if v > 0:
+                vols.append(v)
+        except:
+            pass
+    if len(vols) < 2:
+        return 1.0
+    avg5  = sum(vols[1:6]) / min(len(vols[1:6]), 5)  # 전일 포함 최대 5일
+    today = vols[0] if vols else avg5
+    return today / avg5 if avg5 > 0 else 1.0
+
+
+def get_kospi_ma5():
+    """코스피 5일 이동평균"""
+    h = kis_headers("FHKST03010100")
+    if not h:
+        return 0.0
+    today_str = date.today().strftime("%Y%m%d")
+    past_str  = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
+    res = api_call(
+        "get",
+        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
+        headers=h,
+        params={
+            "fid_cond_mrkt_div_code": "U",
+            "fid_input_iscd":         "0001",
+            "fid_input_date_1":       past_str,
+            "fid_input_date_2":       today_str,
+            "fid_period_div_code":    "D",
+        },
+    )
+    rows = res.get("output2", []) or res.get("output", [])
+    closes = []
+    for r in rows[1:6]:   # 오늘 제외, 최근 5거래일
+        try:
+            c = float(r.get("bstp_nmix_clpr", 0) or 0)
+            if c > 0:
+                closes.append(c)
+        except:
+            pass
+    return sum(closes) / len(closes) if closes else 0.0
+
+
+def update_consecutive_down_days():
+    """연속하락일수 갱신 — 매일 장 시작 전 1회 호출"""
+    global consecutive_down_days
+    h = kis_headers("FHKST03010100")
+    if not h:
+        return
+    today_str = date.today().strftime("%Y%m%d")
+    past_str  = (date.today() - timedelta(days=15)).strftime("%Y%m%d")
+    res = api_call(
+        "get",
+        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
+        headers=h,
+        params={
+            "fid_cond_mrkt_div_code": "U",
+            "fid_input_iscd":         "0001",
+            "fid_input_date_1":       past_str,
+            "fid_input_date_2":       today_str,
+            "fid_period_div_code":    "D",
+        },
+    )
+    rows = res.get("output2", []) or res.get("output", [])
+    closes = []
+    for r in rows[:8]:
+        try:
+            c = float(r.get("bstp_nmix_clpr", 0) or 0)
+            if c > 0:
+                closes.append(c)
+        except:
+            pass
+    # 최신→과거 순 → 연속 하락일 카운트
+    count = 0
+    for i in range(len(closes) - 1):
+        if closes[i] < closes[i + 1]:   # 오늘 < 전일 → 하락
+            count += 1
+        else:
+            break
+    consecutive_down_days = count
+    cprint(f"[연속하락일] {count}일", Fore.CYAN)
 
 
 def get_cash_balance():
@@ -818,16 +985,20 @@ def _log_trade(code, side, qty, price, pnl=0, reason=""):
 
 def _save_state():
     data = {
-        "portfolio":       portfolio,
-        "cooldown_list":   {k: str(v) for k, v in cooldown_list.items()},
-        "kill_switch":     kill_switch_active,
-        "mdd_active":      mdd_active,
-        "peak_value":      peak_value,
-        "initial_value":   initial_value,
-        "daily_pnl_krw":   daily_pnl_krw,
-        "trade_count":     trade_count,
-        "last_reset_day":  str(last_reset_day) if last_reset_day else None,
-        "ts":              time.time(),
+        "portfolio":            portfolio,
+        "cooldown_list":        {k: str(v) for k, v in cooldown_list.items()},
+        "kill_switch":          kill_switch_active,
+        "mdd_active":           mdd_active,
+        "peak_value":           peak_value,
+        "initial_value":        initial_value,
+        "daily_pnl_krw":        daily_pnl_krw,
+        "trade_count":          trade_count,
+        "last_reset_day":       str(last_reset_day) if last_reset_day else None,
+        "defense_stage":        defense_stage,
+        "consecutive_down_days": consecutive_down_days,
+        "inverse_peak_return":  inverse_peak_return,
+        "defense_down_date":    str(defense_down_date) if defense_down_date else None,
+        "ts":                   time.time(),
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -838,23 +1009,29 @@ def _save_state():
 def _load_state():
     global portfolio, cooldown_list, kill_switch_active, mdd_active
     global peak_value, initial_value, daily_pnl_krw, trade_count, last_reset_day
+    global defense_stage, consecutive_down_days, inverse_peak_return, defense_down_date
     if not os.path.exists(STATE_FILE):
         return
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        portfolio          = data.get("portfolio", {})
-        raw_cd             = data.get("cooldown_list", {})
-        cooldown_list      = {k: date.fromisoformat(v) for k, v in raw_cd.items()}
-        kill_switch_active = data.get("kill_switch", False)
-        mdd_active         = data.get("mdd_active", False)
-        peak_value         = float(data.get("peak_value",    initial_value))
-        initial_value      = float(data.get("initial_value", TOTAL_BUDGET))
-        daily_pnl_krw      = int(data.get("daily_pnl_krw",   0))
-        trade_count        = int(data.get("trade_count",      0))
+        portfolio             = data.get("portfolio", {})
+        raw_cd                = data.get("cooldown_list", {})
+        cooldown_list         = {k: date.fromisoformat(v) for k, v in raw_cd.items()}
+        kill_switch_active    = data.get("kill_switch", False)
+        mdd_active            = data.get("mdd_active", False)
+        peak_value            = float(data.get("peak_value",    initial_value))
+        initial_value         = float(data.get("initial_value", TOTAL_BUDGET))
+        daily_pnl_krw         = int(data.get("daily_pnl_krw",   0))
+        trade_count           = int(data.get("trade_count",      0))
         lrd = data.get("last_reset_day")
-        last_reset_day     = date.fromisoformat(lrd) if lrd else None
-        cprint(f"✅ 상태 복원 — 포트폴리오 {len(portfolio)}종목", Fore.GREEN)
+        last_reset_day        = date.fromisoformat(lrd) if lrd else None
+        defense_stage         = data.get("defense_stage", "NORMAL")
+        consecutive_down_days = int(data.get("consecutive_down_days", 0))
+        inverse_peak_return   = float(data.get("inverse_peak_return", 0.0))
+        ddd = data.get("defense_down_date")
+        defense_down_date     = date.fromisoformat(ddd) if ddd else None
+        cprint(f"✅ 상태 복원 — 포트폴리오 {len(portfolio)}종목 / 대피:{defense_stage}", Fore.GREEN)
     except Exception as e:
         cprint(f"[상태 복원 오류] {e}", Fore.YELLOW)
 
@@ -966,14 +1143,13 @@ def register_cooldown_if_needed(code, closes):
 
 
 # ============================================================
-# [13] 킬 스위치 / MDD
+# [13] 킬 스위치 / MDD / 대피 시스템
 # ============================================================
 def _calc_portfolio_value():
     total = 0
     for code, pos in portfolio.items():
         info  = get_price_info(code)
         raw   = info.get("price", 0) if info else 0
-        # 가격 0이면 평균단가로 대체 (API 오류·장 초반 미체결 등)
         price = raw if raw > 0 else pos["avg_price"]
         total += price * pos["qty"]
     return total
@@ -989,11 +1165,10 @@ def check_kill_switch():
         send_msg(
             f"🔴 킬 스위치 발동!\n"
             f"일일 손실: {daily_pnl_krw:+,}원 ({loss_pct:.1f}%)\n"
-            f"→ 전량 KOFR 대피\n"
-            f"→ /unkill 로 수동 재가동",
+            f"→ DEFENSE_1 진입",
             force=True,
         )
-        threading.Thread(target=lambda: _evacuate_to_kofr("킬 스위치"), daemon=True).start()
+        threading.Thread(target=lambda: _enter_defense_1("킬 스위치"), daemon=True).start()
     return kill_switch_active
 
 
@@ -1004,7 +1179,6 @@ def check_mdd():
     pf_val = _calc_portfolio_value()
     cash   = get_cash_balance()
     val    = pf_val + cash
-    # 포지션이 있는데 평가액이 예산의 20% 미만 → API 오류로 간주, 스킵
     if portfolio and val < TOTAL_BUDGET * 0.2:
         cprint(f"[MDD 스킵] 평가액 이상({val:,}원) — 데이터 오류 의심", Fore.YELLOW)
         return mdd_active
@@ -1014,27 +1188,281 @@ def check_mdd():
     if dd <= MAX_DD_PCT and not mdd_active:
         mdd_active = True
         send_msg(
-            f"🚨 MDD 한도 도달!\nMDD: {dd:.1f}%\n→ 전량 KOFR + 1주일 강제 휴식",
+            f"🚨 MDD 한도 도달! ({dd:.1f}%)\n→ DEFENSE_1 진입",
             force=True,
         )
-        threading.Thread(target=lambda: _evacuate_to_kofr("MDD 한도"), daemon=True).start()
+        threading.Thread(target=lambda: _enter_defense_1("MDD 한도"), daemon=True).start()
     return mdd_active
 
 
-def _evacuate_to_kofr(reason):
-    if not portfolio:
-        return
-    cprint(f"[KOFR 대피] {reason} — 전량 매도 시작", Fore.RED, bright=True)
+# ── 대피 공통 유틸 ─────────────────────────────────────────
+def _sell_all_etf(exclude=None):
+    """인버스 제외 전 종목 시장가 매도. exclude: 추가 제외 코드 집합."""
+    excluded = {INVERSE_CODE}
+    if exclude:
+        excluded.update(exclude)
+    failed = []
     for code in list(portfolio.keys()):
-        if code == KOFR_CODE:
+        if code in excluded:
             continue
-        sell_etf(code, reason=f"KOFR:{reason}")
-        time.sleep(1)
-    time.sleep(2)
-    cash = get_cash_balance()
-    if cash >= 5_000:
-        buy_etf(KOFR_CODE, int(cash * 0.95))
-    send_msg(f"✅ KOFR 대피 완료 ({reason})", force=True)
+        ok = sell_etf(code, reason="대피매도")
+        if not ok:
+            # 재시도 2회
+            for _ in range(2):
+                time.sleep(1)
+                ok = sell_etf(code, reason="대피매도_재시도")
+                if ok:
+                    break
+        if not ok:
+            failed.append(code)
+        else:
+            time.sleep(0.5)
+    if failed:
+        send_msg(f"⚠️ 매도 실패: {', '.join(failed)}\n수동 처리 필요", force=True)
+    return len(failed) == 0
+
+
+def _get_inverse_return_pct():
+    """인버스 ETF 현재 수익률(%)"""
+    pos = portfolio.get(INVERSE_CODE)
+    if not pos or pos["avg_price"] <= 0:
+        return 0.0
+    info  = get_price_info(INVERSE_CODE)
+    price = (info.get("price", 0) if info else 0) or pos["avg_price"]
+    return (price - pos["avg_price"]) / pos["avg_price"] * 100
+
+
+def _buy_inverse_to_ratio(target_ratio):
+    """전체 자산 대비 인버스 비중이 target_ratio가 되도록 추가 매수."""
+    cash      = get_cash_balance()
+    pf_val    = _calc_portfolio_value()
+    total_val = pf_val + cash
+    if total_val <= 0:
+        return
+    inv_pos   = portfolio.get(INVERSE_CODE)
+    inv_val   = 0.0
+    if inv_pos:
+        info    = get_price_info(INVERSE_CODE)
+        price   = (info.get("price", 0) if info else 0) or inv_pos["avg_price"]
+        inv_val = price * inv_pos["qty"]
+    target_val = total_val * target_ratio
+    need       = target_val - inv_val
+    if need < 5_000:
+        return
+    buy_etf(INVERSE_CODE, int(need))
+
+
+def _sell_inverse_by_ratio(sell_ratio):
+    """전체 자산의 sell_ratio 만큼 인버스 매도."""
+    pos = portfolio.get(INVERSE_CODE)
+    if not pos:
+        return
+    pf_val    = _calc_portfolio_value()
+    cash      = get_cash_balance()
+    total_val = pf_val + cash
+    info      = get_price_info(INVERSE_CODE)
+    price     = (info.get("price", 0) if info else 0) or pos["avg_price"]
+    if price <= 0:
+        return
+    sell_val = total_val * sell_ratio
+    qty      = min(int(sell_val / price), pos["qty"])
+    if qty > 0:
+        sell_etf(INVERSE_CODE, qty, reason="단계하향매도")
+
+
+def _set_defense_stage(new_stage, reason=""):
+    global defense_stage, inverse_peak_return, defense_down_date
+    old = defense_stage
+    defense_stage = new_stage
+    if new_stage == "NORMAL":
+        inverse_peak_return = 0.0
+        defense_down_date   = None
+    cprint(f"[대피단계] {old} → {new_stage}  {reason}", Fore.MAGENTA, bright=True)
+    send_msg(
+        f"🛡 대피 단계 변경\n{old} → {new_stage}\n{reason}",
+        force=True,
+    )
+    _save_state()
+
+
+# ── 단계 상향 ─────────────────────────────────────────────
+def _enter_defense_1(reason=""):
+    """NORMAL → DEFENSE_1: 전 ETF 매도 후 현금 100%"""
+    if defense_stage != "NORMAL":
+        return
+    send_msg(f"🚨 DEFENSE_1 진입 — {reason}\nETF 전량 매도 중...", force=True)
+    _sell_all_etf()
+    _set_defense_stage("DEFENSE_1", reason)
+
+
+def _enter_defense_2():
+    """DEFENSE_1 → DEFENSE_2: 현금 30% 인버스 매수"""
+    global inverse_peak_return
+    if defense_stage != "DEFENSE_1":
+        return
+    send_msg("📉 DEFENSE_2 진입 — 인버스 30% 매수", force=True)
+    inverse_peak_return = 0.0
+    _buy_inverse_to_ratio(0.30)
+    _set_defense_stage("DEFENSE_2")
+
+
+def _enter_defense_3():
+    """DEFENSE_2 → DEFENSE_3: 인버스 50%까지 확대"""
+    if defense_stage != "DEFENSE_2":
+        return
+    send_msg("📉 DEFENSE_3 진입 — 인버스 50%까지 확대", force=True)
+    _buy_inverse_to_ratio(0.50)
+    _set_defense_stage("DEFENSE_3")
+
+
+# ── 단계 하향 (루프마다 호출) ─────────────────────────────
+def _step_down_defense():
+    """단계 하향 — 1일 유지 확인 후 10%씩 단계적 매도"""
+    global defense_down_date
+    kospi_pct = get_kospi_intraday_pct()
+    today     = date.today()
+
+    if defense_stage == "DEFENSE_3":
+        if kospi_pct > D_DOWN_3TO2:
+            if defense_down_date is None:
+                defense_down_date = today
+            elif today > defense_down_date:        # 1일 유지 확인
+                inv_ratio = _current_inverse_ratio()
+                if inv_ratio > 0.40:
+                    _sell_inverse_by_ratio(0.10)
+                elif inv_ratio > 0.30:
+                    _sell_inverse_by_ratio(0.10)
+                else:
+                    _set_defense_stage("DEFENSE_2", "지수 회복")
+        else:
+            defense_down_date = None
+
+    elif defense_stage == "DEFENSE_2":
+        if kospi_pct > D_DOWN_2TO1:
+            if defense_down_date is None:
+                defense_down_date = today
+            elif today > defense_down_date:
+                inv_ratio = _current_inverse_ratio()
+                if inv_ratio > 0.20:
+                    _sell_inverse_by_ratio(0.10)
+                elif inv_ratio > 0.0:
+                    sell_etf(INVERSE_CODE, reason="단계하향완료")
+                else:
+                    _set_defense_stage("DEFENSE_1", "인버스 정리 완료")
+        else:
+            defense_down_date = None
+
+    elif defense_stage == "DEFENSE_1":
+        if kospi_pct > D_DOWN_1WAIT:
+            if defense_down_date is None:
+                defense_down_date = today
+            elif today > defense_down_date:
+                _set_defense_stage("DEFENSE_WAIT", "복귀 대기 시작")
+        else:
+            defense_down_date = None
+
+
+def _current_inverse_ratio():
+    """현재 인버스 비중 (0.0 ~ 1.0)"""
+    pos = portfolio.get(INVERSE_CODE)
+    if not pos:
+        return 0.0
+    info  = get_price_info(INVERSE_CODE)
+    price = (info.get("price", 0) if info else 0) or pos["avg_price"]
+    inv_val   = price * pos["qty"]
+    pf_val    = _calc_portfolio_value()
+    cash      = get_cash_balance()
+    total_val = pf_val + cash
+    return inv_val / total_val if total_val > 0 else 0.0
+
+
+# ── 인버스 익절 / 손절 (단계와 독립적으로 항상 체크) ────────
+def check_inverse_exit():
+    global inverse_peak_return
+    if INVERSE_CODE not in portfolio:
+        return
+    ret = _get_inverse_return_pct()
+    # 고점 갱신
+    if ret > inverse_peak_return:
+        inverse_peak_return = ret
+    # 트레일링 익절: 고점 > 0% AND 현재 <= 고점 - 2%
+    if inverse_peak_return > 0 and ret <= inverse_peak_return - INVERSE_TRAIL_GAP:
+        cprint(f"[인버스 익절] 고점:{inverse_peak_return:.1f}% 현재:{ret:.1f}%", Fore.CYAN)
+        send_msg(
+            f"💰 인버스 트레일링 익절\n고점:{inverse_peak_return:.1f}% / 현재:{ret:.1f}%",
+            force=True,
+        )
+        sell_etf(INVERSE_CODE, reason="인버스익절")
+        inverse_peak_return = 0.0
+        return
+    # 손절 -4%
+    if ret <= INVERSE_STOP_LOSS:
+        cprint(f"[인버스 손절] {ret:.1f}%", Fore.RED)
+        send_msg(f"🔴 인버스 손절 {ret:.1f}%", force=True)
+        sell_etf(INVERSE_CODE, reason="인버스손절")
+        inverse_peak_return = 0.0
+
+
+# ── 단계 상향 체크 (루프마다 호출) ──────────────────────────
+def check_defense_escalate():
+    """장중 단계 상향 조건 체크"""
+    kospi_pct = get_kospi_intraday_pct()
+    pf_val    = _calc_portfolio_value()
+    cash      = get_cash_balance()
+    total_val = pf_val + cash
+    pf_ret    = (total_val - initial_value) / initial_value * 100 if initial_value > 0 else 0.0
+
+    if defense_stage == "NORMAL":
+        if kospi_pct <= D1_KOSPI_PCT and pf_ret <= D1_PF_PCT:
+            threading.Thread(
+                target=lambda: _enter_defense_1(
+                    f"코스피{kospi_pct:.1f}% / 포트{pf_ret:.1f}%"
+                ), daemon=True
+            ).start()
+
+    elif defense_stage == "DEFENSE_1":
+        if kospi_pct <= D2_KOSPI_PCT and consecutive_down_days >= D2_CONSEC:
+            threading.Thread(target=_enter_defense_2, daemon=True).start()
+
+    elif defense_stage == "DEFENSE_2":
+        if kospi_pct <= D3_KOSPI_PCT and consecutive_down_days >= D3_CONSEC:
+            threading.Thread(target=_enter_defense_3, daemon=True).start()
+
+
+# ── 복귀 ────────────────────────────────────────────────────
+def check_defense_resume():
+    """자동 복귀 조건 체크 — DEFENSE_WAIT 상태에서만"""
+    if defense_stage != "DEFENSE_WAIT":
+        return
+    kospi_pct = get_kospi_intraday_pct()
+    if kospi_pct < RESUME_KOSPI_PCT:
+        return
+    vol_ratio = get_kospi_volume_ratio()
+    if vol_ratio < RESUME_VOL_RATIO:
+        return
+    ma5   = get_kospi_ma5()
+    price = get_kospi_info().get("price", 0.0)
+    if ma5 > 0 and price < ma5:
+        return
+    send_msg("🟢 자동 복귀 조건 충족 — ETF 재매수 시작", force=True)
+    _do_resume()
+
+
+def _do_resume():
+    global consecutive_down_days
+    """인버스 매도 + ETF 재매수 + NORMAL 전환"""
+    if INVERSE_CODE in portfolio:
+        sell_etf(INVERSE_CODE, reason="복귀매도")
+        time.sleep(2)
+    _set_defense_stage("NORMAL", "복귀 완료")
+    consecutive_down_days = 0
+    threading.Thread(target=_do_rebalance, daemon=True).start()
+
+
+# ── (하위 호환) KOFR 대피 명령을 DEFENSE_1로 연결 ───────────
+def _evacuate_to_kofr(reason):
+    """기존 코드 호환용 — DEFENSE_1 진입으로 처리"""
+    _enter_defense_1(reason)
 
 
 # ============================================================
@@ -1045,6 +1473,8 @@ def monitor_positions():
         return
 
     for code in list(portfolio.keys()):
+        if code == INVERSE_CODE:
+            continue   # 인버스는 check_inverse_exit() 에서 별도 관리
         pos  = portfolio.get(code)
         if not pos:
             continue
@@ -1084,8 +1514,12 @@ def monitor_positions():
 # [15] 리밸런싱
 # ============================================================
 def _do_rebalance():
-    """모멘텀 기반 ETF 교체"""
+    """모멘텀 기반 ETF 교체 — NORMAL 상태에서만 실행"""
     global portfolio
+
+    if defense_stage != "NORMAL":
+        send_msg(f"⚠️ 리밸런싱 불가 — 현재 {defense_stage} 상태\n/resume 으로 복귀 후 재시도", force=True)
+        return
 
     cprint("[리밸런싱] 모멘텀 스코어 계산 시작...", Fore.CYAN, bright=True)
     send_msg("🔄 리밸런싱 시작 — 스코어 계산 중 (약 30초)...", force=True)
@@ -1271,6 +1705,7 @@ def _send_status():
         f"오늘 손익: {daily_pnl_krw:+,}원",
         f"MDD:      {dd:.1f}%",
         f"킬스위치: {'🔴 ON' if kill_switch_active else '🟢 OFF'}",
+        f"대피단계: {defense_stage}",
         f"━━━━━━━━━━━━━━━━━━",
     ]
     for code, pos in portfolio.items():
@@ -1324,6 +1759,7 @@ def _send_scores():
 # [18] 메인 루프
 # ============================================================
 def main():
+    global kospi_baseline, _kospi_baseline_set
     cprint("=" * 52, Fore.CYAN, bright=True)
     cprint(f"  {BOT_NAME} v{BOT_VERSION} 시작", Fore.CYAN, bright=True)
     cprint("=" * 52, Fore.CYAN, bright=True)
@@ -1346,12 +1782,15 @@ def main():
     last_monitor      = 0.0
     last_tg_poll      = 0.0
     last_schedule     = 0.0
+    last_defense_chk  = 0.0
     last_token_check  = time.time()
     monitor_interval  = 120   # 포지션 모니터링 2분마다
+    defense_interval  = 300   # 대피 체크 5분마다
 
     while True:
         try:
             now_ts = time.time()
+            now_dt = datetime.now()
 
             # 토큰 갱신 (10시간마다)
             if now_ts - last_token_check > 36_000:
@@ -1368,6 +1807,19 @@ def main():
             # 일간 리셋
             _daily_reset()
 
+            # 장 시작 시 코스피 기준가 캡처 (9:10~9:15 사이 1회)
+            if now_dt.hour == 9 and 10 <= now_dt.minute <= 15:
+                if not _kospi_baseline_set:
+                    info = get_kospi_info()
+                    p    = info.get("price", 0.0)
+                    if p > 0:
+                        kospi_baseline      = p
+                        _kospi_baseline_set = True
+                        cprint(f"[코스피 기준가] {kospi_baseline:,.2f}", Fore.CYAN)
+                        update_consecutive_down_days()
+            elif now_dt.hour < 9:
+                _kospi_baseline_set = False   # 익일 초기화
+
             # 킬스위치 / MDD 체크 (1분마다)
             if now_ts - last_monitor >= 60:
                 if not kill_switch_active:
@@ -1379,9 +1831,19 @@ def main():
             if is_tradeable_time(for_buy=False):
                 # 포지션 모니터링 (2분마다)
                 if now_ts - last_monitor >= monitor_interval:
-                    if not kill_switch_active and not mdd_active:
+                    if not kill_switch_active and not mdd_active and defense_stage == "NORMAL":
                         monitor_positions()
+                    if defense_stage != "NORMAL":
+                        check_inverse_exit()
                     last_monitor = now_ts
+
+                # 대피 단계 체크 (5분마다)
+                if now_ts - last_defense_chk >= defense_interval:
+                    if not kill_switch_active:
+                        check_defense_escalate()
+                        _step_down_defense()
+                        check_defense_resume()
+                    last_defense_chk = now_ts
 
                 # 리밸런싱 스케줄 체크 (5분마다)
                 if now_ts - last_schedule >= 300:
