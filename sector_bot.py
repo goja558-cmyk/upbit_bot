@@ -972,7 +972,9 @@ def _calc_portfolio_value():
     total = 0
     for code, pos in portfolio.items():
         info  = get_price_info(code)
-        price = info.get("price", pos["avg_price"]) if info else pos["avg_price"]
+        raw   = info.get("price", 0) if info else 0
+        # 가격 0이면 평균단가로 대체 (API 오류·장 초반 미체결 등)
+        price = raw if raw > 0 else pos["avg_price"]
         total += price * pos["qty"]
     return total
 
@@ -999,7 +1001,13 @@ def check_mdd():
     global mdd_active, peak_value
     if peak_value <= 0:
         return mdd_active
-    val = _calc_portfolio_value() + get_cash_balance()
+    pf_val = _calc_portfolio_value()
+    cash   = get_cash_balance()
+    val    = pf_val + cash
+    # 포지션이 있는데 평가액이 예산의 20% 미만 → API 오류로 간주, 스킵
+    if portfolio and val < TOTAL_BUDGET * 0.2:
+        cprint(f"[MDD 스킵] 평가액 이상({val:,}원) — 데이터 오류 의심", Fore.YELLOW)
+        return mdd_active
     if val > peak_value:
         peak_value = val
     dd = (val - peak_value) / peak_value * 100
