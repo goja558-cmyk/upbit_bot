@@ -411,11 +411,16 @@ def api_call(method, url, **kwargs):
 
 
 def _prod_url():
+    """주문용 URL — 모의/실투자 구분"""
     return (
         "https://openapivts.koreainvestment.com:29443"
         if IS_MOCK
         else "https://openapi.koreainvestment.com:9443"
     )
+
+def _market_url():
+    """시세/차트 조회용 URL — 항상 실서버 (모의서버는 데이터 30일 제한)"""
+    return "https://openapi.koreainvestment.com:9443"
 
 
 def get_kis_token():
@@ -578,34 +583,56 @@ def get_price_info(code):
 
 
 def get_daily_chart(code, n_days=70):
-    """일봉 종가 리스트 반환 (오래된 것 먼저)"""
+    """일봉 종가 리스트 반환 (오래된 것 먼저)
+    KIS API는 1회 호출당 최대 30건 반환 → 필요한 만큼 반복 호출해서 합산."""
     h = kis_headers("FHKST01010400")
     if not h:
         return []
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-        headers=h,
-        params={
-            "fid_cond_mrkt_div_code": "J",
-            "fid_input_iscd":         code,
-            "fid_input_date_1":       (date.today() - timedelta(days=100)).strftime("%Y%m%d"),
-            "fid_input_date_2":       date.today().strftime("%Y%m%d"),
-            "fid_period_div_code":    "D",
-            "fid_org_adj_prc":        "0",
-        },
-    )
-    output = res.get("output2", []) or res.get("output", [])
-    closes = []
-    for row in output:
-        try:
-            c = int(row.get("stck_clpr", 0) or 0)
-            if c > 0:
-                closes.append(c)
-        except:
-            pass
-    closes.reverse()
-    return closes[-n_days:]
+
+    closes_all = []
+    date_to    = date.today()
+
+    for _ in range(5):   # 최대 5회 (30개×5 = 150일치)
+        date_from = date_to - timedelta(days=50)
+        res = api_call(
+            "get",
+            f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            headers=h,
+            params={
+                "fid_cond_mrkt_div_code": "J",
+                "fid_input_iscd":         code,
+                "fid_input_date_1":       date_from.strftime("%Y%m%d"),
+                "fid_input_date_2":       date_to.strftime("%Y%m%d"),
+                "fid_period_div_code":    "D",
+                "fid_org_adj_prc":        "0",
+            },
+        )
+        output = res.get("output2", []) or res.get("output", [])
+        if not output:
+            break
+
+        batch = []
+        for row in output:
+            try:
+                c = int(row.get("stck_clpr", 0) or 0)
+                if c > 0:
+                    batch.append(c)
+            except:
+                pass
+
+        if not batch:
+            break
+
+        # output2는 최신→과거 순서로 오므로 앞에 붙임
+        closes_all = batch + closes_all
+
+        if len(closes_all) >= n_days:
+            break
+
+        date_to = date_from - timedelta(days=1)
+        time.sleep(0.2)
+
+    return closes_all[-n_days:]
 
 
 def get_kospi_change_pct():
