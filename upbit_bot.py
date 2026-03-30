@@ -4786,6 +4786,12 @@ def run_bot():
                 _train_mode = _is_train
 
 
+                # [PATCH] 변동성 돌파 매수
+                vb_ok, vb_target = check_vbreak_signal(price)
+                if vb_ok and ma_ok and volr_ok and not bot['has_stock']:
+                    if do_buy(price, f'변동성돌파 목표:{vb_target:,.0f}'):
+                        highest_profit = 0.0
+                        bot['be_active'] = False
                 # 최종 매수 승인
                 if rsi_v_turn:
                     if _aggressive_mode:
