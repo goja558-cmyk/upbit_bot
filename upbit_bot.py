@@ -364,6 +364,47 @@ def load_config():
     cprint("✅ 설정 파일 로드 완료", Fore.GREEN)
 
 
+
+def _request_slot() -> bool:
+    mkt = MARKET_CODE.replace("KRW-", "").lower()
+    req_file = os.path.join(SHARED_DIR, f"slot_req_{mkt}.json")
+    res_file = os.path.join(SHARED_DIR, f"slot_res_{mkt}.json")
+    try:
+        if os.path.exists(res_file): os.remove(res_file)
+        tmp = req_file + ".tmp"
+        with open(tmp, "w") as f:
+            import json as _j
+            _j.dump({"market": MARKET_CODE, "ts": time.time()}, f)
+        os.replace(tmp, req_file)
+        os.chmod(req_file, 0o664)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if os.path.exists(res_file):
+                with open(res_file) as f:
+                    import json as _j; data = _j.load(f)
+                os.remove(res_file)
+                return bool(data.get("granted", False))
+            time.sleep(0.1)
+        return not _is_manager_running()
+    except Exception as e:
+        cprint(f"[슬롯 요청 오류] {e}", Fore.YELLOW)
+        return True
+
+def _release_slot():
+    if not _is_manager_running(): return
+    mkt = MARKET_CODE.replace("KRW-", "").lower()
+    rel_file = os.path.join(SHARED_DIR, f"slot_release_{mkt}.json")
+    try:
+        tmp = rel_file + ".tmp"
+        with open(tmp, "w") as f:
+            import json as _j
+            _j.dump({"market": MARKET_CODE, "ts": time.time()}, f)
+        os.replace(tmp, rel_file)
+        os.chmod(rel_file, 0o664)
+        cprint(f"[슬롯] {MARKET_CODE} 반납 신호 전송", Fore.CYAN)
+    except Exception as e:
+        cprint(f"[슬롯 반납 오류] {e}", Fore.YELLOW)
+
 def fetch_coin_stats(market):
     """실시간 데이터로 보수적 세팅 자동 계산."""
     try:
@@ -2278,6 +2319,9 @@ def do_buy(price, reason, retry=2):
     if bot["has_stock"]:
         cprint("[중복 주문 방지] 이미 보유 중입니다.", Fore.YELLOW)
         return False
+    if _is_manager_running() and not _request_slot():
+        cprint(f"[슬롯] {MARKET_CODE} 슬롯 거절 — 매수 건너뜀", Fore.YELLOW)
+        return False
     _order_pending = True
     try:
         order_krw = calc_order_qty_krw(price)
@@ -2559,6 +2603,7 @@ def do_sell(price, reason, retry=2):
             _last_sell_time = time.time()
             _buy_time       = 0.0
             save_state()
+            _release_slot()
             log_trade("SELL", actual_sell, filled, pnl_krw,
                       rsi=rsi, vwap=vwap, ma20=ma20, ma60=ma60, reason=reason,
                       pos_hold_time=pos_hold, buy_price_ref=bot.get("buy_price", 0))
