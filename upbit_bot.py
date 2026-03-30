@@ -4578,11 +4578,13 @@ def run_bot():
                 volume_history.append(volume)
             timed_prices.append((now_ts, price))
 
-            # VWAP 갱신
-            if volume:
-                _vwap_sum_pv += price * volume
-                _vwap_sum_v  += volume
-                _vwap_value   = _vwap_sum_pv / _vwap_sum_v if _vwap_sum_v > 0 else None
+            # VWAP 갱신 — 증분 거래량 사용 (24h 누적 아님)
+            if volume and len(volume_history) >= 2:
+                vol_delta = float(volume_history[-1]) - float(volume_history[-2])
+                if vol_delta > 0:
+                    _vwap_sum_pv += price * vol_delta
+                    _vwap_sum_v  += vol_delta
+                    _vwap_value   = _vwap_sum_pv / _vwap_sum_v if _vwap_sum_v > 0 else None
 
             _real_data_count += 1
 
