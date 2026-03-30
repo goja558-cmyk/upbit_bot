@@ -407,10 +407,7 @@ def do_buy(signal_strength):
         send_msg(f"❌ 매수 실패 — 잔고 부족 ({cash:,}원)")
         return False
 
-    tick  = get_tick_size(price)
-    order_price = price + tick
-
-    ok = send_order("BUY", qty, order_price)
+    ok = send_order("BUY", qty, 0)  # 시장가
     if ok:
         bot.update({
             "has_stock": True,
@@ -481,7 +478,8 @@ def nasdaq_check_loop():
             now = datetime.now()
             today = date.today()
             # 매일 06:00~06:10 사이에 체크 (나스닥 마감 후)
-            if now.hour == 6 and now.minute < 10:
+            # 06:00~08:59 사이 매 시 정각에 재시도 (네트워크 오류 대비)
+            if 6 <= now.hour <= 8 and now.minute < 10:
                 if _signal_checked_date != today:
                     signal, msg = check_nasdaq_signal()
                     _signal_checked_date = today
@@ -516,12 +514,26 @@ def trading_loop():
             if not ((9 <= h < 15) or (h == 15 and m < 25)):
                 time.sleep(10); continue
 
-            # ── 09:00~09:05 매수 ──────────────────────────────
-            if h == 9 and m < 5:
-                if _pending_signal > 0 and not bot["has_stock"]:
-                    cprint(f"[매수 시도] 신호:{_pending_signal} {_pending_signal_msg}", Fore.CYAN)
-                    do_buy(_pending_signal)
-                    _pending_signal = 0  # 오늘 신호 소진
+            # ── 09:00~09:50 변동성 돌파 매수 ─────────────────
+            if h == 9 and _pending_signal > 0 and not bot["has_stock"]:
+                price_now = get_price(STOCK_CODE)
+                if price_now > 0:
+                    if not hasattr(trading_loop, '_open_price') or \
+                       not hasattr(trading_loop, '_open_date') or \
+                       trading_loop._open_date != date.today():
+                        trading_loop._open_price = price_now
+                        trading_loop._open_date  = date.today()
+                        cprint(f'[인버스 시가] {price_now:,}원', Fore.CYAN)
+                    open_p    = trading_loop._open_price
+                    vb_target = open_p * 1.003
+                    if price_now >= vb_target or m < 3:
+                        cprint(f'[매수] 신호:{_pending_signal} 현재:{price_now:,} 목표:{vb_target:,.0f}', Fore.CYAN)
+                        do_buy(_pending_signal)
+                        _pending_signal = 0
+                    elif m >= 50:
+                        cprint(f'[매수 포기] 돌파 실패', Fore.YELLOW)
+                        send_msg(f'⚠️ 돌파 미확인 — 오늘 매수 포기\n목표: {vb_target:,.0f}원 / 현재: {price_now:,}원')
+                        _pending_signal = 0
 
             # ── 보유 중 TP/SL 체크 ──────────────────────────────
             if bot["has_stock"]:
@@ -613,7 +625,10 @@ def handle_command(text):
 
     elif c in ("/signal", "/신호"):
         signal, smsg = check_nasdaq_signal()
-        _write_ipc_result(f"[normal] 📡 나스닥 신호\n{smsg}")
+        _pending_signal     = signal
+        _pending_signal_msg = smsg
+        _signal_checked_date = date.today()
+        _write_ipc_result(f"[normal] 📡 나스닥 신호\n{smsg}\n{'✅ 오늘 매수 예정' if signal > 0 else '❌ 신호 없음'}")
         if _ap_args.config is None:
             send_msg(f"📡 나스닥 신호\n{smsg}")
 
@@ -720,6 +735,15 @@ def main():
     load_config()
     load_state()
 
+    # 시작 시 즉시 신호 체크
+    signal, msg = check_nasdaq_signal()
+    global _pending_signal, _pending_signal_msg, _signal_checked_date
+    _pending_signal     = signal
+    _pending_signal_msg = msg
+    _signal_checked_date = date.today()
+    cprint(f'[시작 시 신호 체크] {msg}', Fore.CYAN)
+    if signal > 0:
+        send_msg(f'📡 신호 감지!\n{msg}\n→ 09:00 매수 예정')
     # 나스닥 신호 체크 스레드
     threading.Thread(target=nasdaq_check_loop, daemon=True, name="nasdaq-check").start()
 

@@ -1408,6 +1408,57 @@ def get_ohlcv(market=None, count=200, unit="minutes", interval=1):
         cprint(f"[OHLCV 조회 오류] {e}", Fore.YELLOW)
     return []
 
+
+def get_day_ohlcv(market=None, count=2):
+    """일봉 OHLCV 조회 — 변동성 돌파용"""
+    if market is None:
+        market = MARKET_CODE
+    try:
+        _api_throttle()
+        res = requests.get(
+            f"{UPBIT_BASE}/candles/days",
+            params={"market": market, "count": count},
+            timeout=5
+        )
+        if res.status_code == 200:
+            data = sorted(res.json(), key=lambda x: x["candle_date_time_utc"])
+            return data
+    except Exception as e:
+        cprint(f"[일봉 조회 오류] {e}", Fore.YELLOW)
+    return []
+
+_vbreak_k     = 0.5
+_vbreak_cache = {}
+
+def calc_vbreak_target(market=None):
+    """변동성 돌파 목표가. 반환: 목표가 또는 None"""
+    from datetime import date as _date
+    if market is None:
+        market = MARKET_CODE
+    today = str(_date.today())
+    if market in _vbreak_cache:
+        cached_date, cached_target = _vbreak_cache[market]
+        if cached_date == today:
+            return cached_target
+    candles = get_day_ohlcv(market, count=3)
+    if len(candles) < 2:
+        return None
+    prev       = candles[-2]
+    today_c    = candles[-1]
+    prev_range = float(prev["high_price"]) - float(prev["low_price"])
+    today_open = float(today_c["opening_price"])
+    target     = today_open + prev_range * _vbreak_k
+    _vbreak_cache[market] = (today, target)
+    cprint(f"[변동성돌파] {market} 목표가:{target:,.2f}", Fore.CYAN)
+    return target
+
+def check_vbreak_signal(price, market=None):
+    """변동성 돌파 신호. 반환: (신호여부, 목표가)"""
+    target = calc_vbreak_target(market)
+    if target is None:
+        return False, 0
+    return price >= target, target
+
 # ============================================================
 # [7] 지표 계산
 # ============================================================
