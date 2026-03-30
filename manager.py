@@ -937,6 +937,52 @@ class TickerWatcher:
                 cprint(f"[TickerWatcher] 오류: {e}", Fore.YELLOW)
             time.sleep(10)
 
+
+# ============================================================
+# [6-C] 멀티코인 워커
+# ============================================================
+class MultiCoinWorker:
+    """multi_coin_bot.py 를 단일 프로세스로 실행."""
+
+    def __init__(self, script="multi_coin_bot.py"):
+        self.script    = os.path.join(BASE_DIR, script)
+        self.worker_id = "MULTI-COIN"
+        self.process   = None
+        self.thread    = None
+        self._stop_event = threading.Event()
+
+    def _run(self):
+        register_worker(self.worker_id)
+        cfg = os.path.join(BASE_DIR, "upbit_cfg.yaml")
+        while not self._stop_event.is_set():
+            try:
+                cprint("▶ [멀티코인봇] 시작", Fore.GREEN, bright=True)
+                self.process = subprocess.Popen(
+                    [sys.executable, self.script, "--config", cfg],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, cwd=BASE_DIR
+                )
+                for line in self.process.stdout:
+                    line = line.rstrip()
+                    if line: print(f"  [멀티코인] {line}")
+                self.process.wait()
+                if self._stop_event.is_set(): break
+                cprint("  [멀티코인봇] 10초 후 재시작...", Fore.YELLOW)
+                time.sleep(10)
+            except Exception as e:
+                cprint(f"[멀티코인봇] 오류: {e}", Fore.RED)
+                time.sleep(10)
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True, name="worker-multicoin")
+        self.thread.start()
+        cprint("✅ [멀티코인봇] 워커 시작", Fore.GREEN)
+
+    def stop(self):
+        self._stop_event.set()
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+
 class StockWorker:
     """섹터 로테이션 봇을 별도 프로세스로 실행하는 워커.
     클래스명은 하위 호환을 위해 StockWorker 유지."""
@@ -2795,6 +2841,15 @@ def run_manager():
             budget_ratio = coin_cfg.get("budget_ratio", 0.5),
         )
         _workers.append(w)
+
+    # 멀티코인 워커 생성
+    mc_cfg = _cfg.get("multicoin", {})
+    if mc_cfg.get("enabled", False):
+        script = mc_cfg.get("script", "multi_coin_bot.py")
+        if os.path.exists(os.path.join(BASE_DIR, script)):
+            _workers.append(MultiCoinWorker(script=script))
+        else:
+            cprint(f"  [멀티코인봇] {script} 없음 — 건너뜀", Fore.YELLOW)
 
     # 주식 워커 생성
     stock_cfg = _cfg.get("stock", {})
