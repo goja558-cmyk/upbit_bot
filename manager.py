@@ -2762,6 +2762,7 @@ def run_manager():
             budget_ratio = coin_cfg.get("budget_ratio", 0.5),
         )
         _workers.append(w)
+        _slot_add(coin_cfg["market"], w)
 
     # 주식 워커 생성
     stock_cfg = _cfg.get("stock", {})
