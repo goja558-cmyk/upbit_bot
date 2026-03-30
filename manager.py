@@ -1300,6 +1300,66 @@ def _handle_command_inner(text):
             )
 
     # ── 전체 예산 변경 ────────────────────────────────────────
+
+    # ── /autoselect ──────────────────────────────────────────
+    elif cmd[0] == "/autoselect":
+        sub = cmd[1].lower() if len(cmd) > 1 else "status"
+
+        if sub == "on":
+            count = int(cmd[2]) if len(cmd) > 2 else 20
+            if not _cfg.get("autoselect"):
+                _cfg["autoselect"] = {}
+            _cfg["autoselect"]["enabled"]        = True
+            _cfg["autoselect"]["count"]          = count
+            _cfg["autoselect"].setdefault("min_volume_krw", 5_000_000_000)
+            _cfg["autoselect"].setdefault("min_price",      100)
+            _save_cfg()
+            send_msg(
+                f"✅ 자동 선별 ON\n"
+                f"상위 {count}개 / 매일 08:55 자동 갱신\n"
+                f"→ /autoselect now 로 즉시 실행",
+                level="critical", source="매니저", force=True
+            )
+
+        elif sub == "off":
+            if _cfg.get("autoselect"):
+                _cfg["autoselect"]["enabled"] = False
+                _save_cfg()
+            send_msg("✅ 자동 선별 OFF", level="normal", source="매니저", force=True)
+
+        elif sub == "now":
+            threading.Thread(target=_autoselect_run, daemon=True).start()
+
+        elif sub == "status":
+            cfg_as = _cfg.get("autoselect", {})
+            enabled = cfg_as.get("enabled", False)
+            count   = cfg_as.get("count", 20)
+            min_vol = cfg_as.get("min_volume_krw", 5_000_000_000)
+            min_prc = cfg_as.get("min_price", 100)
+            coins   = _cfg.get("coins", [])
+            send_msg(
+                f"🔍 자동 선별 설정\n"
+                f"상태: {'🟢 ON' if enabled else '🔴 OFF'}\n"
+                f"상위: {count}개\n"
+                f"최소 거래대금: {min_vol//100_000_000}억원\n"
+                f"최소 가격: {min_prc}원\n"
+                f"현재 종목: {len(coins)}개\n"
+                f"─────────────────\n"
+                f"/autoselect on 20  — 켜기 (상위 20개)\n"
+                f"/autoselect off    — 끄기\n"
+                f"/autoselect now    — 즉시 실행",
+                level="normal", source="매니저", force=True
+            )
+        else:
+            send_msg(
+                "사용법:\n"
+                "/autoselect on 20  — 상위 20개 자동 선별\n"
+                "/autoselect off    — 끄기\n"
+                "/autoselect now    — 즉시 실행\n"
+                "/autoselect status — 설정 확인",
+                level="normal", source="매니저", force=True
+            )
+
     elif cmd[0] == "/budget":
         if len(cmd) < 2:
             send_msg(
@@ -2160,6 +2220,165 @@ def _ticker_feed_loop():
             pass
         _tt.sleep(1.0)
 
+
+# ============================================================
+# [PATCH] 거래대금 상위 종목 자동 선별
+# ============================================================
+import requests as _as_req
+
+# 자동 선별 제외 목록
+_AS_STABLECOINS = {
+    "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX",
+    "LUSD","USDN","FDUSD","PYUSD","USDD","AEUR","UST",
+}
+# 자동 선별 설정 (yaml에 저장됨)
+# autoselect:
+#   enabled: true
+#   count: 20
+#   min_volume_krw: 5000000000   # 거래대금 최소 50억
+#   min_price: 100               # 최소 가격 100원
+
+_autoselect_last_run = 0.0
+
+def _autoselect_fetch_top(count, min_volume_krw, min_price):
+    """업비트 전체 KRW 종목 조회 → 필터링 → 거래대금 상위 N개 반환"""
+    try:
+        # 1) 전체 마켓 목록
+        r = _as_req.get(
+            "https://api.upbit.com/v1/market/all",
+            params={"isDetails": "true"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None, "마켓 목록 조회 실패"
+
+        all_markets = r.json()
+        krw_markets = [
+            x for x in all_markets
+            if x["market"].startswith("KRW-")
+            and x["market"].replace("KRW-", "") not in _AS_STABLECOINS
+            and x.get("market_warning") != "CAUTION"
+        ]
+        market_codes = [x["market"] for x in krw_markets]
+
+        # 2) 시세 일괄 조회 (100개씩 나눠서)
+        tickers = []
+        for i in range(0, len(market_codes), 100):
+            chunk = market_codes[i:i+100]
+            r2 = _as_req.get(
+                "https://api.upbit.com/v1/ticker",
+                params={"markets": ",".join(chunk)},
+                timeout=10
+            )
+            if r2.status_code == 200:
+                tickers.extend(r2.json())
+            import time as _t; _t.sleep(0.2)
+
+        # 3) 필터링 + 정렬
+        filtered = [
+            t for t in tickers
+            if float(t.get("trade_price", 0)) >= min_price
+            and float(t.get("acc_trade_price_24h", 0)) >= min_volume_krw
+        ]
+        filtered.sort(key=lambda x: float(x.get("acc_trade_price_24h", 0)), reverse=True)
+
+        top = [t["market"] for t in filtered[:count]]
+        return top, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+def _autoselect_apply(markets, notify=True):
+    """선별된 종목 목록을 현재 coins 설정에 반영"""
+    global _workers
+
+    if not markets:
+        return
+
+    coins     = _cfg.get("coins", [])
+    current   = {c["market"] for c in coins}
+    new_set   = set(markets)
+
+    to_add    = new_set - current
+    to_remove = current - new_set
+    kept      = current & new_set
+
+    ratio = round(1.0 / len(markets), 4)
+
+    lines = [
+        f"🔄 자동 선별 결과 ({len(markets)}종목)",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"유지: {len(kept)}개  추가: {len(to_add)}개  제거: {len(to_remove)}개",
+        f"종목당 예산: {ratio*100:.1f}% = {calc_budget(ratio):,}원",
+        f"─────────────────",
+    ]
+
+    # 제거
+    for mkt in to_remove:
+        _coin_remove(mkt)
+        lines.append(f"➖ {mkt}")
+
+    # 비율 업데이트 (기존 종목)
+    for c in _cfg.get("coins", []):
+        if c["market"] in new_set:
+            c["budget_ratio"] = ratio
+    _save_cfg()
+
+    # 추가
+    for mkt in sorted(to_add):
+        coins2 = _cfg.get("coins", [])
+        coins2.append({"market": mkt, "budget_ratio": ratio, "enabled": True})
+        _cfg["coins"] = coins2
+        _save_cfg()
+        new_w = CoinWorker(market=mkt, budget_ratio=ratio)
+        new_w.start()
+        with _workers_lock:
+            _workers.append(new_w)
+        lines.append(f"➕ {mkt}")
+
+    if notify:
+        send_msg("\n".join(lines), level="critical", source="매니저", force=True)
+
+
+def _autoselect_run(notify=True):
+    """자동 선별 즉시 실행"""
+    global _autoselect_last_run
+    cfg_as  = _cfg.get("autoselect", {})
+    count   = int(cfg_as.get("count", 20))
+    min_vol = int(cfg_as.get("min_volume_krw", 5_000_000_000))
+    min_prc = int(cfg_as.get("min_price", 100))
+
+    send_msg(
+        f"🔍 자동 선별 중...\n상위 {count}개 / 최소거래대금 {min_vol//100_000_000}억 / 최소가격 {min_prc}원",
+        level="normal", source="매니저", force=True
+    )
+
+    markets, err = _autoselect_fetch_top(count, min_vol, min_prc)
+    if err:
+        send_msg(f"❌ 자동 선별 실패: {err}", level="critical", source="매니저", force=True)
+        return
+
+    _autoselect_apply(markets, notify=notify)
+    _autoselect_last_run = __import__("time").time()
+
+
+def _autoselect_loop():
+    """매일 08:55 자동 실행"""
+    import time as _t
+    from datetime import datetime as _dt
+    while True:
+        try:
+            cfg_as = _cfg.get("autoselect", {})
+            if cfg_as.get("enabled"):
+                now = _dt.now()
+                if now.hour == 8 and now.minute == 55:
+                    _autoselect_run(notify=True)
+                    _t.sleep(70)   # 중복 실행 방지
+        except Exception:
+            pass
+        _t.sleep(30)
+
 def run_manager():
     global _workers
 
@@ -2167,6 +2386,9 @@ def run_manager():
 
     # ── [PATCH] ticker_feed 스레드 ──────────────────────
     threading.Thread(target=_ticker_feed_loop, daemon=True, name="ticker-feed").start()
+    threading.Thread(target=_autoselect_loop, daemon=True, name="autoselect").start()
+    cprint("✅ [autoselect] 종목 자동 선별 루프 시작", Fore.CYAN)
+
     cprint("✅ [ticker_feed] 멀티 종목 시세 공유 시작", Fore.CYAN)
 
     cprint(f"  통합 매니저 v{MANAGER_VERSION} 시작", Fore.CYAN, bright=True)
