@@ -405,6 +405,22 @@ def _release_slot():
     except Exception as e:
         cprint(f"[슬롯 반납 오류] {e}", Fore.YELLOW)
 
+def _acquire_slot():
+    """매수 완료 후 슬롯 점유 신호 전송."""
+    if not _is_manager_running(): return
+    mkt = MARKET_CODE.replace("KRW-", "").lower()
+    acq_file = os.path.join(SHARED_DIR, f"slot_acquired_{mkt}.json")
+    try:
+        tmp = acq_file + ".tmp"
+        with open(tmp, "w") as f:
+            import json as _j
+            _j.dump({"market": MARKET_CODE, "ts": time.time()}, f)
+        os.replace(tmp, acq_file)
+        os.chmod(acq_file, 0o664)
+        cprint(f"[슬롯] {MARKET_CODE} 점유 신호 전송", Fore.CYAN)
+    except Exception as e:
+        cprint(f"[슬롯 점유 오류] {e}", Fore.YELLOW)
+
 def fetch_coin_stats(market):
     """실시간 데이터로 보수적 세팅 자동 계산."""
     try:
@@ -2347,7 +2363,8 @@ def do_buy(price, reason, retry=2):
                 "filled_qty": filled,
                 "be_active": False,
             })
-            save_state()  # 즉시 상태 저장 (재시작 시 중복 방지)
+            save_state()
+            _acquire_slot()  # 즉시 상태 저장 (재시작 시 중복 방지)
 
             if slippage > MAX_SLIPPAGE_PCT:
                 send_msg(

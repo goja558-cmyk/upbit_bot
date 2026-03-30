@@ -804,8 +804,10 @@ def _handle_slot_request(market):
     mkt = market.replace("KRW-", "").lower()
     res_file = os.path.join(SHARED_DIR, f"slot_res_{mkt}.json")
     try:
+        # 고정 등록 종목은 무조건 허가
+        cfg_markets = [c["market"] for c in _cfg.get("coins", []) if c.get("enabled")]
         with _slots_lock:
-            granted = len(_active_slots) < MAX_SLOTS or market in _active_slots
+            granted = (market in cfg_markets) or len(_active_slots) < MAX_SLOTS or market in _active_slots
         tmp = res_file + ".tmp"
         with open(tmp, "w") as f:
             import json as _j
@@ -828,6 +830,29 @@ def _poll_slot_requests():
                 os.remove(tmp)
                 market = data.get("market", "")
                 if market: _handle_slot_request(market)
+            except Exception: pass
+    except Exception: pass
+
+def _poll_slot_acquired():
+    """매수 완료 신호 처리 → 슬롯 점유 등록."""
+    try:
+        for fname in os.listdir(SHARED_DIR):
+            if not fname.startswith("slot_acquired_"): continue
+            acq_file = os.path.join(SHARED_DIR, fname)
+            try:
+                tmp = acq_file + ".read"
+                os.rename(acq_file, tmp)
+                with open(tmp) as f:
+                    import json as _j; data = _j.load(f)
+                os.remove(tmp)
+                market = data.get("market", "")
+                if market and not _slot_has(market):
+                    # 워커 찾아서 슬롯 등록
+                    with _workers_lock:
+                        w = next((w for w in _workers if isinstance(w, CoinWorker) and w.market == market), None)
+                    if w:
+                        _slot_add(market, w)
+                        cprint(f"[슬롯] {market} 매수 완료 → 슬롯 점유 ({_slot_count()}/{MAX_SLOTS})", Fore.CYAN)
             except Exception: pass
     except Exception: pass
 
@@ -2762,7 +2787,6 @@ def run_manager():
             budget_ratio = coin_cfg.get("budget_ratio", 0.5),
         )
         _workers.append(w)
-        _slot_add(coin_cfg["market"], w)
 
     # 주식 워커 생성
     stock_cfg = _cfg.get("stock", {})
@@ -2813,6 +2837,7 @@ def run_manager():
             _poll_ipc_results()
             _check_bot_health()
             _poll_slot_requests()
+            _poll_slot_acquired()
             _poll_slot_release()
             update_mgr_pinned_message()
             time.sleep(3)
