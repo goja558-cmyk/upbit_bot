@@ -912,10 +912,6 @@ def handle_command(text):
         return
     # Reply Keyboard 버튼 텍스트 → 명령어 변환
     text = MGR_REPLY_CMD_MAP.get(text.strip(), text)
-    print(f"[DEBUG] raw text: {repr(text)}")
-    print(f"[DEBUG] raw text: {repr(text)}")
-    print(f"[DEBUG] raw text: {repr(text)}")
-    print(f"[DEBUG] raw text: {repr(text)}")
     if not _cmd_semaphore.acquire(timeout=15):
         cprint(f"[명령 큐 타임아웃] {text[:30]}", Fore.YELLOW)
         return
