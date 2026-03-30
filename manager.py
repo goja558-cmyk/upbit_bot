@@ -990,6 +990,61 @@ def _handle_command_inner(text):
     # /start 는 더 이상 매니저가 가로채지 않음 → 각 봇의 토글로 전달됨
     # 매니저 메뉴는 /menu 또는 /도움말 로만 열림
     if cmd[0] in ("/menu", "/도움말", "/help"):
+        if cmd[0] == "/help":
+            send_msg(
+                "🤖 전체 명령어 목록\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📡 매니저\n"
+                "/status        — 전체 현황\n"
+                "/summary       — 오늘 요약\n"
+                "/update        — 코드 업데이트\n"
+                "/update force  — 강제 업데이트\n"
+                "/rollback      — 이전 버전 복원\n"
+                "/restart all   — 전체 재시작\n"
+                "/restart coin  — 코인봇 재시작\n"
+                "/restart stock — 주식봇 재시작\n"
+                "/budget 50000  — 코인봇 예산 변경\n"
+                "/version       — 버전 확인\n"
+                "─────────────────\n"
+                "🪙 코인봇 (/c 접두사)\n"
+                "/c status      — 상태 조회\n"
+                "/c why         — 왜 안사?\n"
+                "/c sell        — 즉시 매도\n"
+                "/c start / /c stop\n"
+                "/c set rsi_buy 35    — RSI 기준\n"
+                "/c set target 1.5   — 익절\n"
+                "/c set max_loss -0.9 — 손절\n"
+                "/c set drop 0.4     — 눌림\n"
+                "/c set cooldown 300 — 쿨다운\n"
+                "─────────────────\n"
+                "🪙 종목 관리\n"
+                "/coin list              — 감시 목록\n"
+                "/coin add KRW-SOL 0.3   — 종목 추가\n"
+                "/coin remove KRW-BTC    — 종목 제거\n"
+                "/autoselect on 2        — 자동 선별\n"
+                "/autoselect now / off\n"
+                "─────────────────\n"
+                "⚡ 단축 (코인+주식 동시)\n"
+                "/rsi 35  /tp 1.2  /sl -0.9  /drop 0.4  /be 0.3\n"
+                "─────────────────\n"
+                "📊 주식봇 (/s 접두사)\n"
+                "/s status  /s scores  /s why\n"
+                "/s rebalance  /s kofr  /s resume\n"
+                "/s kill  /s unkill\n"
+                "/s bollinger  /s investor\n"
+                "/s start  /s stop\n"
+                "─────────────────\n"
+                "📉 인버스봇 (/i 접두사)\n"
+                "/i status  /i signal  /i why\n"
+                "/i buy  /i buy force  /i sell\n"
+                "/i start  /i stop\n"
+                "/i set tp 1.5\n"
+                "/i set sl -1.0\n"
+                "/i set threshold -2.0\n"
+                "/i set budget 100000",
+                level="normal", source="매니저", force=True
+            )
+            return
         active = len([w for w in list(_workers) if w.thread and w.thread.is_alive()])
         send_msg(
             f"🤖 통합 매니저 v{MANAGER_VERSION}\n"
