@@ -2120,10 +2120,55 @@ def do_restart(target="all"):
 _workers = []
 
 
+
+# ============================================================
+# [PATCH] ticker_feed
+# ============================================================
+import requests as _ticker_req
+
+def _ticker_feed_loop():
+    """전체 코인 종목 시세를 1회 API 호출로 수집 → shared/ticker_{mkt}.json"""
+    import json as _tj, time as _tt, os as _to
+    while True:
+        try:
+            markets = [
+                w.market for w in list(_workers)
+                if isinstance(w, CoinWorker)
+            ]
+            if markets:
+                res = _ticker_req.get(
+                    "https://api.upbit.com/v1/ticker",
+                    params={"markets": ",".join(markets)},
+                    timeout=5
+                )
+                if res.status_code == 200:
+                    now_ts = _tt.time()
+                    for item in res.json():
+                        mkt  = item.get("market", "")
+                        code = mkt.replace("KRW-", "").lower()
+                        path = _to.path.join(SHARED_DIR, f"ticker_{code}.json")
+                        tmp  = path + ".tmp"
+                        with open(tmp, "w") as f:
+                            _tj.dump({
+                                "market": mkt,
+                                "price":  float(item.get("trade_price", 0)),
+                                "volume": float(item.get("acc_trade_volume_24h", 0)),
+                                "ts":     now_ts,
+                            }, f)
+                        _to.replace(tmp, path)
+        except Exception:
+            pass
+        _tt.sleep(1.0)
+
 def run_manager():
     global _workers
 
     cprint(f"\n{'='*50}", Fore.CYAN, bright=True)
+
+    # ── [PATCH] ticker_feed 스레드 ──────────────────────
+    threading.Thread(target=_ticker_feed_loop, daemon=True, name="ticker-feed").start()
+    cprint("✅ [ticker_feed] 멀티 종목 시세 공유 시작", Fore.CYAN)
+
     cprint(f"  통합 매니저 v{MANAGER_VERSION} 시작", Fore.CYAN, bright=True)
     cprint(f"{'='*50}\n", Fore.CYAN, bright=True)
 

@@ -1207,9 +1207,21 @@ def _api_throttle():
     _api_last_call = time.time()
 
 def get_price_and_volume(market=None):
-    """현재가 + 거래량 조회. 반환: (price, volume) 또는 (None, None)"""
+    """현재가 + 거래량 조회. 반환: (price, volume) 또는 (None, None)
+    [PATCH] 매니저 ticker 파일 우선 → 없거나 오래되면 직접 API fallback"""
+    import json as _gj, time as _gt
     if market is None:
         market = MARKET_CODE
+    try:
+        code = market.replace("KRW-", "").lower()
+        tick_path = os.path.join(SHARED_DIR, f"ticker_{code}.json")
+        if os.path.exists(tick_path):
+            with open(tick_path) as _f:
+                _td = _gj.load(_f)
+            if _gt.time() - _td.get("ts", 0) < 2.0:
+                return float(_td["price"]), float(_td["volume"])
+    except Exception:
+        pass
     try:
         _api_throttle()
         res = requests.get(
