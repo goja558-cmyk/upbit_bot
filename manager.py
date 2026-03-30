@@ -824,6 +824,62 @@ class StockWorker:
                 cprint("⏹ [섹터봇] 강제 종료(SIGKILL)", Fore.RED)
 
 
+
+# ============================================================
+# [PATCH] InverseWorker — 나스닥→인버스 봇
+# ============================================================
+class InverseWorker:
+    """inverse_bot.py 를 subprocess로 실행하는 워커."""
+
+    def __init__(self, script="inverse_bot.py"):
+        self.script     = os.path.join(BASE_DIR, script)
+        self.worker_id  = "INVERSE"
+        self.process    = None
+        self.thread     = None
+        self._stop_event = threading.Event()
+
+    def _run(self):
+        cfg_file = os.path.join(BASE_DIR, "inverse_cfg.yaml")
+        cmd = [sys.executable, self.script]
+        if os.path.exists(cfg_file):
+            cmd += ["--config", cfg_file]
+        while not self._stop_event.is_set():
+            try:
+                cprint(f"  [인버스봇] 시작: {' '.join(cmd)}", Fore.CYAN)
+                self.process = subprocess.Popen(
+                    cmd, cwd=BASE_DIR,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                for line in self.process.stdout:
+                    line = line.rstrip()
+                    if line:
+                        print(f"  [인버스봇] {line}")
+                self.process.wait()
+                if self._stop_event.is_set():
+                    break
+                cprint("  [인버스봇] 비정상 종료 — 5초 후 재시작", Fore.YELLOW)
+                time.sleep(5)
+            except Exception as e:
+                cprint(f"  [인버스봇 오류] {e}", Fore.RED)
+                time.sleep(5)
+
+    def start(self):
+        self._stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="worker-inverse")
+        self.thread.start()
+        cprint("✅ [인버스봇] 워커 시작", Fore.GREEN)
+
+    def stop(self):
+        self._stop_event.set()
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+                cprint("⏹ [인버스봇] 강제 종료", Fore.RED)
+
 # ============================================================
 # [8] 텔레그램 명령 처리
 # ============================================================
@@ -1041,6 +1097,48 @@ def _handle_command_inner(text):
         sub = " ".join(cmd[1:]) if len(cmd) > 1 else "status"
         _forward_to_bot("stock", sub)
         return
+
+    # ── /i → 인버스봇 명령 전달 ─────────────────────────────
+    elif cmd[0] == "/i":
+        sub = " ".join(cmd[1:]) if len(cmd) > 1 else "status"
+        import uuid as _uuid
+        req_id  = _uuid.uuid4().hex[:8]
+        sub_cmd = "/" + sub
+        cmd_file    = os.path.join(SHARED_DIR, "cmd_inverse.json")
+        result_file = os.path.join(SHARED_DIR, "result_inverse.json")
+        # 인버스봇 실행 중인지 확인
+        inv_workers = [w for w in list(_workers) if isinstance(w, InverseWorker)]
+        if not inv_workers:
+            send_msg("📉 인버스봇 실행 안 됨", level="normal", source="매니저", force=True)
+            return
+        # IPC 전송
+        try:
+            tmp = cmd_file + ".tmp"
+            import json as _json
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump({"cmd": sub_cmd, "req_id": req_id, "ts": time.time()}, f)
+            os.replace(tmp, cmd_file)
+        except Exception as e:
+            cprint(f"[인버스 IPC 오류] {e}", Fore.YELLOW)
+            return
+        # 결과 수신
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            if os.path.exists(result_file):
+                try:
+                    with open(result_file, encoding="utf-8") as f:
+                        data = _json.load(f)
+                    os.remove(result_file)
+                    result = data.get("result","")
+                    clean  = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+                    if clean.strip():
+                        send_msg(clean, level="normal", source="📉인버스", force=True)
+                    return
+                except Exception:
+                    pass
+            time.sleep(0.2)
+        send_msg("⚠️ 인버스봇 응답 없음", level="normal", source="매니저", force=True)
+
     elif cmd[0] == "/set" and len(cmd) >= 3:
         # /set 명령어 직접 입력 시 코인봇으로 중계
         import uuid as _uuid
@@ -1864,6 +1962,21 @@ def _poll_ipc_results():
         elif isinstance(w, StockWorker):
             targets.append(("result_stock.json", "📈주식봇", KB_STOCK_BOT))
 
+    # 인버스봇 result 폴링
+    inv_result = os.path.join(SHARED_DIR, "result_inverse.json")
+    if os.path.exists(inv_result):
+        try:
+            with _ipc_lock(inv_result):
+                with open(inv_result, encoding="utf-8") as f:
+                    _idata = json.load(f)
+                os.remove(inv_result)
+            _itext = _idata.get("result","")
+            _ilevel = "critical" if "[critical]" in _itext else "normal"
+            _iclean = _itext.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+            if _iclean.strip() and _ilevel != "silent":
+                send_msg(_iclean, level=_ilevel, source="📉인버스", force=True)
+        except Exception:
+            pass
     for filename, source, kb in targets:
         result_file = os.path.join(SHARED_DIR, filename)
         if not os.path.exists(result_file):
@@ -2438,6 +2551,15 @@ def run_manager():
         else:
             cprint(f"  [주식봇] {KIS_BOT_DIR}/{script} 파일 없음 — 건너뜀", Fore.YELLOW)
 
+    # 인버스봇 워커
+    inv_cfg_file = os.path.join(BASE_DIR, "inverse_cfg.yaml")
+    inv_script   = os.path.join(BASE_DIR, "inverse_bot.py")
+    if os.path.exists(inv_script):
+        inv_w = InverseWorker(script="inverse_bot.py")
+        _workers.append(inv_w)
+        cprint("✅ [인버스봇] 워커 등록", Fore.CYAN)
+    else:
+        cprint("⚠️ inverse_bot.py 없음 — 인버스봇 건너뜀", Fore.YELLOW)
     if not _workers:
         cprint("❌ 실행할 봇이 없어요. manager_cfg.yaml에서 enabled: true 확인하세요.", Fore.RED)
         sys.exit(1)
