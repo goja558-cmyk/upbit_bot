@@ -232,7 +232,7 @@ MGR_REPLY_CMD_MAP = {
     "💰 예산":      "/budget_menu",
     "⚙️ 설정":      "/sys_menu",
     "📋 메뉴":      "/menu",
-    "🔍 왜안사?":   "/s why",
+    "🔍 왜안사?":   "/c why",
 }
 
 
@@ -340,7 +340,7 @@ KB_MAIN = [
 # 코인봇 메뉴: 상태조회 먼저, 조작 다음
 KB_COIN_BOT = [
     [{"text": "📊 상태조회",    "callback_data": "/bot_cmd coin status"},
-     {"text": "🔍 왜 안사/팔?", "callback_data": "/s why"}],
+     {"text": "🔍 왜 안사/팔?", "callback_data": "/c why"}],
     [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd coin start"},
      {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd coin sell"},
      {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd coin aggressive"}],

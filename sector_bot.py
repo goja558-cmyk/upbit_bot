@@ -283,6 +283,31 @@ def _handle_ipc_cmd(text):
         _ipc_send_portfolio()
     elif c in ("/scores", "/score", "/스코어"):
         _ipc_send_scores()
+    elif c in ("/why", "/왜", "/왜안사"):
+        holdings = list(portfolio.keys())
+        stage = defense_stage
+        scores = get_all_scores() or {}
+        ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+        lines = [
+            f"🔍 왜 안사? [{stage}]",
+            f"━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if stage != "NORMAL":
+            lines.append(f"❌ 대피 단계: {stage} → 매수 불가")
+        elif kill_switch_active:
+            lines.append("❌ 킬스위치 ON → 매수 불가")
+        elif mdd_active:
+            lines.append("❌ MDD 한도 초과 → 매수 불가")
+        else:
+            lines.append("✅ 매수 가능 상태")
+        lines.append("─────────────────")
+        if ranked:
+            lines.append("📊 모멘텀 스코어 상위 3개:")
+            for i, (code, d) in enumerate(ranked[:3], 1):
+                held = "📦" if code in holdings else ""
+                cd = "⏸쿨다운" if code in cooldown_list else ""
+                lines.append(f"{i}. {ETF_UNIVERSE.get(code,{}).get('name',code)}{held}{cd}: {d['score']:+.1f}%")
+        _write_ipc_result("[normal] " + "\n".join(lines))
     elif c in ("/bollinger", "/bb"):
         holdings = list(portfolio.keys())
         msg = "\n\n".join(get_bollinger_status(c) for c in holdings) if holdings else "보유없음"
@@ -566,6 +591,25 @@ def _handle_cmd(cmd):
         _send_portfolio()
     elif c in ("/scores", "/score", "/스코어"):
         _send_scores()
+    elif c in ("/why", "/왜", "/왜안사"):
+        holdings = list(portfolio.keys())
+        stage = defense_stage
+        scores = get_all_scores() or {}
+        ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+        lines = [f"🔍 왜 안사? [{stage}]", "━━━━━━━━━━━━━━━━━━━━"]
+        if stage != "NORMAL":
+            lines.append(f"❌ 대피 단계: {stage}")
+        elif kill_switch_active:
+            lines.append("❌ 킬스위치 ON")
+        elif mdd_active:
+            lines.append("❌ MDD 한도 초과")
+        else:
+            lines.append("✅ 매수 가능 상태")
+        lines.append("─────────────────")
+        for i, (code, d) in enumerate(ranked[:3], 1):
+            held = "📦" if code in holdings else ""
+            lines.append(f"{i}. {ETF_UNIVERSE.get(code,{}).get('name',code)}{held}: {d['score']:+.1f}%")
+        send_msg("\n".join(lines), force=True)
     elif c in ("/bollinger", "/bb"):
         for code in (list(portfolio.keys()) or ["보유없음"]):
             send_msg(get_bollinger_status(code) if code != "보유없음" else "보유없음", force=True)
