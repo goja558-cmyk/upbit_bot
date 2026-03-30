@@ -336,11 +336,8 @@ def update_mgr_pinned_message():
                   message_id=_mgr_pinned_msg_id, text=_build_mgr_pinned_text())
     if not res.get("ok"):
         _mgr_pinned_msg_id = 0
-        global _watcher_started
-    if not _watcher_started:
-        _tw = TickerWatcher()
-        _tw.start()
-        _watcher_started = True
+        # TickerWatcher 비활성 (멀티코인봇으로 대체)
+    pass
 
     init_mgr_pinned_message()
 
