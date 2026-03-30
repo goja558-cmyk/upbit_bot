@@ -283,6 +283,14 @@ def _handle_ipc_cmd(text):
         _ipc_send_portfolio()
     elif c in ("/scores", "/score", "/스코어"):
         _ipc_send_scores()
+    elif c in ("/bollinger", "/bb"):
+        holdings = list(portfolio.keys())
+        msg = "\n\n".join(get_bollinger_status(c) for c in holdings) if holdings else "보유없음"
+        _write_ipc_result("[normal] " + msg)
+    elif c in ("/investor", "/수급"):
+        holdings = list(portfolio.keys())
+        msg = "\n\n".join(get_investor_status(c) for c in holdings) if holdings else "보유없음"
+        _write_ipc_result("[normal] " + msg)
     elif c in ("/rebalance", "/r", "/리밸"):
         _write_ipc_result("[normal] 🔄 리밸런싱 시작 (백그라운드)...")
         threading.Thread(target=_do_rebalance, daemon=True).start()
@@ -558,6 +566,12 @@ def _handle_cmd(cmd):
         _send_portfolio()
     elif c in ("/scores", "/score", "/스코어"):
         _send_scores()
+    elif c in ("/bollinger", "/bb"):
+        for code in (list(portfolio.keys()) or ["보유없음"]):
+            send_msg(get_bollinger_status(code) if code != "보유없음" else "보유없음", force=True)
+    elif c in ("/investor", "/수급"):
+        for code in (list(portfolio.keys()) or ["보유없음"]):
+            send_msg(get_investor_status(code) if code != "보유없음" else "보유없음", force=True)
     elif c in ("/rebalance", "/r", "/리밸"):
         send_msg("🔄 수동 리밸런싱 실행 중...", force=True)
         threading.Thread(target=_do_rebalance, daemon=True).start()
@@ -896,12 +910,187 @@ def send_order(code, side, qty, price=0):
     return False
 
 
+
+# ============================================================
+# [PATCH] 볼린저밴드 + 투자자 동향
+# ============================================================
+import numpy as _np_ind
+
+_BB_PERIOD = 20
+_BB_K      = 2.0
+_BB_NEAR   = 0.15   # %B 이하면 하단 근처
+_INV_FILTER = True
+_INV_CACHE  = {}
+_INV_TTL    = 300   # 5분 캐시
+
+
+def get_minute_candles(code, count=30):
+    """당일 분봉 조회 FHKST03010200"""
+    from datetime import datetime as _dt
+    h = kis_headers("FHKST03010200")
+    if not h:
+        return []
+    now_str = _dt.now().strftime("%H%M%S")
+    res = api_call(
+        "get",
+        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+        headers=h,
+        params={
+            "FID_ETC_CLS_CODE":       "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD":         code,
+            "FID_INPUT_HOUR_1":       now_str,
+            "FID_PW_DATA_INCU_YN":    "N",
+        }
+    )
+    try:
+        return [
+            {
+                "open":  int(c.get("stck_oprc", 0)),
+                "high":  int(c.get("stck_hgpr", 0)),
+                "low":   int(c.get("stck_lwpr", 0)),
+                "close": int(c.get("stck_prpr", 0)),
+            }
+            for c in (res.get("output2", []) or [])[:count]
+        ]
+    except Exception as e:
+        cprint(f"[분봉 오류] {e}", Fore.YELLOW)
+        return []
+
+
+def calc_bollinger(candles, period=20, k=2.0):
+    """볼린저밴드 계산. 반환: (upper, mid, lower, pct_b)"""
+    if len(candles) < period:
+        return None, None, None, None
+    closes = [c["close"] for c in candles[-period:]]
+    mid    = sum(closes) / period
+    std    = float(_np_ind.std(closes))
+    upper  = mid + k * std
+    lower  = mid - k * std
+    cur    = closes[-1]
+    pct_b  = (cur - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+    return upper, mid, lower, pct_b
+
+
+def is_hammer(c):
+    body = abs(c["close"] - c["open"])
+    if body == 0: return False
+    lw = min(c["open"], c["close"]) - c["low"]
+    uw = c["high"] - max(c["open"], c["close"])
+    return lw >= body * 2 and uw <= body * 0.3
+
+
+def is_bullish_reversal(candles):
+    if len(candles) < 2: return False
+    return candles[-2]["close"] < candles[-2]["open"] and candles[-1]["close"] > candles[-1]["open"]
+
+
+def check_bollinger_signal(code):
+    """볼린저 신호. 반환: (통과여부, 메시지)"""
+    candles = get_minute_candles(code, 30)
+    if not candles:
+        return True, "분봉없음(통과)"
+    _, _, _, pct_b = calc_bollinger(candles, _BB_PERIOD, _BB_K)
+    if pct_b is None:
+        return True, "계산불가(통과)"
+    msgs = [f"%B={pct_b:.2f}"]
+    # 상단 근처면 차단
+    if pct_b >= 0.85:
+        msgs.append("상단⚠️")
+        return False, " ".join(msgs)
+    if pct_b <= _BB_NEAR:
+        msgs.append("하단✅")
+    if is_hammer(candles[-1]):
+        msgs.append("망치✅")
+    if is_bullish_reversal(candles):
+        msgs.append("양봉전환✅")
+    return True, " ".join(msgs)
+
+
+def get_investor_flow(code):
+    """투자자 동향. 반환: (외국인_순매수, 기관_순매수)"""
+    import time as _t
+    now = _t.time()
+    cached = _INV_CACHE.get(code)
+    if cached and now - cached[0] < _INV_TTL:
+        return cached[1], cached[2]
+    h = kis_headers("FHKST01010900")
+    if not h:
+        return None, None
+    res = api_call(
+        "get",
+        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-investor",
+        headers=h,
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+    )
+    try:
+        out = res.get("output", [])
+        row = out[0] if isinstance(out, list) and out else out
+        frgn = int(row.get("frgn_ntby_qty", 0))
+        inst = int(row.get("orgn_ntby_qty", 0))
+        _INV_CACHE[code] = (now, frgn, inst)
+        return frgn, inst
+    except Exception as e:
+        cprint(f"[투자자 동향 오류] {e}", Fore.YELLOW)
+        return None, None
+
+
+def check_investor_signal(code):
+    """투자자 필터. 반환: (통과여부, 메시지)"""
+    if not _INV_FILTER:
+        return True, "필터OFF"
+    frgn, inst = get_investor_flow(code)
+    if frgn is None:
+        return True, "조회실패(통과)"
+    msg = f"외국인{frgn:+,} 기관{inst:+,}"
+    return (frgn > 0 or inst > 0), msg
+
+
+def get_bollinger_status(code):
+    candles = get_minute_candles(code, 30)
+    if not candles:
+        return f"{code}: 분봉 없음"
+    upper, mid, lower, pct_b = calc_bollinger(candles)
+    cur = candles[-1]["close"]
+    if pct_b is None:
+        return f"{code}: 계산 불가"
+    return (
+        f"📊 {code} 볼린저\n"
+        f"현재가: {cur:,}원\n"
+        f"상단: {upper:,.0f}  중간: {mid:,.0f}  하단: {lower:,.0f}\n"
+        f"%B: {pct_b:.2f}  망치: {'✅' if candles and is_hammer(candles[-1]) else '❌'}"
+        f"  양봉전환: {'✅' if is_bullish_reversal(candles) else '❌'}"
+    )
+
+
+def get_investor_status(code):
+    frgn, inst = get_investor_flow(code)
+    if frgn is None:
+        return f"{code}: 조회 실패"
+    return (
+        f"👥 {code} 수급\n"
+        f"외국인: {frgn:+,}주 {'✅' if frgn > 0 else '❌'}\n"
+        f"기관:   {inst:+,}주 {'✅' if inst > 0 else '❌'}\n"
+        f"신호: {'✅통과' if (frgn > 0 or inst > 0) else '❌차단'}"
+    )
+
 def buy_etf(code, budget_krw):
     """ETF 매수 — 예산 내 최대 수량"""
     info = get_price_info(code)
     if not info or info["price"] <= 0:
         cprint(f"[매수 실패] {code} 가격 조회 실패", Fore.YELLOW)
         return 0
+    # ── [PATCH] 볼린저 + 투자자 필터 ──────────────────
+    bb_ok,  bb_msg  = check_bollinger_signal(code)
+    inv_ok, inv_msg = check_investor_signal(code)
+    cprint(f"[매수필터] {code} BB:{bb_msg} 수급:{inv_msg}", Fore.CYAN)
+    if not bb_ok:
+        send_msg(f"⚠️ {code} 매수차단 — {bb_msg}", force=True)
+        return 0
+    if not inv_ok:
+        send_msg(f"⚠️ {code} 수급차단 — {inv_msg}", force=True)
+        return 0
+    # ────────────────────────────────────────────────────
     price = info.get("ask") or info["price"]
     qty   = int(budget_krw / price)
     if qty <= 0:
