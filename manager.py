@@ -817,6 +817,11 @@ class StockWorker:
         if self.process and self.process.poll() is None:
             self.process.terminate()
             cprint("⏹ [섹터봇] 정지 신호 전송", Fore.YELLOW)
+            try:
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+                cprint("⏹ [섹터봇] 강제 종료(SIGKILL)", Fore.RED)
 
 
 # ============================================================
