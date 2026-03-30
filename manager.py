@@ -1765,13 +1765,25 @@ def _forward_to_bot(target, sub_cmd_str):
             return
         for w in coin_workers:
             _send_ipc_cmd(w.market, sub_cmd, req_id=req_id)
+        results = []
         for w in coin_workers:
             result = _read_ipc_result(w.market, timeout=timeout, req_id=req_id)
             if result:
                 clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
                 if clean.strip():
+                    results.append((w.market.replace('KRW-',''), clean.strip()))
+        if results:
+            if sub_cmd == "/why" and len(results) > 1:
+                # /why 는 전체 합쳐서 한 메시지로
+                merged = "\n─────────────────\n".join(
+                    f"🪙{mkt}\n{txt}" for mkt, txt in results
+                )
+                send_msg(merged, level="normal", source="🪙코인봇",
+                         force=True, keyboard=KB_COIN_BOT if use_kb else None)
+            else:
+                for mkt, clean in results:
                     send_msg(clean, level="normal",
-                             source=f"🪙{w.market.replace('KRW-','')}",
+                             source=f"🪙{mkt}",
                              force=True, keyboard=KB_COIN_BOT if use_kb else None)
     elif target == "stock":
         stock_workers = [w for w in workers_snap if isinstance(w, StockWorker)]
