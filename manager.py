@@ -1099,7 +1099,7 @@ def _handle_command_inner(text):
         return
 
     # ── /i → 인버스봇 명령 전달 ─────────────────────────────
-    elif cmd[0] == "/i":
+    elif cmd[0].lower() == "/i":
         sub = " ".join(cmd[1:]) if len(cmd) > 1 else "status"
         import uuid as _uuid
         req_id  = _uuid.uuid4().hex[:8]
