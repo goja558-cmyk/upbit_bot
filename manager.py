@@ -219,7 +219,7 @@ def send_msg(text, level="normal", source="매니저", force=False, keyboard=Non
 # ── Reply Keyboard & 상단 고정 메시지 ────────────────────────
 _mgr_pinned_msg_id      = 0
 _mgr_pinned_last_update = 0.0
-MGR_PINNED_INTERVAL     = 30
+MGR_PINNED_INTERVAL     = 86400  # 사실상 비활성 — 변동 시 수동 호출로만 업데이트
 
 MGR_REPLY_KEYBOARD = {
     "keyboard": [
@@ -317,6 +317,12 @@ def init_mgr_pinned_message():
                 message_id=msg_id, disable_notification=True)
         cprint(f"✅ 매니저 고정 메시지 설정 (msg_id={msg_id})", Fore.GREEN)
 
+
+def notify_pinned_update():
+    """상태 변동 시 호출 — 고정 메시지 즉시 갱신."""
+    global _mgr_pinned_last_update
+    _mgr_pinned_last_update = 0.0  # 강제 갱신 트리거
+    update_mgr_pinned_message()
 
 def update_mgr_pinned_message():
     global _mgr_pinned_msg_id, _mgr_pinned_last_update
@@ -733,6 +739,7 @@ class CoinWorker:
             if m:
                 pnl = int(m.group(1).replace(",", ""))
                 report_trade(self.worker_id, pnl)
+                notify_pinned_update()
         except Exception as e:
             cprint(f"[손익 파싱 오류] {e}", Fore.YELLOW)
 
@@ -995,6 +1002,7 @@ class StockWorker:
             if m:
                 pnl = int(m.group(1).replace(",", ""))
                 report_trade(self.worker_id, pnl)
+                notify_pinned_update()
         except Exception as e:
             cprint(f"[손익 파싱 오류] {e}", Fore.YELLOW)
 
