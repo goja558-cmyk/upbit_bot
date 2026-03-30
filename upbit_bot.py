@@ -3048,6 +3048,10 @@ def _start_ipc_thread():
 
 
 def poll_telegram():
+    # [PATCH] 매니저 하위 프로세스(IPC 모드)면 폴링 스킵
+    # 매니저가 텔레그램 폴링을 전담하고 IPC로 명령 전달
+    if _ap_args.config is not None:
+        return
     """단독 실행 시 텔레그램 직접 폴링.
     매니저 실행 중이면 건너뜀 (IPC는 _start_ipc_thread가 담당)."""
     global _last_direct_tg_poll, _direct_tg_update_id
