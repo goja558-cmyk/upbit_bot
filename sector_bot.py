@@ -899,7 +899,8 @@ def get_cash_balance():
         },
     )
     try:
-        return int(res.get("output", {}).get("ord_psbl_cash", 0) or 0)
+        out = res.get("output", {})
+        return int(out.get("max_buy_amt") or out.get("ord_psbl_cash") or 0)
     except:
         return 0
 
