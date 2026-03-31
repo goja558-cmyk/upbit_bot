@@ -1032,24 +1032,7 @@ def is_bullish_reversal(candles):
 
 def check_bollinger_signal(code):
     """볼린저 신호. 반환: (통과여부, 메시지)"""
-    candles = get_minute_candles(code, 30)
-    if not candles:
-        return True, "분봉없음(통과)"
-    _, _, _, pct_b = calc_bollinger(candles, _BB_PERIOD, _BB_K)
-    if pct_b is None:
-        return True, "계산불가(통과)"
-    msgs = [f"%B={pct_b:.2f}"]
-    # 상단 근처면 차단
-    if pct_b >= 0.85:
-        msgs.append("상단⚠️")
-        return False, " ".join(msgs)
-    if pct_b <= _BB_NEAR:
-        msgs.append("하단✅")
-    if is_hammer(candles[-1]):
-        msgs.append("망치✅")
-    if is_bullish_reversal(candles):
-        msgs.append("양봉전환✅")
-    return True, " ".join(msgs)
+    return True, "BB필터비활성"  # 섹터봇 ETF 매수에는 불필요
 
 
 def get_investor_flow(code):
@@ -1828,6 +1811,13 @@ def _do_rebalance():
         name = ETF_UNIVERSE.get(code, {}).get("name", code)
         mark = "✅" if code in top_codes else "  "
         score_lines.append(f"{mark} {name}: {data['score']:+.1f}%")
+    # 제외 종목 이유 표시
+    excluded = {c: d for c, d in filtered.items() if c not in top_codes}
+    all_universe = set(ETF_UNIVERSE.keys()) - {KOFR_CODE}
+    for code in all_universe:
+        name = ETF_UNIVERSE.get(code, {}).get("name", code)
+        if code not in filtered:
+            score_lines.append(f"  ✖ {name}: 스코어≤0 또는 유동성부족")
 
     send_msg(
         f"✅ 리밸런싱 완료\n"
