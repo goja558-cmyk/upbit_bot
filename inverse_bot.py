@@ -258,7 +258,11 @@ def get_cash():
             "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
         })
     try:
-        return int(res["output"]["ord_psbl_cash"])
+        out = res["output"]
+        # nrcvb_buy_amt: 당일 매수가능금액 (전일매도 미결제 포함)
+        # TOTAL_BUDGET으로 상한 제한
+        available = int(out.get("nrcvb_buy_amt") or out.get("ord_psbl_cash") or 0)
+        return min(available, TOTAL_BUDGET)
     except:
         return 0
 
