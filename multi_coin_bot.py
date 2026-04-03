@@ -286,14 +286,35 @@ def detect_market_regime():
 
 
 def get_regime_conditions():
-    """현재 장세별 진입 조건 반환."""
+    """장세별 진입 조건 반환.
+    상승장: (기본 트리거, 보조 트리거) 튜플
+    중립/하락장: (기본 트리거, None)
+    """
     regime = _market_regime
     if regime == "bull":
-        return dict(rsi_max=30, drop_min=2.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.2)
+        primary   = dict(rsi_max=30, drop_min=2.0, vol_ratio_min=1.2, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        secondary = dict(rsi_max=35, drop_min=2.5, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=True)
+        return primary, secondary
     elif regime == "neutral":
-        return dict(rsi_max=28, drop_min=2.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.3)
+        primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        return primary, None
     else:  # bear
-        return dict(rsi_max=25, drop_min=3.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.5)
+        primary = dict(rsi_max=25, drop_min=3.0, vol_ratio_min=1.5, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        return primary, None
+
+
+def _primary_slots():
+    """기본 트리거 슬롯 수: 상승장 3개, 나머지 전체."""
+    if _market_regime == "bull":
+        return max(1, MAX_SLOTS - 2)
+    return MAX_SLOTS
+
+
+def _secondary_slots():
+    """보조 트리거 슬롯 수: 상승장 2개, 나머지 0."""
+    if _market_regime == "bull":
+        return 2
+    return 0
 
 
 def calc_vol_pct(timed_prices):
@@ -559,70 +580,60 @@ def check_buy_score(market, price, volume, open_price=0):
     c["prev_rsi"]  = rsi
     p1 = c["prev_rsi2"]  # 이전 RSI
 
-    # ── 장세별 진입 조건 로드 ────────────────────────────────
-    cond = get_regime_conditions()
-
-    # ── 필수 조건 (통과 못 하면 즉시 탈락) ──────────────────
-    # 1. RSI 장세별 기준 이하 + 1봉 반등
-    if rsi > cond["rsi_max"]: return False, 0
-    if p1 is None or rsi <= p1: return False, 0
-
-    # 2. 시간봉 MA20 > MA60 (상승추세)
-    if ma20 <= ma60: return False, 0
-
-    # 3. 눌림 장세별 기준 이상
+    # ── 공통 전처리 ──────────────────────────────────────────
     drop_pct = (ma20 - price) / ma20 * 100 if ma20 > 0 else 0
-    if drop_pct < cond["drop_min"]: return False, 0
 
-    # 4. 변동성 장세별 범위
-    if vol is None or not (cond["vol_min"] <= vol <= cond["vol_max"]): return False, 0
-
-    # 5. 양봉 확인 (현재봉 종가 > 시가)
-    if open_price > 0 and price <= open_price: return False, 0
-
-    # 6. 거래량 장세별 최소 배수 (필수 조건)
+    # 거래량 배율
     vol_h = list(c["vol_history"])
     vol_ratio = 1.0
     if len(vol_h) >= 6 and vol_h[-1] > 0:
         avg5 = sum(vol_h[-6:-1]) / 5
         vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
-    if vol_ratio < cond["vol_ratio_min"]: return False, 0
 
-    # 7. 일봉 MA20/MA60 — 하락장은 허용 (이미 슬롯/조건으로 관리)
-    #    단 상승장에서는 일봉도 상승이어야 함
+    # 일봉 MA
     d_ma20, d_ma60 = get_daily_ma_cached(market)
-    if _market_regime == "bull":
-        if d_ma20 is not None and d_ma60 is not None:
-            if d_ma20 <= d_ma60: return False, 0
+
+    # 공통 필수 조건
+    if ma20 <= ma60: return False, 0                          # 시간봉 추세
+    if vol is None or not (2.0 <= vol <= 8.0): return False, 0  # 변동성
+    if open_price > 0 and price <= open_price: return False, 0  # 양봉
+    if p1 is None or rsi <= p1: return False, 0               # 반등
+
+    # ── 장세별 트리거 체크 ────────────────────────────────────
+    primary, secondary = get_regime_conditions()
+    matched_cond = None
+
+    # 기본 트리거 체크
+    if (rsi <= primary["rsi_max"] and
+        drop_pct >= primary["drop_min"] and
+        vol_ratio >= primary["vol_ratio_min"]):
+        # 상승장: 일봉 필터 추가
+        if _market_regime == "bull":
+            if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
+                matched_cond = primary
+        else:
+            matched_cond = primary
+
+    # 보조 트리거 체크 (상승장 전용, 기본 트리거 미충족 시)
+    if matched_cond is None and secondary is not None:
+        if (rsi <= secondary["rsi_max"] and
+            drop_pct >= secondary["drop_min"] and
+            vol_ratio >= secondary["vol_ratio_min"]):
+            if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
+                matched_cond = secondary
+
+    if matched_cond is None: return False, 0
 
     # ── 복합 점수 계산 ───────────────────────────────────────
-    # RSI 점수 (최대 40점)
-    rsi_score = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
-
-    # MA이격 점수 (최대 30점)
-    if drop_pct >= 4.0:
-        drop_score = 30
-    elif drop_pct >= 3.0:
-        drop_score = 20
-    elif drop_pct >= 2.0:
-        drop_score = 10
-    else:
-        drop_score = 0
-
-    # 거래량 점수 (최대 30점)
-    if vol_ratio >= 2.0:
-        vol_score = 30
-    elif vol_ratio >= 1.5:
-        vol_score = 20
-    elif vol_ratio >= 1.2:
-        vol_score = 10
-    else:
-        vol_score = 0
-
+    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+    drop_score = 30 if drop_pct >= 4.0 else 20 if drop_pct >= 3.0 else 10
+    vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10 if vol_ratio >= 1.2 else 0
     total_score = rsi_score + drop_score + vol_score
     if total_score < 10: return False, 0
 
-    return True, total_score
+    # 보조 트리거면 점수에 is_secondary 태그
+    is_sec = matched_cond.get("is_secondary", False)
+    return True, total_score + (0.01 if is_sec else 0)  # 소수점으로 구분
 
 
 # 하위 호환용
@@ -708,9 +719,12 @@ def handle_command(text, req_id=""):
         with slots_lock:
             holding = list(slots)
         regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        pri_slots = _primary_slots()
+        sec_slots = _secondary_slots()
+        slot_str = f"{len(holding)}/{MAX_SLOTS}" + (f" (기본{pri_slots}+보조{sec_slots})" if sec_slots > 0 else "")
         lines = [f"📊 멀티코인봇 상태", f"━━━━━━━━━━━━━━━━━━━━",
                  f"캔들: {CANDLE_INTERVAL}분봉  장세: {regime_kor}",
-                 f"슬롯: {len(holding)}/{MAX_SLOTS}  손익: {daily_pnl:+,.0f}원"]
+                 f"슬롯: {slot_str}  손익: {daily_pnl:+,.0f}원"]
         import time as _t
         for m in holding:
             c = coins.get(m, {})
@@ -742,10 +756,13 @@ def handle_command(text, req_id=""):
     elif cmd[0] in ("/why", "/왜"):
         import time as _t
         regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
-        cond = get_regime_conditions()
+        primary_c, secondary_c = get_regime_conditions()
+        cond_str = f"기본 RSI≤{primary_c['rsi_max']} 눌림≥{primary_c['drop_min']}% 거래량≥{primary_c['vol_ratio_min']}배"
+        if secondary_c:
+            cond_str += f"\n보조 RSI≤{secondary_c['rsi_max']} 눌림≥{secondary_c['drop_min']}% 거래량≥{secondary_c['vol_ratio_min']}배"
         lines = ["🔍 매수 조건 요약", f"━━━━━━━━━━━━━━━━━━━━",
-                 f"장세: {regime_kor}  슬롯: {MAX_SLOTS}개",
-                 f"RSI≤{cond['rsi_max']} 눌림≥{cond['drop_min']}% 거래량≥{cond['vol_ratio_min']}배"]
+                 f"장세: {regime_kor}  슬롯: {_primary_slots()}+{_secondary_slots()}개",
+                 cond_str]
         with slots_lock:
             holding = set(slots)
         # 보유 중 종목
@@ -778,40 +795,49 @@ def handle_command(text, req_id=""):
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
             cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
-            # 이유 판단 (장세별 조건 기준)
-            drop_pct = (ma20 - price) / ma20 * 100 if ma20 and ma20 > 0 else 0
-            d_ma20, d_ma60 = get_daily_ma_cached(m)
-            cond_w = get_regime_conditions()
+            # 이유 판단 (이중 트리거 기준)
+            drop_pct_w = (ma20 - price) / ma20 * 100 if ma20 and ma20 > 0 else 0
+            d_ma20_w, d_ma60_w = get_daily_ma_cached(m)
+            primary_w, secondary_w = get_regime_conditions()
             vol_h_w = list(c.get("vol_history", []))
             vol_ratio_w = 1.0
             if len(vol_h_w) >= 6 and vol_h_w[-1] > 0:
                 avg5_w = sum(vol_h_w[-6:-1]) / 5
                 vol_ratio_w = vol_h_w[-1] / avg5_w if avg5_w > 0 else 1.0
+
+            def _check_trigger(cond_t):
+                if rsi > cond_t["rsi_max"]: return f"RSI과열 {rsi:.1f}(≤{cond_t['rsi_max']})"
+                if p1 is None or rsi <= p1: return f"RSI반등없음 {rsi:.1f}"
+                if ma20 is None or ma20 <= (ma60 or 0): return f"MA하락"
+                if drop_pct_w < cond_t["drop_min"]: return f"눌림부족 {drop_pct_w:.1f}%(≥{cond_t['drop_min']}%)"
+                if vol is None or not (2.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
+                if vol_ratio_w < cond_t["vol_ratio_min"]: return f"거래량부족 {vol_ratio_w:.1f}배(≥{cond_t['vol_ratio_min']}배)"
+                if _market_regime == "bull" and d_ma20_w is not None and d_ma60_w is not None and d_ma20_w <= d_ma60_w:
+                    return "일봉하락추세"
+                return None  # 통과
+
             if cooldown_left > 0:
-                cd_h = cooldown_left / 3600
-                reason = f"쿨다운 {cd_h:.1f}h"
+                reason = f"쿨다운 {cooldown_left/3600:.1f}h"
             elif rsi is None:
                 reason = "RSI 계산불가"
-            elif rsi > cond_w["rsi_max"]:
-                reason = f"RSI과열 {rsi:.1f}(기준≤{cond_w['rsi_max']})"
-            elif p1 is None or rsi <= p1:
-                reason = f"RSI반등없음 {rsi:.1f}"
-            elif ma20 is None or ma20 <= (ma60 or 0):
-                reason = f"MA하락 {rsi:.1f}"
-            elif drop_pct < cond_w["drop_min"]:
-                reason = f"눌림부족 {drop_pct:.1f}%(기준≥{cond_w['drop_min']}%)"
-            elif vol is None or not (cond_w["vol_min"] <= vol <= cond_w["vol_max"]):
-                reason = f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
-            elif vol_ratio_w < cond_w["vol_ratio_min"]:
-                reason = f"거래량부족 {vol_ratio_w:.1f}배(기준≥{cond_w['vol_ratio_min']}배)"
-            elif _market_regime == "bull" and d_ma20 is not None and d_ma60 is not None and d_ma20 <= d_ma60:
-                reason = "일봉하락추세"
             else:
-                rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
-                drop_score = 30 if drop_pct >= 4 else 20 if drop_pct >= 3 else 10
-                vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
-                score = rsi_score + drop_score + vol_score
-                reason = f"점수부족 {score}점" if score < 10 else f"✅신호 {score}점"
+                fail_pri = _check_trigger(primary_w)
+                fail_sec = _check_trigger(secondary_w) if secondary_w else "보조없음"
+                if fail_pri is None:
+                    # 기본 트리거 통과 → 점수 계산
+                    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+                    drop_score = 30 if drop_pct_w >= 4 else 20 if drop_pct_w >= 3 else 10
+                    vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
+                    score = rsi_score + drop_score + vol_score
+                    reason = f"점수부족 {score}점" if score < 10 else f"✅기본신호 {score}점"
+                elif secondary_w and fail_sec is None:
+                    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+                    drop_score = 30 if drop_pct_w >= 4 else 20 if drop_pct_w >= 3 else 10
+                    vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
+                    score = rsi_score + drop_score + vol_score
+                    reason = f"✅보조신호 {score}점"
+                else:
+                    reason = fail_pri  # 기본 트리거 실패 이유 표시
             lines.append(f"⏳ {m.replace('KRW-','')}: {reason}")
             checked += 1
         if checked == 0 and not holding:
@@ -932,12 +958,25 @@ def run_bot():
                 if ok:
                     signals.append((market, price, score))
 
-            # 복합 점수 순 정렬 → 슬롯 여유만큼 매수
+            # 점수 순 정렬 → 슬롯 분리 매수
             signals.sort(key=lambda x: x[2], reverse=True)
+            pri_used = sum(1 for m in slots if not coins.get(m, {}).get("is_secondary", False))
+            sec_used = sum(1 for m in slots if coins.get(m, {}).get("is_secondary", False))
             for market, price, score in signals:
                 with slots_lock:
                     if len(slots) >= MAX_SLOTS: break
-                do_buy(market, price, f"복합점수:{score:.0f}점")
+                is_sec = (score % 1) > 0.005  # 소수점으로 보조 트리거 구분
+                real_score = int(score)
+                if is_sec:
+                    if sec_used >= _secondary_slots(): continue
+                    sec_used += 1
+                    tag = f"보조:{real_score}점"
+                else:
+                    if pri_used >= _primary_slots(): continue
+                    pri_used += 1
+                    tag = f"기본:{real_score}점"
+                coins.get(market, {})["is_secondary"] = is_sec
+                do_buy(market, price, tag)
 
         except Exception as e:
             cprint(f"[메인 루프 오류] {e}\n{traceback.format_exc()}", Fore.RED)
