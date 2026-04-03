@@ -567,11 +567,19 @@ def handle_command(text, req_id=""):
         with slots_lock:
             holding = list(slots)
         lines = [f"📊 멀티코인봇 상태", f"━━━━━━━━━━━━━━━━━━━━",
-                 f"슬롯: {len(holding)}/{MAX_SLOTS}",
+                 f"캔들: {CANDLE_INTERVAL}분봉  슬롯: {len(holding)}/{MAX_SLOTS}",
                  f"오늘 손익: {daily_pnl:+,.0f}원"]
+        import time as _t
         for m in holding:
             c = coins.get(m, {})
-            lines.append(f"📦 {m}: 매수가 {c.get('buy_price',0):,.2f}원")
+            buy_p = c.get("buy_price", 0)
+            h = list(c.get("history", [0]))
+            cur = h[-1] if h else 0
+            pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p else 0
+            hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
+            lines.append(f"📦 {m.replace('KRW-','')}: {pnl_pct:+.2f}% ({hold_h:.1f}h보유)")
+        if not holding:
+            lines.append("⏳ 대기중")
         _write_ipc_result("\n".join(lines), req_id)
 
     elif cmd[0] in ("/start", "/시작"):
@@ -591,7 +599,8 @@ def handle_command(text, req_id=""):
 
     elif cmd[0] in ("/why", "/왜"):
         import time as _t
-        lines = ["🔍 매수 조건 요약", "━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["🔍 매수 조건 요약", f"━━━━━━━━━━━━━━━━━━━━",
+                 f"캔들: {CANDLE_INTERVAL}분봉  감시: {WATCH_COUNT}종목"]
         with slots_lock:
             holding = set(slots)
         # 보유 중 종목
@@ -600,7 +609,8 @@ def handle_command(text, req_id=""):
             buy_p = c.get("buy_price", 0)
             price = list(c.get("history", [0]))[-1] if c.get("history") else 0
             pnl = (price - buy_p) / buy_p * 100 if buy_p else 0
-            lines.append(f"📦 {m.replace('KRW-','')}: 보유중 {pnl:+.2f}%")
+            hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
+            lines.append(f"📦 {m.replace('KRW-','')}: 보유중 {pnl:+.2f}% ({hold_h:.1f}h)")
         # 감시 중 종목 (최대 10개)
         checked = 0
         with coins_lock:
@@ -610,30 +620,32 @@ def handle_command(text, req_id=""):
             if m in holding: continue
             if checked >= 10: break
             h = list(c.get("history", []))
-            if len(h) < 3:
-                lines.append(f"⏳ {m.replace('KRW-','')}: 데이터 수집중")
+            cnt = c.get("real_data_count", 0)
+            if cnt < REAL_DATA_MIN:
+                lines.append(f"⏳ {m.replace('KRW-','')}: 데이터 수집중 ({cnt}/{REAL_DATA_MIN}h)")
                 checked += 1
                 continue
             rsi = calc_rsi(h)
             ma20 = calc_ma(h, 20)
             ma60 = calc_ma(h, 60)
             vol = calc_vol_pct(c.get("timed", []))
-            price = h[-1]
+            price = h[-1] if h else 0
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
             cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
             # 이유 판단
             if cooldown_left > 0:
-                reason = f"쿨다운 {cooldown_left:.0f}초"
+                cd_h = cooldown_left / 3600
+                reason = f"쿨다운 {cd_h:.1f}h"
             elif rsi is None:
                 reason = "RSI 계산불가"
             elif p2 is None or not (p2 <= c.get("rsi_buy", 38) and p1 > p2):
                 reason = f"RSI V턴없음 {rsi:.1f}"
             elif ma20 is None or ma20 <= (ma60 or 0):
                 reason = f"MA하락 {rsi:.1f}"
-            elif ma20 > 0 and (ma20 - price) / ma20 * 100 < c.get("drop", 0.5):
+            elif ma20 > 0 and (ma20 - price) / ma20 * 100 < c.get("drop", 1.0):
                 reason = f"눌림부족 {rsi:.1f}"
-            elif vol is None or not (c.get("vol_min", 0.3) <= vol <= c.get("vol_max", 6.0)):
+            elif vol is None or not (c.get("vol_min", 0.8) <= vol <= c.get("vol_max", 15.0)):
                 reason = f"변동성부족 {vol:.2f}%" if vol else "변동성없음"
             else:
                 reason = "신호대기"
