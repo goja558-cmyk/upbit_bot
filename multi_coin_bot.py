@@ -775,6 +775,7 @@ def handle_command(text, req_id=""):
             lines.append(f"📦 {m.replace('KRW-','')}: 보유중 {pnl:+.2f}% ({hold_h:.1f}h)")
         # 감시 중 종목 (최대 10개)
         checked = 0
+        prob_list = []
         with coins_lock:
             snap = dict(coins)
         now = _t.time()
@@ -816,34 +817,71 @@ def handle_command(text, req_id=""):
                     return "일봉하락추세"
                 return None  # 통과
 
-            if cooldown_left > 0:
-                reason = f"쿨다운 {cooldown_left/3600:.1f}h"
-            elif rsi is None:
-                reason = "RSI 계산불가"
-            else:
-                fail_pri = _check_trigger(primary_w)
-                fail_sec = _check_trigger(secondary_w) if secondary_w else "보조없음"
-                if fail_pri is None:
-                    # 기본 트리거 통과 → 점수 계산
-                    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
-                    drop_score = 30 if drop_pct_w >= 4 else 20 if drop_pct_w >= 3 else 10
-                    vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
-                    score = rsi_score + drop_score + vol_score
-                    reason = f"점수부족 {score}점" if score < 10 else f"✅기본신호 {score}점"
-                elif secondary_w and fail_sec is None:
-                    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
-                    drop_score = 30 if drop_pct_w >= 4 else 20 if drop_pct_w >= 3 else 10
-                    vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
-                    score = rsi_score + drop_score + vol_score
-                    reason = f"✅보조신호 {score}점"
+            def _calc_prob(cond_t):
+                scores = []
+                rsi_target = cond_t["rsi_max"]
+                scores.append(1.0 if rsi <= rsi_target else max(0, 1.0 - (rsi - rsi_target) / (70 - rsi_target)))
+                scores.append(1.0 if (p1 is not None and rsi > p1) else 0.3)
+                if ma20 and ma60:
+                    scores.append(1.0 if ma20 > ma60 else 0.0)
                 else:
-                    reason = fail_pri  # 기본 트리거 실패 이유 표시
-            lines.append(f"⏳ {m.replace('KRW-','')}: {reason}")
+                    scores.append(0.5)
+                drop_target = cond_t["drop_min"]
+                scores.append(1.0 if drop_pct_w >= drop_target else max(0, drop_pct_w / drop_target))
+                if vol is None:
+                    scores.append(0.2)
+                elif 2.0 <= vol <= 8.0:
+                    scores.append(1.0)
+                elif vol < 2.0:
+                    scores.append(max(0, vol / 2.0))
+                else:
+                    scores.append(max(0, 1.0 - (vol - 8.0) / 8.0))
+                vr_target = cond_t["vol_ratio_min"]
+                scores.append(1.0 if vol_ratio_w >= vr_target else max(0, vol_ratio_w / vr_target))
+                if _market_regime == "bull":
+                    if d_ma20_w and d_ma60_w:
+                        scores.append(1.0 if d_ma20_w > d_ma60_w else 0.0)
+                    else:
+                        scores.append(0.5)
+                return int(sum(scores) / len(scores) * 100)
+
+            if cooldown_left > 0:
+                prob_list.append((m, 0, f"쿨다운 {cooldown_left/3600:.1f}h 후"))
+            elif rsi is None:
+                prob_list.append((m, 0, "데이터 없음"))
+            else:
+                prob_pri = _calc_prob(primary_w)
+                prob_sec = _calc_prob(secondary_w) if secondary_w else 0
+                prob = max(prob_pri, prob_sec)
+                best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
+                hints = []
+                if rsi > best_cond["rsi_max"]:
+                    hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
+                if drop_pct_w < best_cond["drop_min"]:
+                    hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}%")
+                if vol_ratio_w < best_cond["vol_ratio_min"]:
+                    hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}배")
+                hint_str = ", ".join(hints[:2])
+                prob_list.append((m, prob, hint_str))
             checked += 1
-        if checked == 0 and not holding:
+        hot  = sorted([(m,p,h) for m,p,h in prob_list if p >= 70], key=lambda x: x[1], reverse=True)
+        mid  = sorted([(m,p,h) for m,p,h in prob_list if 40 <= p < 70], key=lambda x: x[1], reverse=True)
+        cold = sorted([(m,p,h) for m,p,h in prob_list if p < 40], key=lambda x: x[1], reverse=True)
+        if hot:
+            lines.append("🔥 곧 살 수도 있음")
+            for m, p, h in hot:
+                lines.append(f"  {m.replace('KRW-','')}: {p}%" + (f" ({h})" if h else ""))
+        if mid:
+            lines.append("📊 중간 정도")
+            for m, p, h in mid:
+                lines.append(f"  {m.replace('KRW-','')}: {p}%" + (f" ({h})" if h else ""))
+        if cold:
+            lines.append("⏳ 아직 멀었음")
+            for m, p, _ in cold:
+                lines.append(f"  {m.replace('KRW-','')}: {p}%")
+        if not prob_list and not holding:
             lines.append("감시 종목 없음")
         _write_ipc_result("\n".join(lines), req_id)
-
 # ============================================================
 # [13] 데이터 프리필
 # ============================================================
