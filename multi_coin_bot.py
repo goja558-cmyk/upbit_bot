@@ -785,7 +785,9 @@ def handle_command(text, req_id=""):
             h = list(c.get("history", []))
             cnt = c.get("real_data_count", 0)
             if cnt < REAL_DATA_MIN:
-                lines.append(f"⏳ {m.replace('KRW-','')}: 데이터 수집중 ({cnt}/{REAL_DATA_MIN}h)")
+                prob_list.append((m, 0, f"데이터 수집중 {cnt}/{REAL_DATA_MIN}"))
+                checked += 1
+                continue
                 checked += 1
                 continue
             rsi = calc_rsi(h)
@@ -858,9 +860,9 @@ def handle_command(text, req_id=""):
                 if rsi > best_cond["rsi_max"]:
                     hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
                 if drop_pct_w < best_cond["drop_min"]:
-                    hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}%")
+                    hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
                 if vol_ratio_w < best_cond["vol_ratio_min"]:
-                    hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}배")
+                    hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
                 hint_str = ", ".join(hints[:2])
                 prob_list.append((m, prob, hint_str))
             checked += 1
@@ -870,15 +872,15 @@ def handle_command(text, req_id=""):
         if hot:
             lines.append("🔥 곧 살 수도 있음")
             for m, p, h in hot:
-                lines.append(f"  {m.replace('KRW-','')}: {p}%" + (f" ({h})" if h else ""))
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if mid:
             lines.append("📊 중간 정도")
             for m, p, h in mid:
-                lines.append(f"  {m.replace('KRW-','')}: {p}%" + (f" ({h})" if h else ""))
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if cold:
             lines.append("⏳ 아직 멀었음")
             for m, p, _ in cold:
-                lines.append(f"  {m.replace('KRW-','')}: {p}%")
+                lines.append(f"  {m.replace('KRW-','')}: {p}점")
         if not prob_list and not holding:
             lines.append("감시 종목 없음")
         _write_ipc_result("\n".join(lines), req_id)
