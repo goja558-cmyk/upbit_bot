@@ -586,6 +586,60 @@ def handle_command(text, req_id=""):
             s = list(slots)
         _write_ipc_result(f"슬롯 {len(s)}/{MAX_SLOTS}: {', '.join(s) or '없음'}", req_id)
 
+    elif cmd[0] in ("/why", "/왜"):
+        import time as _t
+        lines = ["🔍 매수 조건 요약", "━━━━━━━━━━━━━━━━━━━━"]
+        with slots_lock:
+            holding = set(slots)
+        # 보유 중 종목
+        for m in holding:
+            c = coins.get(m, {})
+            buy_p = c.get("buy_price", 0)
+            price = list(c.get("history", [0]))[-1] if c.get("history") else 0
+            pnl = (price - buy_p) / buy_p * 100 if buy_p else 0
+            lines.append(f"📦 {m.replace('KRW-','')}: 보유중 {pnl:+.2f}%")
+        # 감시 중 종목 (최대 10개)
+        checked = 0
+        with coins_lock:
+            snap = dict(coins)
+        now = _t.time()
+        for m, c in snap.items():
+            if m in holding: continue
+            if checked >= 10: break
+            h = list(c.get("history", []))
+            if len(h) < 3:
+                lines.append(f"⏳ {m.replace('KRW-','')}: 데이터 수집중")
+                checked += 1
+                continue
+            rsi = calc_rsi(h)
+            ma20 = calc_ma(h, 20)
+            ma60 = calc_ma(h, 60)
+            vol = calc_vol_pct(c.get("timed", []))
+            price = h[-1]
+            p1 = c.get("prev_rsi")
+            p2 = c.get("prev_rsi2")
+            cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
+            # 이유 판단
+            if cooldown_left > 0:
+                reason = f"쿨다운 {cooldown_left:.0f}초"
+            elif rsi is None:
+                reason = "RSI 계산불가"
+            elif p2 is None or not (p2 <= c.get("rsi_buy", 38) and p1 > p2):
+                reason = f"RSI V턴없음 {rsi:.1f}"
+            elif ma20 is None or ma20 <= (ma60 or 0):
+                reason = f"MA하락 {rsi:.1f}"
+            elif ma20 > 0 and (ma20 - price) / ma20 * 100 < c.get("drop", 0.5):
+                reason = f"눌림부족 {rsi:.1f}"
+            elif vol is None or not (c.get("vol_min", 0.3) <= vol <= c.get("vol_max", 6.0)):
+                reason = f"변동성부족 {vol:.2f}%" if vol else "변동성없음"
+            else:
+                reason = "신호대기"
+            lines.append(f"⏳ {m.replace('KRW-','')}: {reason}")
+            checked += 1
+        if checked == 0 and not holding:
+            lines.append("감시 종목 없음")
+        _write_ipc_result("\n".join(lines), req_id)
+
 # ============================================================
 # [13] 데이터 프리필
 # ============================================================
