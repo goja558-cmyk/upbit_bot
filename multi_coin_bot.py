@@ -91,7 +91,15 @@ def load_config():
     CHAT_ID        = str(_cfg.get("chat_id", ""))
     ACCESS_KEY     = _cfg.get("access_key", "")
     SECRET_KEY     = _cfg.get("secret_key", "")
-    TOTAL_BUDGET   = int(_cfg.get("budget", 50_000))
+    # manager_cfg.yaml의 total_budget 우선, 없으면 upbit_cfg.yaml의 budget
+    mgr_cfg_file = os.path.join(os.path.dirname(CFG_FILE), "manager_cfg.yaml")
+    mgr_budget = 0
+    if os.path.exists(mgr_cfg_file):
+        import yaml as _yaml
+        with open(mgr_cfg_file, encoding="utf-8") as _f:
+            _mcfg = _yaml.safe_load(_f) or {}
+        mgr_budget = int(_mcfg.get("total_budget", 0))
+    TOTAL_BUDGET   = mgr_budget or int(_cfg.get("budget", 50_000))
     MAX_SLOTS      = max(1, TOTAL_BUDGET // MIN_TRADE_KRW)
     cprint(f"✅ 설정 로드 (예산:{TOTAL_BUDGET:,}원 / 슬롯:{MAX_SLOTS}개)", Fore.GREEN)
 
