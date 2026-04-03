@@ -344,6 +344,32 @@ def _handle_ipc_cmd(text):
         kill_switch_active = True
         _save_state()
         _write_ipc_result("[critical] ⏹ 섹터봇 정지 (킬스위치 ON)")
+    elif c in ("/sync", "/싱크"):
+        real = get_kis_holdings()
+        if not real:
+            _write_ipc_result("[normal] ⚠️ KIS 잔고 조회 실패 또는 보유 없음")
+            return
+        # ETF 유니버스 + KOFR만 반영
+        valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
+        new_portfolio = {}
+        for code, pos in real.items():
+            if code in valid_codes:
+                old = portfolio.get(code, {})
+                new_portfolio[code] = {
+                    "qty":        pos["qty"],
+                    "avg_price":  pos["avg_price"],
+                    "high_price": max(old.get("high_price", 0), pos["avg_price"]),
+                    "entry_date": old.get("entry_date", str(__import__("datetime").date.today())),
+                }
+        portfolio.clear()
+        portfolio.update(new_portfolio)
+        _save_state()
+        lines = ["✅ 싱크 완료", f"보유: {len(portfolio)}종목"]
+        for code, pos in portfolio.items():
+            name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+            lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
+        _write_ipc_result("[normal] " + "\n".join(lines))
+
     elif c in ("/help", "/도움말"):
         _write_ipc_result(
             "[normal] 📋 섹터봇 명령어\n"
@@ -357,7 +383,8 @@ def _handle_ipc_cmd(text):
             "/kill      — 킬 스위치 ON\n"
             "/unkill    — 킬 스위치 OFF\n"
             "/start     — 재개\n"
-            "/stop      — 정지"
+            "/stop      — 정지\n"
+            "/sync      — KIS 실제 잔고로 동기화"
         )
     else:
         _write_ipc_result(f"[normal] ⚠️ 알 수 없는 명령: {text}")
@@ -633,6 +660,31 @@ def _handle_cmd(cmd):
         kill_switch_active = False
         _save_state()
         send_msg("🟢 킬 스위치 OFF — 매매 재개", force=True)
+    elif c in ("/sync", "/싱크"):
+        real = get_kis_holdings()
+        if not real:
+            send_msg("⚠️ KIS 잔고 조회 실패 또는 보유 없음", force=True)
+            return
+        valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
+        new_portfolio = {}
+        for code, pos in real.items():
+            if code in valid_codes:
+                old = portfolio.get(code, {})
+                new_portfolio[code] = {
+                    "qty":        pos["qty"],
+                    "avg_price":  pos["avg_price"],
+                    "high_price": max(old.get("high_price", 0), pos["avg_price"]),
+                    "entry_date": old.get("entry_date", str(__import__("datetime").date.today())),
+                }
+        portfolio.clear()
+        portfolio.update(new_portfolio)
+        _save_state()
+        lines = ["✅ 싱크 완료", f"보유: {len(portfolio)}종목"]
+        for code, pos in portfolio.items():
+            name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+            lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
+        send_msg("\n".join(lines), force=True)
+
     elif c in ("/help", "/도움말"):
         send_msg(
             "📋 명령어 목록\n"
@@ -643,7 +695,8 @@ def _handle_cmd(cmd):
             "/kofr      — DEFENSE_1 대피\n"
             "/resume    — 복귀 (ETF 재매수)\n"
             "/kill      — 킬 스위치 ON\n"
-            "/unkill    — 킬 스위치 OFF",
+            "/unkill    — 킬 스위치 OFF\n"
+            "/sync      — KIS 실제 잔고로 동기화",
             force=True,
         )
 
@@ -902,6 +955,44 @@ def get_cash_balance():
         return int(res.get("output", {}).get("ord_psbl_cash", 0) or 0)
     except:
         return 0
+
+
+def get_kis_holdings():
+    """KIS 실제 보유 주식 잔고 조회 → {code: {qty, avg_price}} 반환"""
+    tr = "VTTC8434R" if IS_MOCK else "TTTC8434R"
+    h  = kis_headers(tr)
+    if not h:
+        return {}
+    acnt_no, suffix = _acnt()
+    result = {}
+    try:
+        res = api_call(
+            "get",
+            f"{_prod_url()}/uapi/domestic-stock/v1/trading/inquire-balance",
+            headers=h,
+            params={
+                "CANO":            acnt_no,
+                "ACNT_PRDT_CD":    suffix,
+                "AFHR_FLPR_YN":    "N",
+                "OFL_YN":          "",
+                "INQR_DVSN":       "02",
+                "UNPR_DVSN":       "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN":       "01",
+                "CTX_AREA_FK100":  "",
+                "CTX_AREA_NK100":  "",
+            },
+        )
+        for item in res.get("output1", []):
+            code = item.get("pdno", "")
+            qty  = int(item.get("hldg_qty", 0) or 0)
+            avg  = float(item.get("pchs_avg_pric", 0) or 0)
+            if code and qty > 0:
+                result[code] = {"qty": qty, "avg_price": avg}
+    except Exception as e:
+        cprint(f"[잔고 조회 오류] {e}", Fore.YELLOW)
+    return result
 
 
 # ============================================================
