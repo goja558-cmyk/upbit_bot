@@ -245,6 +245,57 @@ def get_daily_ma_cached(market):
     return ma20, ma60
 
 
+# 장세 캐시 (1시간마다 갱신)
+_market_regime       = "neutral"   # "bull" / "neutral" / "bear"
+_market_regime_ts    = 0.0
+_market_regime_ttl   = 3600
+_BASE_MAX_SLOTS      = 5   # 상승장 기준 슬롯
+
+def detect_market_regime():
+    """일봉 MA20/MA60 이격률로 장세 구분.
+    상승: 이격률 ≥ +2%  /  중립: -2%~+2%  /  하락: ≤ -2%
+    대표 종목 BTC 기준 (시장 전체 대리 지표)
+    """
+    global _market_regime, _market_regime_ts, MAX_SLOTS
+    import time as _t
+    now = _t.time()
+    if now - _market_regime_ts < _market_regime_ttl:
+        return _market_regime
+    try:
+        ma20, ma60 = get_daily_ma("KRW-BTC", short=20, long=60)
+        if ma20 and ma60 and ma60 > 0:
+            gap = (ma20 - ma60) / ma60 * 100
+            if gap >= 2.0:
+                regime = "bull"
+                slots  = _BASE_MAX_SLOTS        # 5슬롯
+            elif gap <= -2.0:
+                regime = "bear"
+                slots  = max(2, _BASE_MAX_SLOTS - 3)  # 2슬롯
+            else:
+                regime = "neutral"
+                slots  = max(3, _BASE_MAX_SLOTS - 2)  # 3슬롯
+            _market_regime    = regime
+            MAX_SLOTS         = slots
+            _market_regime_ts = now
+            cprint(f"[장세] {regime.upper()} | MA이격 {gap:+.1f}% | 슬롯 {slots}개", Fore.CYAN)
+        else:
+            cprint("[장세] MA조회 실패 — 중립 유지", Fore.YELLOW)
+    except Exception as e:
+        cprint(f"[장세 감지 오류] {e}", Fore.YELLOW)
+    return _market_regime
+
+
+def get_regime_conditions():
+    """현재 장세별 진입 조건 반환."""
+    regime = _market_regime
+    if regime == "bull":
+        return dict(rsi_max=30, drop_min=2.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.2)
+    elif regime == "neutral":
+        return dict(rsi_max=28, drop_min=2.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.3)
+    else:  # bear
+        return dict(rsi_max=25, drop_min=3.0, vol_min=2.0, vol_max=8.0, vol_ratio_min=1.5)
+
+
 def calc_vol_pct(timed_prices):
     now = time.time()
     recent = [p for t, p in timed_prices if now - t <= 18000]  # 5시간
@@ -508,36 +559,47 @@ def check_buy_score(market, price, volume, open_price=0):
     c["prev_rsi"]  = rsi
     p1 = c["prev_rsi2"]  # 이전 RSI
 
+    # ── 장세별 진입 조건 로드 ────────────────────────────────
+    cond = get_regime_conditions()
+
     # ── 필수 조건 (통과 못 하면 즉시 탈락) ──────────────────
-    # 1. RSI 50 이하 + 1봉 반등
-    if rsi > 50: return False, 0
-    if p1 is None or rsi <= p1: return False, 0   # 반등 없음
+    # 1. RSI 장세별 기준 이하 + 1봉 반등
+    if rsi > cond["rsi_max"]: return False, 0
+    if p1 is None or rsi <= p1: return False, 0
 
     # 2. 시간봉 MA20 > MA60 (상승추세)
     if ma20 <= ma60: return False, 0
 
-    # 3. 눌림 -2% 이상
+    # 3. 눌림 장세별 기준 이상
     drop_pct = (ma20 - price) / ma20 * 100 if ma20 > 0 else 0
-    if drop_pct < 2.0: return False, 0
+    if drop_pct < cond["drop_min"]: return False, 0
 
-    # 4. 변동성 2~8%
-    if vol is None or not (2.0 <= vol <= 8.0): return False, 0
+    # 4. 변동성 장세별 범위
+    if vol is None or not (cond["vol_min"] <= vol <= cond["vol_max"]): return False, 0
 
     # 5. 양봉 확인 (현재봉 종가 > 시가)
     if open_price > 0 and price <= open_price: return False, 0
 
-    # 6. 일봉 MA20 > MA60 (상위 타임프레임 필터)
+    # 6. 거래량 장세별 최소 배수 (필수 조건)
+    vol_h = list(c["vol_history"])
+    vol_ratio = 1.0
+    if len(vol_h) >= 6 and vol_h[-1] > 0:
+        avg5 = sum(vol_h[-6:-1]) / 5
+        vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+    if vol_ratio < cond["vol_ratio_min"]: return False, 0
+
+    # 7. 일봉 MA20/MA60 — 하락장은 허용 (이미 슬롯/조건으로 관리)
+    #    단 상승장에서는 일봉도 상승이어야 함
     d_ma20, d_ma60 = get_daily_ma_cached(market)
-    if d_ma20 is not None and d_ma60 is not None:
-        if d_ma20 <= d_ma60: return False, 0
+    if _market_regime == "bull":
+        if d_ma20 is not None and d_ma60 is not None:
+            if d_ma20 <= d_ma60: return False, 0
 
     # ── 복합 점수 계산 ───────────────────────────────────────
-    # RSI 점수 (최대 40점): RSI 낮을수록 고점수
-    # RSI 30→0점, 20→20점, 10→40점
+    # RSI 점수 (최대 40점)
     rsi_score = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
 
-    # MA이격 점수 (최대 30점): 눌림 깊을수록 고점수
-    # -2%→10점, -3%→20점, -4% 이하→30점
+    # MA이격 점수 (최대 30점)
     if drop_pct >= 4.0:
         drop_score = 30
     elif drop_pct >= 3.0:
@@ -547,24 +609,17 @@ def check_buy_score(market, price, volume, open_price=0):
     else:
         drop_score = 0
 
-    # 거래량 점수 (최대 30점): 직전 5봉 평균 대비
-    vol_h = list(c["vol_history"])
-    if len(vol_h) >= 6 and vol_h[-1] > 0:
-        avg5 = sum(vol_h[-6:-1]) / 5
-        ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
-        if ratio >= 2.0:
-            vol_score = 30
-        elif ratio >= 1.5:
-            vol_score = 20
-        elif ratio >= 1.2:
-            vol_score = 10
-        else:
-            vol_score = 0
+    # 거래량 점수 (최대 30점)
+    if vol_ratio >= 2.0:
+        vol_score = 30
+    elif vol_ratio >= 1.5:
+        vol_score = 20
+    elif vol_ratio >= 1.2:
+        vol_score = 10
     else:
         vol_score = 0
 
     total_score = rsi_score + drop_score + vol_score
-    # 최소 점수 10점 이상이어야 신호
     if total_score < 10: return False, 0
 
     return True, total_score
@@ -652,9 +707,10 @@ def handle_command(text, req_id=""):
     if cmd[0] in ("/status", "/s", "/상태"):
         with slots_lock:
             holding = list(slots)
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
         lines = [f"📊 멀티코인봇 상태", f"━━━━━━━━━━━━━━━━━━━━",
-                 f"캔들: {CANDLE_INTERVAL}분봉  슬롯: {len(holding)}/{MAX_SLOTS}",
-                 f"오늘 손익: {daily_pnl:+,.0f}원"]
+                 f"캔들: {CANDLE_INTERVAL}분봉  장세: {regime_kor}",
+                 f"슬롯: {len(holding)}/{MAX_SLOTS}  손익: {daily_pnl:+,.0f}원"]
         import time as _t
         for m in holding:
             c = coins.get(m, {})
@@ -685,8 +741,11 @@ def handle_command(text, req_id=""):
 
     elif cmd[0] in ("/why", "/왜"):
         import time as _t
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        cond = get_regime_conditions()
         lines = ["🔍 매수 조건 요약", f"━━━━━━━━━━━━━━━━━━━━",
-                 f"캔들: {CANDLE_INTERVAL}분봉  감시: {WATCH_COUNT}종목"]
+                 f"장세: {regime_kor}  슬롯: {MAX_SLOTS}개",
+                 f"RSI≤{cond['rsi_max']} 눌림≥{cond['drop_min']}% 거래량≥{cond['vol_ratio_min']}배"]
         with slots_lock:
             holding = set(slots)
         # 보유 중 종목
@@ -719,36 +778,38 @@ def handle_command(text, req_id=""):
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
             cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
-            # 이유 판단 (복합 점수제 기준)
+            # 이유 판단 (장세별 조건 기준)
             drop_pct = (ma20 - price) / ma20 * 100 if ma20 and ma20 > 0 else 0
             d_ma20, d_ma60 = get_daily_ma_cached(m)
+            cond_w = get_regime_conditions()
+            vol_h_w = list(c.get("vol_history", []))
+            vol_ratio_w = 1.0
+            if len(vol_h_w) >= 6 and vol_h_w[-1] > 0:
+                avg5_w = sum(vol_h_w[-6:-1]) / 5
+                vol_ratio_w = vol_h_w[-1] / avg5_w if avg5_w > 0 else 1.0
             if cooldown_left > 0:
                 cd_h = cooldown_left / 3600
                 reason = f"쿨다운 {cd_h:.1f}h"
             elif rsi is None:
                 reason = "RSI 계산불가"
-            elif rsi > 50:
-                reason = f"RSI과열 {rsi:.1f}"
+            elif rsi > cond_w["rsi_max"]:
+                reason = f"RSI과열 {rsi:.1f}(기준≤{cond_w['rsi_max']})"
             elif p1 is None or rsi <= p1:
                 reason = f"RSI반등없음 {rsi:.1f}"
             elif ma20 is None or ma20 <= (ma60 or 0):
                 reason = f"MA하락 {rsi:.1f}"
-            elif drop_pct < 2.0:
-                reason = f"눌림부족 {drop_pct:.1f}%"
-            elif vol is None or not (2.0 <= vol <= 8.0):
+            elif drop_pct < cond_w["drop_min"]:
+                reason = f"눌림부족 {drop_pct:.1f}%(기준≥{cond_w['drop_min']}%)"
+            elif vol is None or not (cond_w["vol_min"] <= vol <= cond_w["vol_max"]):
                 reason = f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
-            elif d_ma20 is not None and d_ma60 is not None and d_ma20 <= d_ma60:
-                reason = f"일봉하락추세"
+            elif vol_ratio_w < cond_w["vol_ratio_min"]:
+                reason = f"거래량부족 {vol_ratio_w:.1f}배(기준≥{cond_w['vol_ratio_min']}배)"
+            elif _market_regime == "bull" and d_ma20 is not None and d_ma60 is not None and d_ma20 <= d_ma60:
+                reason = "일봉하락추세"
             else:
-                # 점수 계산
                 rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
                 drop_score = 30 if drop_pct >= 4 else 20 if drop_pct >= 3 else 10
-                vol_h = list(c.get("vol_history", []))
-                vol_score = 0
-                if len(vol_h) >= 6 and vol_h[-1] > 0:
-                    avg5 = sum(vol_h[-6:-1]) / 5
-                    ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
-                    vol_score = 30 if ratio >= 2.0 else 20 if ratio >= 1.5 else 10 if ratio >= 1.2 else 0
+                vol_score  = 30 if vol_ratio_w >= 2.0 else 20 if vol_ratio_w >= 1.5 else 10 if vol_ratio_w >= 1.2 else 0
                 score = rsi_score + drop_score + vol_score
                 reason = f"점수부족 {score}점" if score < 10 else f"✅신호 {score}점"
             lines.append(f"⏳ {m.replace('KRW-','')}: {reason}")
@@ -808,6 +869,9 @@ def run_bot():
                 _last_reset_day = today
                 daily_pnl = 0.0
                 for c in coins.values(): c["daily_pnl"] = 0.0
+
+            # 장세 감지 (1시간마다 자동 갱신)
+            detect_market_regime()
 
             # IPC 상태 주기적 전송
             _write_status()
