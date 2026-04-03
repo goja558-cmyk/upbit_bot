@@ -59,12 +59,13 @@ UPBIT_BASE    = "https://api.upbit.com/v1"
 FEE_RATE      = 0.0005
 MIN_ORDER_KRW = 5_000
 MIN_TRADE_KRW = 20_000   # 슬롯당 최소 예산
-LOOP_INTERVAL = 5
-WATCH_COUNT   = 30
-WATCH_INTERVAL = 10      # 시세 일괄 조회 주기 (초)
-REAL_DATA_MIN  = 60      # 매수 허용 최소 데이터 수
-HISTORY_LEN    = 300
-COOLDOWN_SEC   = 120
+LOOP_INTERVAL  = 10
+WATCH_COUNT    = 30
+WATCH_INTERVAL = 300     # 시세 일괄 조회 주기 (초) — 1시간봉은 5분마다면 충분
+REAL_DATA_MIN  = 48      # 매수 허용 최소 데이터 수 (48시간치)
+HISTORY_LEN    = 200
+COOLDOWN_SEC   = 3600    # 1시간 쿨다운
+CANDLE_INTERVAL = 60     # 1시간봉
 
 # 스테이블/저변동 블랙리스트
 BLACKLIST = {"KRW-USDT","KRW-USDC","KRW-DAI","KRW-BUSD","KRW-BTC"}
@@ -175,7 +176,9 @@ def confirm_order(uuid, retry=8):
         time.sleep(0.5)
     return 0, 0
 
-def get_ohlcv(market, count=200, interval=1):
+def get_ohlcv(market, count=200, interval=None):
+    if interval is None:
+        interval = CANDLE_INTERVAL
     try:
         r = requests.get(
             f"{UPBIT_BASE}/candles/minutes/{interval}",
@@ -212,7 +215,7 @@ def calc_ma(prices, n):
 
 def calc_vol_pct(timed_prices):
     now = time.time()
-    recent = [p for t, p in timed_prices if now - t <= 300]
+    recent = [p for t, p in timed_prices if now - t <= 18000]  # 5시간
     if len(recent) < 2: return None
     return (max(recent) - min(recent)) / min(recent) * 100
 
@@ -242,21 +245,21 @@ daily_pnl   = 0.0
 weekly_pnl  = 0.0
 _last_reset_day  = date.today()
 
-# 파라미터 프로파일 (기존 upbit_bot.py와 동일)
+# 파라미터 프로파일 — 1시간봉 기준
 COIN_PROFILES = {
-    "KRW-XRP":  dict(target=1.2, max_loss=-0.9, drop=0.6, trail_start=0.6, trail_gap=0.35, be_trigger=0.4, rsi_buy=38, vol_min=0.4, vol_max=6.0, cooldown=90),
-    "KRW-ETH":  dict(target=1.0, max_loss=-0.7, drop=0.5, trail_start=0.5, trail_gap=0.3,  be_trigger=0.35, rsi_buy=38, vol_min=0.3, vol_max=5.0, cooldown=90),
-    "KRW-SOL":  dict(target=1.3, max_loss=-1.0, drop=0.7, trail_start=0.7, trail_gap=0.4,  be_trigger=0.4,  rsi_buy=38, vol_min=0.5, vol_max=7.0, cooldown=120),
-    "KRW-DOGE": dict(target=1.2, max_loss=-0.9, drop=0.6, trail_start=0.6, trail_gap=0.35, be_trigger=0.4,  rsi_buy=40, vol_min=0.4, vol_max=7.0, cooldown=90),
+    "KRW-XRP":  dict(target=2.5, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=38, vol_min=1.0, vol_max=15.0, cooldown=3600),
+    "KRW-ETH":  dict(target=2.0, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.7, be_trigger=0.7, rsi_buy=38, vol_min=0.8, vol_max=12.0, cooldown=3600),
+    "KRW-SOL":  dict(target=3.0, max_loss=-2.0, drop=1.5, trail_start=2.0, trail_gap=1.0, be_trigger=1.0, rsi_buy=38, vol_min=1.5, vol_max=20.0, cooldown=7200),
+    "KRW-DOGE": dict(target=2.5, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=40, vol_min=1.0, vol_max=15.0, cooldown=3600),
 }
-PROFILE_DEFAULT = dict(target=1.0, max_loss=-0.8, drop=0.5, trail_start=0.5, trail_gap=0.3, be_trigger=0.35, rsi_buy=38, vol_min=0.3, vol_max=6.0, cooldown=120)
+PROFILE_DEFAULT = dict(target=2.0, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=38, vol_min=0.8, vol_max=15.0, cooldown=3600)
 
 def _make_coin_state(market):
     p = {**PROFILE_DEFAULT, **COIN_PROFILES.get(market, {})}
     return {
         "history":        deque(maxlen=HISTORY_LEN),
         "vol_history":    deque(maxlen=HISTORY_LEN),
-        "timed":          deque(maxlen=3600),
+        "timed":          deque(maxlen=200),
         "has_stock":      False,
         "buy_price":      0.0,
         "filled_qty":     0.0,
@@ -645,7 +648,7 @@ def handle_command(text, req_id=""):
 # ============================================================
 def prefill(market):
     c = get_or_create_coin(market)
-    prices = get_ohlcv(market, count=REAL_DATA_MIN + 10, interval=1)
+    prices = get_ohlcv(market, count=REAL_DATA_MIN + 10, interval=CANDLE_INTERVAL)
     if prices:
         for p in prices:
             c["history"].append(p)
