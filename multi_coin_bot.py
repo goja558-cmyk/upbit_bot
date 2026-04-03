@@ -213,6 +213,38 @@ def calc_ma(prices, n):
     if len(arr) < n: return None
     return sum(arr[-n:]) / n
 
+def get_daily_ma(market, short=20, long=60):
+    """일봉 MA20, MA60 조회 — 상위 타임프레임 필터용"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/days",
+            params={"market": market, "count": long + 5}, timeout=5
+        )
+        if r.status_code == 200:
+            closes = [c["trade_price"] for c in reversed(r.json())]
+            ma_s = sum(closes[-short:]) / short if len(closes) >= short else None
+            ma_l = sum(closes[-long:]) / long if len(closes) >= long else None
+            return ma_s, ma_l
+    except Exception as e:
+        cprint(f"[일봉MA 오류] {market}: {e}", Fore.YELLOW)
+    return None, None
+
+# 일봉 MA 캐시 (1시간마다 갱신)
+_daily_ma_cache = {}
+_daily_ma_ts    = {}
+DAILY_MA_TTL    = 3600
+
+def get_daily_ma_cached(market):
+    import time as _t
+    now = _t.time()
+    if market in _daily_ma_cache and now - _daily_ma_ts.get(market, 0) < DAILY_MA_TTL:
+        return _daily_ma_cache[market]
+    ma20, ma60 = get_daily_ma(market)
+    _daily_ma_cache[market] = (ma20, ma60)
+    _daily_ma_ts[market]    = now
+    return ma20, ma60
+
+
 def calc_vol_pct(timed_prices):
     now = time.time()
     recent = [p for t, p in timed_prices if now - t <= 18000]  # 5시간
@@ -245,14 +277,14 @@ daily_pnl   = 0.0
 weekly_pnl  = 0.0
 _last_reset_day  = date.today()
 
-# 파라미터 프로파일 — 1시간봉 기준
+# 파라미터 프로파일 — 1시간봉 + 복합 점수제 기준
 COIN_PROFILES = {
-    "KRW-XRP":  dict(target=2.5, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=38, vol_min=1.0, vol_max=15.0, cooldown=3600),
-    "KRW-ETH":  dict(target=2.0, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.7, be_trigger=0.7, rsi_buy=38, vol_min=0.8, vol_max=12.0, cooldown=3600),
-    "KRW-SOL":  dict(target=3.0, max_loss=-2.0, drop=1.5, trail_start=2.0, trail_gap=1.0, be_trigger=1.0, rsi_buy=38, vol_min=1.5, vol_max=20.0, cooldown=7200),
-    "KRW-DOGE": dict(target=2.5, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=40, vol_min=1.0, vol_max=15.0, cooldown=3600),
+    "KRW-XRP":  dict(target=2.5, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
+    "KRW-ETH":  dict(target=2.0, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.7, be_trigger=0.7, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
+    "KRW-SOL":  dict(target=3.0, max_loss=-2.0, drop=2.0, trail_start=2.0, trail_gap=1.0, be_trigger=1.0, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=7200),
+    "KRW-DOGE": dict(target=2.5, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
 }
-PROFILE_DEFAULT = dict(target=2.0, max_loss=-1.5, drop=1.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=38, vol_min=0.8, vol_max=15.0, cooldown=3600)
+PROFILE_DEFAULT = dict(target=2.0, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600)
 
 def _make_coin_state(market):
     p = {**PROFILE_DEFAULT, **COIN_PROFILES.get(market, {})}
@@ -444,9 +476,13 @@ def check_sell(market, price):
         do_sell(market, price, f"손절 {pnl_pct:+.2f}%")
 
 # ============================================================
-# [9] 매수 신호 체크
+# [9] 매수 신호 체크 — 복합 점수제
 # ============================================================
-def check_buy_signal(market, price, volume):
+def check_buy_score(market, price, volume, open_price=0):
+    """복합 점수제 매수 신호 체크.
+    반환: (신호여부, 점수 0~100)
+    점수 구성: RSI 40점 + MA이격 30점 + 거래량 30점
+    """
     c = get_or_create_coin(market)
     if c["has_stock"]: return False, 0
 
@@ -470,24 +506,74 @@ def check_buy_signal(market, price, volume):
 
     c["prev_rsi2"] = c["prev_rsi"]
     c["prev_rsi"]  = rsi
+    p1 = c["prev_rsi2"]  # 이전 RSI
 
-    # RSI V-Turn
-    p1, p2 = c["prev_rsi"], c["prev_rsi2"]
-    rsi_vturn = (p2 is not None and p1 is not None and
-                 p2 <= c["rsi_buy"] and p1 > p2 and rsi > p1)
+    # ── 필수 조건 (통과 못 하면 즉시 탈락) ──────────────────
+    # 1. RSI 50 이하 + 1봉 반등
+    if rsi > 50: return False, 0
+    if p1 is None or rsi <= p1: return False, 0   # 반등 없음
 
-    if not rsi_vturn: return False, 0
+    # 2. 시간봉 MA20 > MA60 (상승추세)
+    if ma20 <= ma60: return False, 0
 
-    # 추가 조건
-    ma_ok   = ma20 > ma60
-    drop_ok = ma20 > 0 and (ma20 - price) / ma20 * 100 >= c["drop"]
-    vol_ok  = vol is not None and c["vol_min"] <= vol <= c["vol_max"]
+    # 3. 눌림 -2% 이상
+    drop_pct = (ma20 - price) / ma20 * 100 if ma20 > 0 else 0
+    if drop_pct < 2.0: return False, 0
 
-    if not (ma_ok and drop_ok and vol_ok): return False, 0
+    # 4. 변동성 2~8%
+    if vol is None or not (2.0 <= vol <= 8.0): return False, 0
 
-    # 신호 강도 (RSI가 낮을수록 강함)
-    signal_strength = c["rsi_buy"] - p2
-    return True, signal_strength
+    # 5. 양봉 확인 (현재봉 종가 > 시가)
+    if open_price > 0 and price <= open_price: return False, 0
+
+    # 6. 일봉 MA20 > MA60 (상위 타임프레임 필터)
+    d_ma20, d_ma60 = get_daily_ma_cached(market)
+    if d_ma20 is not None and d_ma60 is not None:
+        if d_ma20 <= d_ma60: return False, 0
+
+    # ── 복합 점수 계산 ───────────────────────────────────────
+    # RSI 점수 (최대 40점): RSI 낮을수록 고점수
+    # RSI 30→0점, 20→20점, 10→40점
+    rsi_score = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+
+    # MA이격 점수 (최대 30점): 눌림 깊을수록 고점수
+    # -2%→10점, -3%→20점, -4% 이하→30점
+    if drop_pct >= 4.0:
+        drop_score = 30
+    elif drop_pct >= 3.0:
+        drop_score = 20
+    elif drop_pct >= 2.0:
+        drop_score = 10
+    else:
+        drop_score = 0
+
+    # 거래량 점수 (최대 30점): 직전 5봉 평균 대비
+    vol_h = list(c["vol_history"])
+    if len(vol_h) >= 6 and vol_h[-1] > 0:
+        avg5 = sum(vol_h[-6:-1]) / 5
+        ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+        if ratio >= 2.0:
+            vol_score = 30
+        elif ratio >= 1.5:
+            vol_score = 20
+        elif ratio >= 1.2:
+            vol_score = 10
+        else:
+            vol_score = 0
+    else:
+        vol_score = 0
+
+    total_score = rsi_score + drop_score + vol_score
+    # 최소 점수 10점 이상이어야 신호
+    if total_score < 10: return False, 0
+
+    return True, total_score
+
+
+# 하위 호환용
+def check_buy_signal(market, price, volume):
+    ok, score = check_buy_score(market, price, volume)
+    return ok, score
 
 # ============================================================
 # [10] 감시 종목 목록
@@ -761,16 +847,17 @@ def run_bot():
                 if c["real_data_count"] == 0:
                     prefill(market)
 
-                ok, strength = check_buy_signal(market, price, volume)
+                open_price = td.get("opening_price", 0)
+                ok, score = check_buy_score(market, price, volume, open_price)
                 if ok:
-                    signals.append((market, price, strength))
+                    signals.append((market, price, score))
 
-            # 신호 강도 순 정렬 → 슬롯 여유만큼 매수
+            # 복합 점수 순 정렬 → 슬롯 여유만큼 매수
             signals.sort(key=lambda x: x[2], reverse=True)
-            for market, price, strength in signals:
+            for market, price, score in signals:
                 with slots_lock:
                     if len(slots) >= MAX_SLOTS: break
-                do_buy(market, price, f"RSI V-Turn (강도:{strength:.1f})")
+                do_buy(market, price, f"복합점수:{score:.0f}점")
 
         except Exception as e:
             cprint(f"[메인 루프 오류] {e}\n{traceback.format_exc()}", Fore.RED)
