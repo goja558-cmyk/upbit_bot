@@ -719,22 +719,38 @@ def handle_command(text, req_id=""):
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
             cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
-            # 이유 판단
+            # 이유 판단 (복합 점수제 기준)
+            drop_pct = (ma20 - price) / ma20 * 100 if ma20 and ma20 > 0 else 0
+            d_ma20, d_ma60 = get_daily_ma_cached(m)
             if cooldown_left > 0:
                 cd_h = cooldown_left / 3600
                 reason = f"쿨다운 {cd_h:.1f}h"
             elif rsi is None:
                 reason = "RSI 계산불가"
-            elif p2 is None or not (p2 <= c.get("rsi_buy", 38) and p1 > p2):
-                reason = f"RSI V턴없음 {rsi:.1f}"
+            elif rsi > 50:
+                reason = f"RSI과열 {rsi:.1f}"
+            elif p1 is None or rsi <= p1:
+                reason = f"RSI반등없음 {rsi:.1f}"
             elif ma20 is None or ma20 <= (ma60 or 0):
                 reason = f"MA하락 {rsi:.1f}"
-            elif ma20 > 0 and (ma20 - price) / ma20 * 100 < c.get("drop", 1.0):
-                reason = f"눌림부족 {rsi:.1f}"
-            elif vol is None or not (c.get("vol_min", 0.8) <= vol <= c.get("vol_max", 15.0)):
-                reason = f"변동성부족 {vol:.2f}%" if vol else "변동성없음"
+            elif drop_pct < 2.0:
+                reason = f"눌림부족 {drop_pct:.1f}%"
+            elif vol is None or not (2.0 <= vol <= 8.0):
+                reason = f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
+            elif d_ma20 is not None and d_ma60 is not None and d_ma20 <= d_ma60:
+                reason = f"일봉하락추세"
             else:
-                reason = "신호대기"
+                # 점수 계산
+                rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+                drop_score = 30 if drop_pct >= 4 else 20 if drop_pct >= 3 else 10
+                vol_h = list(c.get("vol_history", []))
+                vol_score = 0
+                if len(vol_h) >= 6 and vol_h[-1] > 0:
+                    avg5 = sum(vol_h[-6:-1]) / 5
+                    ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+                    vol_score = 30 if ratio >= 2.0 else 20 if ratio >= 1.5 else 10 if ratio >= 1.2 else 0
+                score = rsi_score + drop_score + vol_score
+                reason = f"점수부족 {score}점" if score < 10 else f"✅신호 {score}점"
             lines.append(f"⏳ {m.replace('KRW-','')}: {reason}")
             checked += 1
         if checked == 0 and not holding:
