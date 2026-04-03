@@ -1345,24 +1345,19 @@ def _handle_command_inner(text):
         target = cmd[1] if len(cmd) > 1 else ""
         workers_snap = list(_workers)   # 스냅샷 — iterate 중 변경 방지
         if target == "coin":
-            coin_workers = [w for w in workers_snap if isinstance(w, CoinWorker)]
-            if not coin_workers:
-                send_msg("🪙 실행 중인 코인봇 없음\n/coin add KRW-XRP 0.5 로 추가하세요.",
+            mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
+            if not mc_workers:
+                send_msg("🪙 멀티코인봇 실행 안 됨",
                          level="normal", source="매니저", force=True, keyboard=KB_COIN_BOT)
                 return
-            markets = ", ".join(w.market for w in coin_workers)
             with _state_lock:
-                states_snap = dict(_worker_states)
-            lines = []
-            for w in coin_workers:
-                st = states_snap.get(w.market, {})
-                holding = "📦보유중" if st.get("holding") else "⏳대기중"
-                lines.append(f"{w.market}: {st.get('pnl_today',0):+,}원 {holding}")
+                st = dict(_worker_states).get("MULTI-COIN", {})
+            holding = "📦보유중" if st.get("holding") else "⏳대기중"
             send_msg(
-                f"🪙 코인봇\n"
+                f"🪙 멀티코인봇\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"실행 종목: {markets}\n" +
-                "\n".join(lines),
+                f"오늘 손익: {st.get('pnl_today',0):+,}원\n"
+                f"거래: {st.get('trades',0)}회 {holding}",
                 level="normal", source="매니저", force=True, keyboard=KB_COIN_BOT
             )
         elif target == "stock":
@@ -1467,24 +1462,17 @@ def _handle_command_inner(text):
         workers_snap = list(_workers)
 
         if target == "coin":
-            coin_workers = [w for w in workers_snap if isinstance(w, CoinWorker)]
-            if not coin_workers:
-                send_msg("🪙 실행 중인 코인봇 없음", level="normal", source="매니저", force=True)
+            mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
+            if not mc_workers:
+                send_msg("🪙 멀티코인봇 실행 안 됨", level="normal", source="매니저", force=True)
                 return
-            for w in coin_workers:
-                _send_ipc_cmd(w.market, sub_cmd, req_id=req_id)
-            for w in coin_workers:
-                result = _read_ipc_result(w.market, timeout=timeout, req_id=req_id)
-                if result:
-                    clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
-                    # 봇이 이미 [🪙 COIN] 태그를 달아서 보내므로 첫 줄 태그 제거
-                    lines = clean.strip().splitlines()
-                    if lines and lines[0].startswith("[") and lines[0].endswith("]"):
-                        clean = "\n".join(lines[1:]).strip()
-                    if clean.strip():
-                        send_msg(clean, level="normal",
-                                 source=f"🪙{w.market.replace('KRW-','')}",
-                                 force=True, keyboard=KB_COIN_BOT if use_kb else None)
+            _send_ipc_cmd("multicoin", sub_cmd, req_id=req_id)
+            result = _read_ipc_result("multicoin", timeout=timeout, req_id=req_id)
+            if result:
+                clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+                if clean.strip():
+                    send_msg(clean, level="normal", source="🪙멀티코인",
+                             force=True, keyboard=KB_COIN_BOT if use_kb else None)
 
         elif target == "stock":
             stock_workers = [w for w in list(_workers) if isinstance(w, StockWorker)]
@@ -2154,32 +2142,17 @@ def _forward_to_bot(target, sub_cmd_str):
     req_id = _uuid.uuid4().hex[:8]
     workers_snap = list(_workers)
     if target == "coin":
-        coin_workers = [w for w in workers_snap if isinstance(w, CoinWorker)]
-        if not coin_workers:
-            send_msg("🪙 실행 중인 코인봇 없음", level="normal", source="매니저", force=True)
+        mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
+        if not mc_workers:
+            send_msg("🪙 멀티코인봇 실행 안 됨", level="normal", source="매니저", force=True)
             return
-        for w in coin_workers:
-            _send_ipc_cmd(w.market, sub_cmd, req_id=req_id)
-        results = []
-        for w in coin_workers:
-            result = _read_ipc_result(w.market, timeout=timeout, req_id=req_id)
-            if result:
-                clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
-                if clean.strip():
-                    results.append((w.market.replace('KRW-',''), clean.strip()))
-        if results:
-            if sub_cmd == "/why" and len(results) > 1:
-                # /why 는 전체 합쳐서 한 메시지로
-                merged = "\n─────────────────\n".join(
-                    f"🪙{mkt}\n{txt}" for mkt, txt in results
-                )
-                send_msg(merged, level="normal", source="🪙코인봇",
+        _send_ipc_cmd("multicoin", sub_cmd, req_id=req_id)
+        result = _read_ipc_result("multicoin", timeout=timeout, req_id=req_id)
+        if result:
+            clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+            if clean.strip():
+                send_msg(clean, level="normal", source="🪙멀티코인",
                          force=True, keyboard=KB_COIN_BOT if use_kb else None)
-            else:
-                for mkt, clean in results:
-                    send_msg(clean, level="normal",
-                             source=f"🪙{mkt}",
-                             force=True, keyboard=KB_COIN_BOT if use_kb else None)
     elif target == "stock":
         stock_workers = [w for w in workers_snap if isinstance(w, StockWorker)]
         if not stock_workers:
@@ -2198,6 +2171,8 @@ def _send_ipc_cmd(target, cmd_text, req_id=None):
     기존 파일이 있으면 덮어쓰지 않고 봇이 처리할 때까지 대기 후 전송."""
     if target == "stock":
         cmd_file = os.path.join(SHARED_DIR, "cmd_stock.json")
+    elif target == "multicoin":
+        cmd_file = os.path.join(SHARED_DIR, "cmd_multicoin.json")
     else:
         mkt = target.replace("KRW-", "").lower()
         cmd_file = os.path.join(SHARED_DIR, f"cmd_{mkt}.json")
@@ -2225,6 +2200,8 @@ def _read_ipc_result(target, timeout=5.0, req_id=None):
     req_id가 있으면 해당 req_id의 결과 파일만 읽음."""
     if target == "stock":
         base = "result_stock"
+    elif target == "multicoin":
+        base = "result_multicoin"
     else:
         mkt = target.replace("KRW-", "").lower()
         base = f"result_{mkt}"
@@ -2253,7 +2230,9 @@ def _poll_ipc_results():
     IPC 명령 응답(_read_ipc_result)과는 별개 — 봇이 스스로 쓴 result 파일."""
     targets = []
     for w in list(_workers):
-        if isinstance(w, CoinWorker):
+        if isinstance(w, MultiCoinWorker):
+            targets.append(("result_multicoin.json", "🪙멀티코인", KB_COIN_BOT))
+        elif isinstance(w, CoinWorker):
             mkt = w.market.replace("KRW-", "").lower()
             targets.append((f"result_{mkt}.json", f"🪙{w.market}", KB_COIN_BOT))
         elif isinstance(w, StockWorker):
