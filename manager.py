@@ -357,16 +357,14 @@ KB_MAIN = [
 
 # 코인봇 메뉴: 상태조회 먼저, 조작 다음
 KB_COIN_BOT = [
-    [{"text": "📊 상태조회",    "callback_data": "/bot_cmd coin status"},
-     {"text": "🔍 왜 안사/팔?", "callback_data": "/c why"}],
-    [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd coin start"},
-     {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd coin sell"},
-     {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd coin aggressive"}],
+    [{"text": "📊 상태조회",    "callback_data": "/bot_cmd multicoin status"},
+     {"text": "🔍 왜 안사?",    "callback_data": "/bot_cmd multicoin why"}],
+    [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd multicoin start"},
+     {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd multicoin sell"},
+     {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd multicoin aggressive"}],
     [{"text": "🔁 종목변경",    "callback_data": "/coin_switch_menu"},
      {"text": "⚙️ 수치설정",    "callback_data": "/coin_set_menu"},
-     {"text": "🧪 분석",        "callback_data": "/analyze_menu"}],
-    [{"text": "🧪 테스트 ON",   "callback_data": "/bot_cmd coin test on"},
-     {"text": "테스트 OFF",     "callback_data": "/bot_cmd coin test off"}],
+     {"text": "🔍 분석",        "callback_data": "/analyze_menu"}],
     [{"text": "◀️ 메인",        "callback_data": "/menu"}],
 ]
 
@@ -1461,7 +1459,7 @@ def _handle_command_inner(text):
         req_id  = _uuid.uuid4().hex[:8]
         workers_snap = list(_workers)
 
-        if target == "coin":
+        if target in ("coin", "multicoin"):
             mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
             if not mc_workers:
                 send_msg("🪙 멀티코인봇 실행 안 됨", level="normal", source="매니저", force=True)
@@ -1764,12 +1762,11 @@ def _handle_command_inner(text):
     # ── 분석 메뉴 ────────────────────────────────────────────
     elif cmd[0] == "/analyze_menu":
         workers_snap = list(_workers)
-        coin_workers = [w for w in workers_snap if isinstance(w, CoinWorker)]
-        if not coin_workers:
+        mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
+        if not mc_workers:
             send_msg("🪙 실행 중인 코인봇 없음", level="normal", source="매니저", force=True)
             return
-        for w in coin_workers:
-            _send_ipc_cmd(w.market, "/analyze")
+        _send_ipc_cmd("multicoin", "/why")
         send_msg("🔍 분석 시작...", level="normal", source="매니저", force=True)
 
     elif cmd[0] == "/analyze_menu_stock":
