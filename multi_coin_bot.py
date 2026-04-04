@@ -781,7 +781,7 @@ def handle_command(text, req_id=""):
         now = _t.time()
         for m, c in snap.items():
             if m in holding: continue
-            if checked >= 10: break
+            if checked >= 30: break
             h = list(c.get("history", []))
             cnt = c.get("real_data_count", 0)
             if cnt < REAL_DATA_MIN:
