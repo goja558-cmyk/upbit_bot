@@ -59,6 +59,16 @@ UPBIT_BASE    = "https://api.upbit.com/v1"
 FEE_RATE      = 0.0005
 MIN_ORDER_KRW = 5_000
 MIN_TRADE_KRW = 20_000   # 슬롯당 최소 예산
+
+# 장세별 슬롯당 예산 비율 (TOTAL_BUDGET 대비)
+# 상승장: 5슬롯 × 18% = 90% 투자, 10% 유보
+# 중립장: 3슬롯 × 30% = 90% 투자, 10% 유보
+# 하락장: 2슬롯 × 25% = 50% 투자, 50% 유보
+SLOT_BUDGET_RATIO = {
+    "bull":    0.18,
+    "neutral": 0.28,
+    "bear":    0.25,
+}
 LOOP_INTERVAL  = 10
 WATCH_COUNT    = 30
 WATCH_INTERVAL = 300     # 시세 일괄 조회 주기 (초) — 1시간봉은 5분마다면 충분
@@ -234,6 +244,37 @@ _daily_ma_cache = {}
 _daily_ma_ts    = {}
 DAILY_MA_TTL    = 3600
 
+def get_hourly_ma(market, short=20, long=60):
+    """시간봉 MA20, MA60 API 직접 조회"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/60",
+            params={"market": market, "count": long + 5}, timeout=5
+        )
+        if r.status_code == 200:
+            closes = [c["trade_price"] for c in reversed(r.json())]
+            ma_s = sum(closes[-short:]) / short if len(closes) >= short else None
+            ma_l = sum(closes[-long:]) / long if len(closes) >= long else None
+            return ma_s, ma_l
+    except Exception as e:
+        cprint(f"[시간봉MA 오류] {market}: {e}", Fore.YELLOW)
+    return None, None
+
+# 시간봉 MA 캐시 (5분마다 갱신)
+_hourly_ma_cache = {}
+_hourly_ma_ts    = {}
+HOURLY_MA_TTL    = 300
+
+def get_hourly_ma_cached(market):
+    import time as _t
+    now = _t.time()
+    if market in _hourly_ma_cache and now - _hourly_ma_ts.get(market, 0) < HOURLY_MA_TTL:
+        return _hourly_ma_cache[market]
+    ma20, ma60 = get_hourly_ma(market)
+    _hourly_ma_cache[market] = (ma20, ma60)
+    _hourly_ma_ts[market]    = now
+    return ma20, ma60
+
 def get_daily_ma_cached(market):
     import time as _t
     now = _t.time()
@@ -292,8 +333,8 @@ def get_regime_conditions():
     """
     regime = _market_regime
     if regime == "bull":
-        primary   = dict(rsi_max=30, drop_min=2.0, vol_ratio_min=1.2, vol_min=2.0, vol_max=8.0, is_secondary=False)
-        secondary = dict(rsi_max=35, drop_min=2.5, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=True)
+        primary   = dict(rsi_max=30, drop_min=1.0, vol_ratio_min=1.0, vol_min=1.0, vol_max=8.0, is_secondary=False)
+        secondary = dict(rsi_max=35, drop_min=1.5, vol_ratio_min=1.1, vol_min=1.0, vol_max=8.0, is_secondary=True)
         return primary, secondary
     elif regime == "neutral":
         primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=False)
@@ -449,7 +490,9 @@ def do_buy(market, price, reason):
             cprint(f"[슬롯 부족] {market} 매수 불가 ({len(slots)}/{MAX_SLOTS})", Fore.YELLOW)
             return False
 
-    per_slot = max(MIN_TRADE_KRW, TOTAL_BUDGET // max(MAX_SLOTS, 1))
+    regime = _market_regime or "neutral"
+    ratio  = SLOT_BUDGET_RATIO.get(regime, 0.28)
+    per_slot = max(MIN_ORDER_KRW, int(TOTAL_BUDGET * ratio))
     balance  = get_balance_krw()
     order_krw = int(min(per_slot, balance) * 0.98)
     if order_krw < MIN_ORDER_KRW:
@@ -570,9 +613,10 @@ def check_buy_score(market, price, volume, open_price=0):
     if time.time() - c["last_sell_time"] < c["cooldown"]: return False, 0
 
     rsi  = calc_rsi(h)
-    ma20 = calc_ma(h, 20)
-    ma60 = calc_ma(h, 60)
     vol  = calc_vol_pct(c["timed"])
+
+    # 시간봉 MA는 API에서 직접 가져옴 (history 혼재 문제 방지)
+    ma20, ma60 = get_hourly_ma_cached(market)
 
     if rsi is None or ma20 is None or ma60 is None: return False, 0
 
@@ -595,9 +639,8 @@ def check_buy_score(market, price, volume, open_price=0):
 
     # 공통 필수 조건
     if ma20 <= ma60: return False, 0                          # 시간봉 추세
-    if vol is None or not (2.0 <= vol <= 8.0): return False, 0  # 변동성
-    if open_price > 0 and price <= open_price: return False, 0  # 양봉
-    if p1 is None or rsi <= p1: return False, 0               # 반등
+    if vol is None or not (1.0 <= vol <= 8.0): return False, 0  # 변동성 하한 1%로 완화, 양봉 조건 제거
+    # RSI 반등 공통 필수에서 제거
 
     # ── 장세별 트리거 체크 ────────────────────────────────────
     primary, secondary = get_regime_conditions()
@@ -785,15 +828,17 @@ def handle_command(text, req_id=""):
             h = list(c.get("history", []))
             cnt = c.get("real_data_count", 0)
             if cnt < REAL_DATA_MIN:
+                # 프리필 즉시 실행
+                prefill(m)
+                cnt = c.get("real_data_count", 0)
+            if cnt < REAL_DATA_MIN:
                 prob_list.append((m, 0, f"데이터 수집중 {cnt}/{REAL_DATA_MIN}"))
                 checked += 1
                 continue
-                checked += 1
-                continue
             rsi = calc_rsi(h)
-            ma20 = calc_ma(h, 20)
-            ma60 = calc_ma(h, 60)
             vol = calc_vol_pct(c.get("timed", []))
+            # 시간봉 MA API 직접 조회
+            ma20, ma60 = get_hourly_ma_cached(m)
             price = h[-1] if h else 0
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
@@ -810,10 +855,10 @@ def handle_command(text, req_id=""):
 
             def _check_trigger(cond_t):
                 if rsi > cond_t["rsi_max"]: return f"RSI과열 {rsi:.1f}(≤{cond_t['rsi_max']})"
-                if p1 is None or rsi <= p1: return f"RSI반등없음 {rsi:.1f}"
+
                 if ma20 is None or ma20 <= (ma60 or 0): return f"MA하락"
                 if drop_pct_w < cond_t["drop_min"]: return f"눌림부족 {drop_pct_w:.1f}%(≥{cond_t['drop_min']}%)"
-                if vol is None or not (2.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
+                if vol is None or not (1.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
                 if vol_ratio_w < cond_t["vol_ratio_min"]: return f"거래량부족 {vol_ratio_w:.1f}배(≥{cond_t['vol_ratio_min']}배)"
                 if _market_regime == "bull" and d_ma20_w is not None and d_ma60_w is not None and d_ma20_w <= d_ma60_w:
                     return "일봉하락추세"
@@ -832,7 +877,7 @@ def handle_command(text, req_id=""):
                 scores.append(1.0 if drop_pct_w >= drop_target else max(0, drop_pct_w / drop_target))
                 if vol is None:
                     scores.append(0.2)
-                elif 2.0 <= vol <= 8.0:
+                elif 1.0 <= vol <= 8.0:
                     scores.append(1.0)
                 elif vol < 2.0:
                     scores.append(max(0, vol / 2.0))
@@ -852,19 +897,30 @@ def handle_command(text, req_id=""):
             elif rsi is None:
                 prob_list.append((m, 0, "데이터 없음"))
             else:
-                prob_pri = _calc_prob(primary_w)
-                prob_sec = _calc_prob(secondary_w) if secondary_w else 0
-                prob = max(prob_pri, prob_sec)
-                best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
-                hints = []
-                if rsi > best_cond["rsi_max"]:
-                    hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
-                if drop_pct_w < best_cond["drop_min"]:
-                    hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
-                if vol_ratio_w < best_cond["vol_ratio_min"]:
-                    hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
-                hint_str = ", ".join(hints[:2])
-                prob_list.append((m, prob, hint_str))
+                # 공통 필수 탈락 여부 먼저 체크
+                common_fail = []
+                if ma20 is None or ma60 is None or ma20 <= ma60:
+                    common_fail.append("MA하락")
+                if vol is None or not (1.0 <= vol <= 8.0):
+                    common_fail.append(f"변동성{vol:.1f}%" if vol else "변동성없음")
+                # 양봉은 open_price 없이 판단 불가 → 생략
+
+                if common_fail:
+                    prob_list.append((m, 0, ", ".join(common_fail)))
+                else:
+                    prob_pri = _calc_prob(primary_w)
+                    prob_sec = _calc_prob(secondary_w) if secondary_w else 0
+                    prob = max(prob_pri, prob_sec)
+                    best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
+                    hints = []
+                    if rsi > best_cond["rsi_max"]:
+                        hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
+                    if drop_pct_w < best_cond["drop_min"]:
+                        hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
+                    if vol_ratio_w < best_cond["vol_ratio_min"]:
+                        hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
+                    hint_str = ", ".join(hints[:2])
+                    prob_list.append((m, prob, hint_str))
             checked += 1
         hot  = sorted([(m,p,h) for m,p,h in prob_list if p >= 70], key=lambda x: x[1], reverse=True)
         mid  = sorted([(m,p,h) for m,p,h in prob_list if 40 <= p < 70], key=lambda x: x[1], reverse=True)
@@ -879,8 +935,8 @@ def handle_command(text, req_id=""):
                 lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if cold:
             lines.append("⏳ 아직 멀었음")
-            for m, p, _ in cold:
-                lines.append(f"  {m.replace('KRW-','')}: {p}점")
+            for m, p, h in cold:
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if not prob_list and not holding:
             lines.append("감시 종목 없음")
         _write_ipc_result("\n".join(lines), req_id)
@@ -891,10 +947,15 @@ def prefill(market):
     c = get_or_create_coin(market)
     prices = get_ohlcv(market, count=REAL_DATA_MIN + 10, interval=CANDLE_INTERVAL)
     if prices:
-        for p in prices:
+        now_ts = time.time()
+        candle_sec = CANDLE_INTERVAL * 60  # 캔들 간격(초)
+        for i, p in enumerate(prices):
             c["history"].append(p)
-        c["real_data_count"] = len(prices)
-        cprint(f"[프리필] {market} {len(prices)}개 로드", Fore.CYAN)
+            # timed에 과거 타임스탬프로 역산해서 삽입 (변동성 계산용)
+            past_ts = now_ts - (len(prices) - 1 - i) * candle_sec
+            c["timed"].append((past_ts, p))
+        c["real_data_count"] = max(REAL_DATA_MIN, len(prices))
+        cprint(f"[프리필] {market} {len(prices)}개 로드 (timed 포함)", Fore.CYAN)
 
 # ============================================================
 # [14] 메인 루프
