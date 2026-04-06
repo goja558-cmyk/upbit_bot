@@ -111,10 +111,9 @@ _indicator_last_ts     = {}    # {market: last_log_ts}
 _indicator_pending_fwd = {}    # {market: {"ts": float, "price": float, "file": str}}
 
 
-def _get_indicator_log_path(market):
-    """logs/indicators/MARKET/YYYY-MM-DD.csv"""
-    coin = market.replace("KRW-", "")
-    log_dir = os.path.join(BASE_DIR, "logs", "indicators", coin)
+def _get_indicator_log_path(market=None):
+    """logs/indicators/YYYY-MM-DD.csv — 모든 코인 하나의 파일"""
+    log_dir = os.path.join(BASE_DIR, "logs", "indicators")
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, f"{date.today().strftime('%Y-%m-%d')}.csv")
 
