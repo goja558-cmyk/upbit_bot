@@ -47,7 +47,9 @@ def cprint(text, color="", bright=False, **_):
 # ============================================================
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.join(BASE_DIR, "shared")
+LOG_DIR    = os.path.join(BASE_DIR, "logs", "daily")
 os.makedirs(SHARED_DIR, exist_ok=True)
+os.makedirs(LOG_DIR,    exist_ok=True)
 
 import argparse as _ap
 _p = _ap.ArgumentParser(add_help=False)
@@ -417,8 +419,16 @@ def _make_coin_state(market):
         "trade_count":    0,
         "daily_pnl":      0.0,
         "real_data_count": 0,
-        "bear_entry_rsi":  None,   # 하락장 진입 시 RSI 기록 (조기손절용)
+        "bear_entry_rsi":   None,  # 하락장 진입 시 RSI 기록 (조기손절용)
         "bear_entry_candle": 0,    # 진입 후 경과 봉 수
+        "max_drawdown_pct":  0.0,  # 보유 중 최대 손실 MAE
+        "signal_price":      0.0,  # 신호 감지 시점 가격
+        "signal_time":       0.0,  # 신호 감지 타임스탬프
+        "signal_rsi":        None, # 신호 시점 RSI
+        "signal_rsi_prev":   None, # 신호 직전 RSI (delta용)
+        "entry_open":        0.0,  # 진입 봉 시가 (캔들 구조)
+        "entry_high":        0.0,  # 진입 봉 고가
+        "entry_low":         0.0,  # 진입 봉 저가
         **p,
     }
 
@@ -479,7 +489,7 @@ def _write_ipc_result(text, req_id=""):
 # ============================================================
 _order_lock = threading.Lock()
 
-def do_buy(market, price, reason):
+def do_buy(market, price, reason, open_price=0.0):
     global daily_pnl
     c = get_or_create_coin(market)
 
@@ -511,9 +521,11 @@ def do_buy(market, price, reason):
     c.update({
         "has_stock": True, "buy_price": avg_p,
         "filled_qty": filled, "be_active": False,
-        "highest_profit": 0.0, "buy_time": time.time(),
+        "highest_profit": 0.0, "max_drawdown_pct": 0.0,
+        "buy_time": time.time(),
         "bear_entry_rsi": calc_rsi(coins.get(market, {}).get("history", [])) if regime == "bear" else None,
         "bear_entry_candle": 0,
+        "entry_open": open_price,  # do_buy 호출 시 open_price 전달
     })
     with slots_lock:
         slots.add(market)
@@ -526,6 +538,9 @@ def do_buy(market, price, reason):
         f"목표가: {target_p:,.2f}원  손절가: {stop_p:,.2f}원\n"
         f"이유: {reason}", market=market, level="critical"
     )
+    entry_delay = time.time() - c.get("signal_time", time.time())
+    write_trade_log(market, "BUY", avg_p, filled, reason=reason,
+                    open_price=open_price, entry_delay_sec=entry_delay)
     _write_status()
     return True
 
@@ -542,6 +557,9 @@ def do_sell(market, price, reason):
     actual = avg_p if avg_p > 0 else price
     fee    = (c["buy_price"] * c["filled_qty"] + actual * filled) * FEE_RATE
     pnl    = (actual - c["buy_price"]) * filled - fee
+    pnl_pct = (actual - c["buy_price"]) / c["buy_price"] * 100 if c["buy_price"] > 0 else 0.0
+    hold_sec = time.time() - c.get("buy_time", time.time())
+    buy_price_snap = c["buy_price"]
 
     daily_pnl       += pnl
     c["daily_pnl"]  += pnl
@@ -559,13 +577,382 @@ def do_sell(market, price, reason):
         f"이번 손익: {pnl:+,.0f}원\n"
         f"이유: {reason}", market=market, level="critical"
     )
+    write_trade_log(market, "SELL", actual, filled,
+                    pnl_krw=pnl, pnl_pct=pnl_pct,
+                    reason=reason, buy_price=buy_price_snap,
+                    hold_sec=hold_sec)
     _write_status()
     return True
 
 # ============================================================
-# [8] 매도 조건 체크 (보유 중 루프)
+# [7-1] 거래 로그 / 상태 로그 (이벤트 기반 + 5분 상태)
 # ============================================================
-def check_sell(market, price):
+LOG_DIR_DAILY = os.path.join(BASE_DIR, "logs", "daily")
+LOG_DIR_STATE = os.path.join(BASE_DIR, "logs", "state")
+os.makedirs(LOG_DIR_DAILY, exist_ok=True)
+os.makedirs(LOG_DIR_STATE, exist_ok=True)
+
+_TRADE_HEADER = [
+    # 기본
+    "datetime", "market", "side", "event_tag",
+    # 가격/수량
+    "price", "qty", "order_krw",
+    # 손익
+    "pnl_krw", "pnl_pct",
+    # RSI
+    "rsi", "rsi_entry", "rsi_delta",
+    # 캔들 구조
+    "candle_body_pct", "lower_wick_pct",
+    # 눌림/변동성
+    "drop_pct", "vol_pct", "vol_ratio",
+    "volatility_regime",
+    # MA
+    "h_ma20", "h_ma60", "d_ma20", "d_ma60",
+    "trend_strength",
+    # 장세
+    "regime",
+    # 슬리피지
+    "signal_price", "slippage_pct", "entry_delay_sec",
+    # 보유
+    "buy_price", "hold_sec",
+    "highest_profit", "max_drawdown_pct",
+    # 직전 흐름
+    "last_3_return_sum",
+    # 메타
+    "trade_count", "slot_used", "total_budget", "reason",
+]
+
+_STATE_HEADER = [
+    "datetime", "market", "event_tag",
+    "price", "pnl_pct",
+    "rsi", "rsi_delta",
+    "drop_pct", "vol_pct", "vol_ratio",
+    "h_ma20", "h_ma60",
+    "highest_profit", "max_drawdown_pct",
+    "regime", "hold_sec",
+]
+
+def _vol_regime(vol):
+    if vol is None: return ""
+    if vol < 2.0:   return "low"
+    if vol < 5.0:   return "mid"
+    return "high"
+
+def _trend_strength(d_ma20, d_ma60):
+    if d_ma20 is None or d_ma60 is None or d_ma60 == 0: return ""
+    gap = abs(d_ma20 - d_ma60) / d_ma60 * 100
+    return "strong" if gap >= 3.0 else "weak"
+
+def _candle_shape(open_p, high_p, low_p, close_p):
+    """캔들 몸통 비율, 아래꼬리 비율 계산."""
+    rng = high_p - low_p
+    if rng <= 0: return 0.0, 0.0
+    body = abs(close_p - open_p) / rng * 100
+    lower_wick = (min(open_p, close_p) - low_p) / rng * 100
+    return round(body, 2), round(lower_wick, 2)
+
+def _last_3_return(history):
+    """최근 3봉 수익률 합계."""
+    h = list(history)
+    if len(h) < 4: return ""
+    r = sum((h[-i] - h[-i-1]) / h[-i-1] * 100 for i in range(1, 4) if h[-i-1] > 0)
+    return round(r, 4)
+
+def _get_vol_ratio(c):
+    vh = list(c.get("vol_history", []))
+    if len(vh) >= 6 and vh[-1] > 0:
+        avg5 = sum(vh[-6:-1]) / 5
+        return vh[-1] / avg5 if avg5 > 0 else 1.0
+    return 1.0
+
+def write_trade_log(market, side, price, qty,
+                    pnl_krw=0.0, pnl_pct=0.0, reason="",
+                    buy_price=0.0, hold_sec=0.0,
+                    open_price=0.0, entry_delay_sec=0.0,
+                    event_tag=""):
+    """매수/매도/이벤트 시 일자별 상세 CSV 기록."""
+    try:
+        c        = coins.get(market, {})
+        h        = c.get("history", deque())
+        rsi      = calc_rsi(h)
+        vol      = calc_vol_pct(c.get("timed", []))
+        vol_ratio= _get_vol_ratio(c)
+        d_ma20, d_ma60 = get_daily_ma_cached(market)
+        h_ma20, h_ma60 = get_hourly_ma_cached(market)
+        drop_pct = (h_ma20 - price) / h_ma20 * 100 if h_ma20 and h_ma20 > 0 else 0.0
+        order_krw= round(price * qty, 0)
+
+        # RSI delta
+        sig_rsi  = c.get("signal_rsi")
+        sig_prev = c.get("signal_rsi_prev")
+        rsi_delta= round(sig_rsi - sig_prev, 2) if sig_rsi and sig_prev else ""
+
+        # 진입 시 RSI (매도 시 기록)
+        rsi_entry= round(c.get("bear_entry_rsi") or sig_rsi or 0, 2) if side == "SELL" else ""
+
+        # 캔들 구조 (진입봉 기준)
+        eo = c.get("entry_open", open_price)
+        eh = c.get("entry_high", price)
+        el = c.get("entry_low",  price)
+        body_pct, wick_pct = _candle_shape(eo, eh, el, price)
+
+        # 슬리피지
+        sig_p    = c.get("signal_price", price)
+        slip_pct = round((price - sig_p) / sig_p * 100, 4) if sig_p > 0 else 0.0
+
+        with slots_lock:
+            slot_used = len(slots)
+
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            market, side, event_tag or side,
+            round(price, 4), round(float(qty), 8), round(order_krw, 0),
+            round(pnl_krw, 0), round(pnl_pct, 4),
+            round(rsi, 2)    if rsi    is not None else "",
+            rsi_entry, rsi_delta,
+            body_pct, wick_pct,
+            round(drop_pct, 4),
+            round(vol, 4)    if vol    is not None else "",
+            round(vol_ratio, 4),
+            _vol_regime(vol),
+            round(h_ma20, 2) if h_ma20 is not None else "",
+            round(h_ma60, 2) if h_ma60 is not None else "",
+            round(d_ma20, 2) if d_ma20 is not None else "",
+            round(d_ma60, 2) if d_ma60 is not None else "",
+            _trend_strength(d_ma20, d_ma60),
+            _market_regime,
+            round(sig_p, 4),
+            slip_pct,
+            round(entry_delay_sec, 1),
+            round(buy_price, 4), round(hold_sec, 1),
+            round(c.get("highest_profit", 0.0), 4),
+            round(c.get("max_drawdown_pct", 0.0), 4),
+            _last_3_return(h),
+            c.get("trade_count", 0), slot_used, TOTAL_BUDGET,
+            reason,
+        ]
+
+        today    = date.today().strftime("%Y-%m-%d")
+        log_path = os.path.join(LOG_DIR_DAILY, f"{today}.csv")
+        write_hdr= not os.path.exists(log_path)
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if write_hdr: w.writerow(_TRADE_HEADER)
+            w.writerow(row)
+    except Exception as e:
+        cprint(f"[거래 로그 오류] {e}", Fore.YELLOW)
+
+# 상태 로그 — 보유 중 종목만 5분마다
+_last_state_log_ts = 0.0
+STATE_LOG_INTERVAL = 300  # 5분
+
+def write_state_log(market, price, event_tag="모니터링"):
+    """보유 중 종목 상태를 주기적으로 기록."""
+    try:
+        c   = coins.get(market, {})
+        if not c.get("has_stock"): return
+        buy_p   = c.get("buy_price", 0)
+        pnl_pct = (price - buy_p) / buy_p * 100 if buy_p > 0 else 0.0
+        rsi     = calc_rsi(c.get("history", deque()))
+        vol     = calc_vol_pct(c.get("timed", []))
+        vol_ratio= _get_vol_ratio(c)
+        h_ma20, h_ma60 = get_hourly_ma_cached(market)
+        drop_pct= (h_ma20 - price) / h_ma20 * 100 if h_ma20 and h_ma20 > 0 else 0.0
+        sig_rsi = c.get("signal_rsi")
+        sig_prev= c.get("signal_rsi_prev")
+        rsi_delta= round(rsi - sig_rsi, 2) if rsi and sig_rsi else ""
+        hold_sec= time.time() - c.get("buy_time", time.time())
+
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            market, event_tag,
+            round(price, 4), round(pnl_pct, 4),
+            round(rsi, 2) if rsi is not None else "",
+            rsi_delta,
+            round(drop_pct, 4),
+            round(vol, 4) if vol is not None else "",
+            round(vol_ratio, 4),
+            round(h_ma20, 2) if h_ma20 is not None else "",
+            round(h_ma60, 2) if h_ma60 is not None else "",
+            round(c.get("highest_profit", 0.0), 4),
+            round(c.get("max_drawdown_pct", 0.0), 4),
+            _market_regime,
+            round(hold_sec, 1),
+        ]
+        today    = date.today().strftime("%Y-%m-%d")
+        log_path = os.path.join(LOG_DIR_STATE, f"{today}.csv")
+        write_hdr= not os.path.exists(log_path)
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if write_hdr: w.writerow(_STATE_HEADER)
+            w.writerow(row)
+    except Exception as e:
+        cprint(f"[상태 로그 오류] {e}", Fore.YELLOW)
+
+
+
+# ============================================================
+# [7-3] 인디케이터 로그 (근접 TOP3 + 랜덤 10% 샘플링)
+# ============================================================
+LOG_DIR_INDICATOR = os.path.join(BASE_DIR, "logs", "indicator")
+os.makedirs(LOG_DIR_INDICATOR, exist_ok=True)
+
+_INDICATOR_HEADER = [
+    "datetime", "market", "price", "hour",
+    "rsi", "drop_pct", "vol_ratio", "vol_pct",
+    "h_ma20", "h_ma60", "d_ma20", "d_ma60",
+    "near_trigger", "signal_score", "entry_possible",
+    "log_type",   # near / random
+    "regime",
+    "fwd_return_5m", "fwd_return_10m",  # 빈칸 → 5/10분 후 채움
+    "fwd_ts",     # 기준 타임스탬프 (내부용)
+]
+
+# fwd 업데이트용 버퍼: [(log_path, row_idx, price, ts_5m, ts_10m), ...]
+_fwd_pending = []
+_fwd_lock    = threading.Lock()
+
+def _calc_near_trigger(rsi, drop_pct, vol_ratio):
+    """0에 가까울수록 진입 직전. 각 조건 미달 정도 정규화 합산."""
+    rsi_gap  = max(0.0, rsi - 28) / 28
+    drop_gap = max(0.0, 2.0 - drop_pct) / 2.0
+    vol_gap  = max(0.0, 1.3 - vol_ratio) / 1.3
+    return round(0.4 * rsi_gap + 0.35 * drop_gap + 0.25 * vol_gap, 4)
+
+def _entry_possible(rsi, drop_pct, vol_ratio, regime):
+    """현재 시점 진입 조건 충족 여부 (슬롯/쿨다운 무시)."""
+    cond = get_regime_conditions()[0]
+    return int(
+        rsi      <= cond["rsi_max"] and
+        drop_pct >= cond["drop_min"] and
+        vol_ratio>= cond["vol_ratio_min"]
+    )
+
+def write_indicator_log(market_data_list):
+    """5분마다 감시 종목 전체 스캔 → 근접 TOP3 + 랜덤 10% 기록.
+    market_data_list: [(market, price, rsi, drop_pct, vol_ratio, vol_pct,
+                        h_ma20, h_ma60, d_ma20, d_ma60, score), ...]
+    """
+    import random
+    if not market_data_list:
+        return
+
+    now     = time.time()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hour    = datetime.now().hour
+    today   = date.today().strftime("%Y-%m-%d")
+    log_path= os.path.join(LOG_DIR_INDICATOR, f"{today}.csv")
+    write_hdr = not os.path.exists(log_path)
+
+    # near_trigger 계산 후 정렬
+    scored = []
+    for item in market_data_list:
+        market, price, rsi, drop_pct, vol_ratio, vol_pct, \
+            h_ma20, h_ma60, d_ma20, d_ma60, score = item
+        if rsi is None: continue
+        nt = _calc_near_trigger(rsi, drop_pct or 0, vol_ratio or 1.0)
+        ep = _entry_possible(rsi, drop_pct or 0, vol_ratio or 1.0, _market_regime)
+        scored.append((nt, market, price, rsi, drop_pct, vol_ratio, vol_pct,
+                       h_ma20, h_ma60, d_ma20, d_ma60, score, ep))
+    scored.sort(key=lambda x: x[0])  # near_trigger 오름차순
+
+    # TOP 3 (근접)
+    to_write = []
+    for item in scored[:3]:
+        to_write.append(("near", item))
+
+    # 랜덤 10% 샘플 (near TOP3 제외)
+    rest = scored[3:]
+    sample_n = max(1, int(len(rest) * 0.10))
+    for item in random.sample(rest, min(sample_n, len(rest))):
+        to_write.append(("random", item))
+
+    rows_written = []
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_hdr:
+            w.writerow(_INDICATOR_HEADER)
+        for log_type, item in to_write:
+            nt, market, price, rsi, drop_pct, vol_ratio, vol_pct, \
+                h_ma20, h_ma60, d_ma20, d_ma60, score, ep = item
+            row = [
+                now_str, market, round(price, 4), hour,
+                round(rsi, 2),
+                round(drop_pct, 4)  if drop_pct  is not None else "",
+                round(vol_ratio, 4) if vol_ratio  is not None else "",
+                round(vol_pct, 4)   if vol_pct    is not None else "",
+                round(h_ma20, 2)    if h_ma20     is not None else "",
+                round(h_ma60, 2)    if h_ma60     is not None else "",
+                round(d_ma20, 2)    if d_ma20     is not None else "",
+                round(d_ma60, 2)    if d_ma60     is not None else "",
+                nt, score, ep,
+                log_type,
+                _market_regime,
+                "", "",   # fwd_return_5m, fwd_return_10m (나중에 채움)
+                now,      # fwd_ts
+            ]
+            w.writerow(row)
+            rows_written.append((log_path, price, now + 300, now + 600))
+
+    # fwd 업데이트 버퍼에 추가
+    with _fwd_lock:
+        _fwd_pending.extend(rows_written)
+
+def update_fwd_returns(current_prices: dict):
+    """5분/10분 후 가격으로 fwd_return 컬럼 업데이트."""
+    now = time.time()
+    still_pending = []
+    with _fwd_lock:
+        pending = list(_fwd_pending)
+        _fwd_pending.clear()
+
+    for log_path, entry_price, ts_5m, ts_10m in pending:
+        done_5  = now >= ts_5m
+        done_10 = now >= ts_10m
+        if not done_10:
+            still_pending.append((log_path, entry_price, ts_5m, ts_10m))
+            continue
+        # 파일에서 해당 행 찾아 업데이트
+        try:
+            rows = []
+            updated = False
+            with open(log_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                fwd5_idx  = header.index("fwd_return_5m")
+                fwd10_idx = header.index("fwd_return_10m")
+                fts_idx   = header.index("fwd_ts")
+                price_idx = header.index("price")
+                mkt_idx   = header.index("market")
+                rows.append(header)
+                for row in reader:
+                    if row[fwd10_idx] == "" and row[fts_idx]:
+                        try:
+                            row_ts    = float(row[fts_idx])
+                            row_price = float(row[price_idx])
+                            mkt       = row[mkt_idx]
+                            cur_price = current_prices.get(mkt, 0)
+                            if cur_price > 0:
+                                if now >= row_ts + 300 and row[fwd5_idx] == "":
+                                    row[fwd5_idx]  = round((cur_price - row_price) / row_price * 100, 4)
+                                if now >= row_ts + 600:
+                                    row[fwd10_idx] = round((cur_price - row_price) / row_price * 100, 4)
+                                    updated = True
+                        except Exception:
+                            pass
+                    rows.append(row)
+            if updated:
+                tmp = log_path + ".tmp"
+                with open(tmp, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows(rows)
+                os.replace(tmp, log_path)
+        except Exception as e:
+            cprint(f"[fwd 업데이트 오류] {e}", Fore.YELLOW)
+
+    with _fwd_lock:
+        _fwd_pending.extend(still_pending)
+
+
     c = coins.get(market)
     if not c or not c["has_stock"]: return
 
@@ -576,11 +963,13 @@ def check_sell(market, price):
     # ── 하락장 조기손절 체크 ─────────────────────────────────
     if _market_regime == "bear" and c.get("bear_entry_rsi") is not None:
         c["bear_entry_candle"] = c.get("bear_entry_candle", 0) + 1
-        if c["bear_entry_candle"] <= 2:
-            cur_rsi = calc_rsi(c.get("history", []))
-            entry_rsi = c["bear_entry_rsi"]
+        candle_no = c["bear_entry_candle"]
+        if candle_no <= 2:
+            cur_rsi  = calc_rsi(c.get("history", []))
+            entry_rsi= c["bear_entry_rsi"]
+            tag = f"{candle_no}봉체크"
+            write_state_log(market, price, event_tag=tag)
             if cur_rsi is not None and cur_rsi <= entry_rsi:
-                # RSI 미상승 → -0.8% 조기손절
                 if pnl_pct <= -0.8:
                     do_sell(market, price, f"하락장 조기손절 RSI미반등 {pnl_pct:+.2f}%")
                     return
@@ -588,6 +977,8 @@ def check_sell(market, price):
     # 트레일링 스탑
     if pnl_pct > c["highest_profit"]:
         c["highest_profit"] = pnl_pct
+    if pnl_pct < c.get("max_drawdown_pct", 0.0):
+        c["max_drawdown_pct"] = pnl_pct
     trail_trigger = c["highest_profit"] >= c["trail_start"]
     trail_stop    = c["highest_profit"] - c["trail_gap"]
 
@@ -757,6 +1148,13 @@ def check_buy_score(market, price, volume, open_price=0):
 
     # 보조 트리거면 점수에 is_secondary 태그
     is_sec = matched_cond.get("is_secondary", False)
+
+    # ── 신호 시점 정보 저장 (로그용) ────────────────────────
+    c["signal_price"]    = price
+    c["signal_time"]     = time.time()
+    c["signal_rsi"]      = rsi
+    c["signal_rsi_prev"] = p1
+
     return True, total_score + (0.01 if is_sec else 0)  # 소수점으로 구분
 
 
@@ -1114,7 +1512,12 @@ def run_bot():
                 if not td: continue
                 price = td.get("trade_price", 0)
                 if price > 0:
+                    # 5분 상태 로그
+                    if now - _last_state_log_ts >= STATE_LOG_INTERVAL:
+                        write_state_log(market, price, event_tag="모니터링")
                     check_sell(market, price)
+            if holding and now - _last_state_log_ts >= STATE_LOG_INTERVAL:
+                globals()["_last_state_log_ts"] = now
 
             # ── 미보유 종목 매수 신호 수집 ───────────────────
             with slots_lock:
@@ -1123,6 +1526,7 @@ def run_bot():
                 continue
 
             signals = []
+            indicator_data = []  # 인디케이터 로그용
             for market, td in tickers.items():
                 with slots_lock:
                     if market in slots: continue
@@ -1139,6 +1543,27 @@ def run_bot():
                 ok, score = check_buy_score(market, price, volume, open_price)
                 if ok:
                     signals.append((market, price, score))
+
+                # 인디케이터 로그 수집
+                rsi      = calc_rsi(c.get("history", []))
+                vol      = calc_vol_pct(c.get("timed", []))
+                vol_ratio= _get_vol_ratio(c)
+                h_ma20, h_ma60 = get_hourly_ma_cached(market)
+                d_ma20, d_ma60 = get_daily_ma_cached(market)
+                drop_pct = (h_ma20 - price) / h_ma20 * 100 if h_ma20 and h_ma20 > 0 else 0.0
+                indicator_data.append((
+                    market, price, rsi, drop_pct, vol_ratio, vol,
+                    h_ma20, h_ma60, d_ma20, d_ma60, int(score) if ok else 0
+                ))
+
+            # 인디케이터 로그 기록 (5분마다)
+            if now - _last_state_log_ts >= STATE_LOG_INTERVAL and indicator_data:
+                write_indicator_log(indicator_data)
+
+            # fwd_return 업데이트
+            current_prices = {td_["market"]: td_.get("trade_price", 0)
+                              for td_ in tickers.values()}
+            update_fwd_returns(current_prices)
 
             # 점수 순 정렬 → 슬롯 분리 매수
             signals.sort(key=lambda x: x[2], reverse=True)
@@ -1158,7 +1583,7 @@ def run_bot():
                     pri_used += 1
                     tag = f"기본:{real_score}점"
                 coins.get(market, {})["is_secondary"] = is_sec
-                do_buy(market, price, tag)
+                do_buy(market, price, tag, open_price=td.get("opening_price", 0.0))
 
         except Exception as e:
             cprint(f"[메인 루프 오류] {e}\n{traceback.format_exc()}", Fore.RED)
