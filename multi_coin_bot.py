@@ -701,15 +701,16 @@ def check_buy_signal(market, price, volume):
 
 def check_trend_signal(market, price, volume):
     """추세추종 매수 신호 체크.
-    조건: 가격>MA20 + MA20상승중 + 최근3봉중2봉양봉 + 거래량≥1.2배 + RSI 50~65
+    조건: 가격>MA20 + MA20상승중 + 최근5봉내MA20이탈이력 + MA20재돌파 + 이격≤1.5% + RSI50~65 + 거래량≥1.2배
     반환: (신호여부, 점수)  점수는 소수점 0.5 태그로 추세추종 구분
     """
     c = get_or_create_coin(market)
     if c["has_stock"]: return False, 0
 
-    h = c["history"]
+    h = list(c["history"])
     if c["real_data_count"] < REAL_DATA_MIN: return False, 0
     if time.time() - c["last_sell_time"] < c["cooldown"]: return False, 0
+    if len(h) < 10: return False, 0
 
     rsi    = calc_rsi(h)
     vol    = calc_vol_pct(c["timed"])
@@ -720,10 +721,20 @@ def check_trend_signal(market, price, volume):
     # RSI 50~65 구간 (과열 전 추세 초입)
     if not (50 <= rsi <= 65): return False, 0
 
-    # 가격 > MA20 (상승 중)
+    # 가격 > MA20
     if price <= ma20: return False, 0
 
-    # MA20 상승 중 (직전 RSI로 대리 판단 — 캐시 없이 간단하게)
+    # MA20 이격 ≤ 1.5% (막 돌파한 초입만)
+    gap_pct = (price - ma20) / ma20 * 100
+    if gap_pct > 1.5: return False, 0
+
+    # 최근 5봉 내 MA20 이탈 이력 확인 (price_history 기준)
+    # history는 루프마다 현재가가 쌓이므로 최근 5개 봉 확인
+    recent5 = h[-6:-1] if len(h) >= 6 else h[:-1]
+    had_below = any(p < ma20 for p in recent5)
+    if not had_below: return False, 0   # 이탈 이력 없으면 탈락
+
+    # MA20 상승 중 (RSI 상승으로 대리 판단)
     prev_rsi = c.get("prev_rsi")
     if prev_rsi is None or rsi <= prev_rsi: return False, 0
 
@@ -738,10 +749,11 @@ def check_trend_signal(market, price, volume):
         vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
     if vol_ratio < 1.2: return False, 0
 
-    # 점수 계산 (RSI 위치 + 거래량 기반)
-    rsi_score  = max(0, int((65 - rsi) / 15 * 40))   # RSI 낮을수록(50에 가까울수록) 고점수
+    # 점수 계산
+    rsi_score  = max(0, int((65 - rsi) / 15 * 40))   # RSI 낮을수록 고점수
+    gap_score  = 20 if gap_pct <= 0.5 else 15 if gap_pct <= 1.0 else 10  # 이격 작을수록 고점수
     vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10
-    total = rsi_score + vol_score
+    total = rsi_score + gap_score + vol_score
     if total < 10: return False, 0
 
     return True, total + 0.5   # 0.5 소수점으로 추세추종 구분
