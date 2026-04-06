@@ -391,7 +391,12 @@ def _handle_ipc_cmd(text):
 
 
 def _ipc_send_status():
+    global peak_value
     val  = _calc_portfolio_value()
+    cash = get_cash_balance()
+    # portfolio 없고 현금만 있을 때 peak_value 초기화 방지
+    if peak_value <= 0 or (not portfolio and cash >= TOTAL_BUDGET * 0.8):
+        peak_value = max(peak_value, val + cash)
     dd   = (val - peak_value) / peak_value * 100 if peak_value > 0 else 0.0
     lines = [
         f"📊 섹터봇 현황",
@@ -522,8 +527,20 @@ def _market_url():
 
 def get_kis_token():
     global _access_token, _token_expire
+    # 기존 토큰 유효하면 재사용
     if _access_token and time.time() < _token_expire:
         return _access_token
+    # 장 시간(평일 8:00~16:00)에만 토큰 발급 시도
+    now_dt = datetime.now()
+    is_weekday = now_dt.weekday() < 5  # 월~금
+    is_market_hours = 8 <= now_dt.hour < 16
+    if not (is_weekday and is_market_hours):
+        if _access_token:
+            cprint(f"[토큰] 장외 시간 — 기존 토큰 유지 (만료: {datetime.fromtimestamp(_token_expire).strftime('%H:%M')})", Fore.CYAN)
+            return _access_token
+        else:
+            cprint("[토큰] 장외 시간 — 토큰 발급 건너뜀", Fore.YELLOW)
+            return ""
     res = api_call("post", f"{_prod_url()}/oauth2/tokenP", json={
         "grant_type": "client_credentials",
         "appkey":     _cfg.get("app_key", ""),
@@ -1861,6 +1878,15 @@ def _do_rebalance():
     ranked    = sorted(filtered.items(), key=lambda x: x[1]["score"], reverse=True)
     top_codes = [c for c, _ in ranked[:TOP_N_ETF]]
 
+    # 유효 종목 수가 TOP_N 미달이면 KOFR 대피
+    if len(top_codes) < TOP_N_ETF:
+        send_msg(
+            f"⚠️ 유효 종목 {len(top_codes)}개 (기준 {TOP_N_ETF}개 미달) → KOFR 대피",
+            force=True,
+        )
+        _evacuate_to_kofr("모멘텀 부족")
+        return
+
     # 교체 대상 매도
     current   = [c for c in portfolio if c != KOFR_CODE]
     to_sell   = [c for c in current if c not in top_codes]
@@ -1872,17 +1898,19 @@ def _do_rebalance():
 
     time.sleep(2)
 
-    # 신규 매수
+    # 신규 매수 — 예산을 TOP_N 종목 수로 균등 분배
     cash        = get_cash_balance()
     kofr_rsv    = int(TOTAL_BUDGET * KOFR_MIN_RATIO)
-    investable  = max(0, cash - kofr_rsv)
+    # 실제 계좌 잔고가 봇 예산보다 많아도 봇 예산 범위 내에서만 투자
+    investable  = max(0, min(cash, TOTAL_BUDGET) - kofr_rsv)
 
     if not top_codes:
         send_msg("⚠️ 매수 후보 없음 → KOFR 대피", force=True)
         _evacuate_to_kofr("모멘텀 없음")
         return
 
-    per_etf = investable // len(top_codes) if top_codes else 0
+    # 종목당 예산 = 전체 투자 가능 금액 / TOP_N (균등 분배)
+    per_etf = investable // TOP_N_ETF
     bought  = []
     for code in top_codes:
         if code in portfolio:
@@ -2082,6 +2110,30 @@ def main():
     get_kis_token()
     _load_state()
     _start_ipc_thread()   # 매니저 ↔ 섹터봇 IPC 수신 스레드 시작
+
+    # 시작 시 KIS 실제 잔고로 포트폴리오 자동 동기화
+    try:
+        real = get_kis_holdings()
+        if real:
+            valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
+            new_portfolio = {}
+            for code, pos in real.items():
+                if code in valid_codes:
+                    old_pos = portfolio.get(code, {})
+                    new_portfolio[code] = {
+                        "qty":        pos["qty"],
+                        "avg_price":  pos["avg_price"],
+                        "high_price": max(old_pos.get("high_price", 0), pos["avg_price"]),
+                        "entry_date": old_pos.get("entry_date", str(__import__("datetime").date.today())),
+                    }
+            portfolio.clear()
+            portfolio.update(new_portfolio)
+            _save_state()
+            cprint(f"[시작 싱크] KIS 잔고 동기화 완료 — {len(portfolio)}종목", Fore.GREEN)
+        else:
+            cprint("[시작 싱크] 보유 종목 없음 또는 조회 실패", Fore.YELLOW)
+    except Exception as e:
+        cprint(f"[시작 싱크 오류] {e}", Fore.YELLOW)
 
     send_msg(
         f"🚀 섹터로테이션 봇 v{BOT_VERSION} 시작\n"

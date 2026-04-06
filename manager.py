@@ -1126,6 +1126,26 @@ class InverseWorker:
 _last_tg_poll   = 0.0
 _last_update_id  = 0
 _tg_poll_lock    = threading.Lock()
+_TG_OFFSET_FILE  = os.path.join(BASE_DIR, "shared", "tg_offset.json")
+
+def _load_tg_offset():
+    global _last_update_id
+    try:
+        if os.path.exists(_TG_OFFSET_FILE):
+            with open(_TG_OFFSET_FILE) as f:
+                _last_update_id = int(json.load(f).get("offset", 0))
+            cprint(f"[텔레그램] offset 복원: {_last_update_id}", Fore.CYAN)
+    except Exception:
+        pass
+
+def _save_tg_offset():
+    try:
+        tmp = _TG_OFFSET_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"offset": _last_update_id}, f)
+        os.replace(tmp, _TG_OFFSET_FILE)
+    except Exception:
+        pass
 _processed_cb    = set()    # 처리된 callback_query id 캐시 (중복 클릭 방지)
 _processed_cb_ts = {}       # 타임스탬프 (오래된 것 정리용)
 
@@ -1148,6 +1168,7 @@ def poll_telegram():
             ).json()
             for upd in res.get("result", []):
                 _last_update_id = upd["update_id"]
+                _save_tg_offset()
 
                 # 일반 메시지
                 msg = upd.get("message", {})
@@ -1593,7 +1614,7 @@ def _handle_command_inner(text):
     elif cmd[0] in ("/rollback", "/롤백"):
         threading.Thread(target=do_rollback, daemon=True).start()
     elif cmd[0] in ("/update", "/업데이트"):
-        force = len(cmd) > 1 and cmd[1].lower() == "force"
+        force = len(cmd) > 1 and cmd[1].lower() in ("force", "강제")
         holding = [wid for wid, st in _worker_states.items() if st.get("holding")]
         if holding and not force:
             send_msg(
@@ -1614,8 +1635,8 @@ def _handle_command_inner(text):
             )
             return
         target = cmd[1].lower()
-        if target not in ("all", "coin", "stock", "manager"):
-            send_msg("❌ 대상: all / coin / stock / manager", level="normal", source="매니저", force=True)
+        if target not in ("all", "coin", "multicoin", "stock", "manager"):
+            send_msg("❌ 대상: all / coin / multicoin / stock / manager", level="normal", source="매니저", force=True)
             return
         holding = [wid for wid, st in _worker_states.items() if st.get("holding")]
         if holding and target in ("all", "coin"):
@@ -2497,6 +2518,16 @@ def do_update(force=False):
         send_msg(f"⚠️ 다운로드 실패: {', '.join(failed)}", level="critical", source="매니저", force=True)
 
     if not updated and not failed:
+        if force:
+            send_msg("🔄 변경 없음 — force 재시작 실행", level="critical", source="매니저", force=True)
+            _save_local_version(latest)
+            time.sleep(2)
+            try:
+                import subprocess as _sp
+                _sp.run(["sudo", "systemctl", "restart", "bot-manager.service"], timeout=5)
+            except Exception:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            return
         send_msg("✅ 변경된 파일 없음. 최신 상태예요.", level="normal", source="매니저", force=True)
         _save_local_version(latest)
         return
@@ -2517,14 +2548,20 @@ def do_update(force=False):
 
 def do_restart(target="all"):
     """
-    target: "all" | "coin" | "stock" | "manager"
+    target: "all" | "coin" | "multicoin" | "stock" | "manager"
     """
     global _workers
 
     if target == "manager":
         send_msg("🔄 매니저 재시작 중...", level="critical", source="매니저", force=True)
         time.sleep(1)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # systemd로 재시작 (코드 반영 보장)
+        try:
+            import subprocess as _sp
+            _sp.run(["sudo", "systemctl", "restart", "bot-manager.service"], timeout=5)
+        except Exception:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
 
     with _workers_lock:
         workers_snap = list(_workers)
@@ -2532,6 +2569,8 @@ def do_restart(target="all"):
     targets = []
     if target in ("all", "coin"):
         targets += [w for w in workers_snap if isinstance(w, CoinWorker)]
+    if target in ("all", "multicoin"):
+        targets += [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
     if target in ("all", "stock"):
         targets += [w for w in workers_snap if isinstance(w, StockWorker)]
 
@@ -2795,6 +2834,7 @@ def run_manager():
 
     load_config()
     _load_state()
+    _load_tg_offset()
 
     # 매니저 PID 파일 기록 → 봇들이 매니저 실행 여부 감지에 사용
     try:
