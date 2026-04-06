@@ -779,25 +779,102 @@ def check_trend_signal(market, price, volume):
 # ============================================================
 # [10-B] vol_ratio 자동 조정 시스템
 # ============================================================
-def _log_vol_ratio(new_val, reason):
-    """vol_ratio 변경 이력 CSV 로깅."""
-    header = not os.path.exists(VOL_RATIO_LOG_FILE)
+def _get_recommend_log_path():
+    """날짜별 추천 로그 파일 경로 반환."""
+    log_dir = os.path.join(BASE_DIR, "logs", "recommend")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"{date.today().strftime('%Y-%m-%d')}.csv")
+
+
+def _snapshot_market():
+    """추천 당시 시장 상황 스냅샷 — 나중에 '그때 상황'을 재현할 수 있도록."""
+    with slots_lock:
+        holding = list(slots)
+    # 감시 종목 중 vol_ratio 분포 (최근 수집된 값 기준)
+    vol_ratios = []
+    near_trigger_count = 0
+    with coins_lock:
+        snap = dict(coins)
+    for m, c in snap.items():
+        vol_h = list(c.get("vol_history", []))
+        if len(vol_h) >= 6 and vol_h[-1] > 0:
+            avg5 = sum(vol_h[-6:-1]) / 5
+            vr = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+            vol_ratios.append(round(vr, 2))
+            # 현재 기준 - 0.2 이내면 "near_trigger"로 간주
+            if _vol_ratio_current - 0.2 <= vr < _vol_ratio_current:
+                near_trigger_count += 1
+    avg_vol_ratio = round(sum(vol_ratios) / len(vol_ratios), 2) if vol_ratios else 0.0
+    return {
+        "regime":            _market_regime,
+        "slots_used":        len(holding),
+        "slots_max":         MAX_SLOTS,
+        "avg_vol_ratio":     avg_vol_ratio,
+        "near_trigger":      near_trigger_count,
+        "no_trade_h":        round((time.time() - _last_trade_ts) / 3600, 1) if _last_trade_ts > 0 else 0,
+        "recent_trades_6h":  len(_recent_trades_ts),
+    }
+
+
+def _log_recommend(current_val, recommended_val, reason_type, reason_detail, applied, snap=None):
+    """추천 발생 시 상황과 함께 CSV에 기록.
+
+    reason_type  : no_trade / restore
+    reason_detail: 12h_no_trade / 24h_auto / manual / auto_restore
+    applied      : Y / N / pending
+    """
+    if snap is None:
+        snap = _snapshot_market()
+    path   = _get_recommend_log_path()
+    header = not os.path.exists(path)
+    row = (
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},"
+        f"{current_val},{recommended_val},"
+        f"{reason_type},{reason_detail},"
+        f"{snap['regime']},"
+        f"{snap['slots_used']}/{snap['slots_max']},"
+        f"{snap['avg_vol_ratio']},"
+        f"{snap['near_trigger']},"
+        f"{snap['no_trade_h']},"
+        f"{snap['recent_trades_6h']},"
+        f"{applied}\n"
+    )
     try:
-        with open(VOL_RATIO_LOG_FILE, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             if header:
-                f.write("dt,vol_ratio_current,reason\n")
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{new_val},{reason}\n")
+                f.write(
+                    "datetime,"
+                    "current_vol_ratio,recommended_vol_ratio,"
+                    "reason_type,reason_detail,"
+                    "regime,"
+                    "slots_used,"
+                    "avg_vol_ratio_market,"
+                    "near_trigger_count,"
+                    "no_trade_h,"
+                    "recent_trades_6h,"
+                    "applied\n"
+                )
+            f.write(row)
+        cprint(f"[추천로그] {reason_detail} | {current_val}→{recommended_val} | applied={applied}", Fore.CYAN)
     except Exception as e:
-        cprint(f"[vol_ratio 로그 오류] {e}", Fore.YELLOW)
+        cprint(f"[추천로그 오류] {e}", Fore.YELLOW)
 
 
 def _set_vol_ratio(new_val, reason):
-    """vol_ratio 값 변경 + 로깅."""
+    """vol_ratio 값 변경 + 추천 로그 기록."""
     global _vol_ratio_current, _last_adjust_ts
+    old_val            = _vol_ratio_current
     _vol_ratio_current = round(new_val, 2)
     _last_adjust_ts    = time.time()
-    _log_vol_ratio(_vol_ratio_current, reason)
-    cprint(f"[vol_ratio] {_vol_ratio_current} ({reason})", Fore.CYAN)
+    # applied=Y 로 기록
+    _log_recommend(
+        current_val      = old_val,
+        recommended_val  = _vol_ratio_current,
+        reason_type      = "restore" if new_val > old_val else "no_trade",
+        reason_detail    = reason,
+        applied          = "Y",
+    )
+    cprint(f"[vol_ratio] {old_val} → {_vol_ratio_current} ({reason})", Fore.CYAN)
 
 
 def check_vol_ratio_adjust():
@@ -833,6 +910,15 @@ def check_vol_ratio_adjust():
             return
         proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
         _vol_ratio_pending = True
+        snap = _snapshot_market()
+        _log_recommend(
+            current_val     = _vol_ratio_current,
+            recommended_val = proposed,
+            reason_type     = "no_trade",
+            reason_detail   = "12h_no_trade",
+            applied         = "pending",
+            snap            = snap,
+        )
         send_msg(
             f"⚠️ 12시간 무거래 감지\n"
             f"거래량 기준 완화 제안: {_vol_ratio_current:.1f} → {proposed:.1f}\n"
@@ -988,6 +1074,13 @@ def handle_command(text, req_id=""):
 
     elif cmd[0] == "/volkeep":
         _vol_ratio_pending = False
+        _log_recommend(
+            current_val     = _vol_ratio_current,
+            recommended_val = round(_vol_ratio_current - VOL_RATIO_STEP, 2),
+            reason_type     = "no_trade",
+            reason_detail   = "12h_no_trade",
+            applied         = "N",
+        )
         _write_ipc_result(f"✅ 거래량 기준 유지 ({_vol_ratio_current:.1f})", req_id)
 
     elif cmd[0] == "/volstatus":
