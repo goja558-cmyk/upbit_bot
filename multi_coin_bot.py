@@ -97,7 +97,7 @@ VOL_RATIO_MIN_CAP  = 1.1   # 최저 한도
 VOL_RATIO_STEP     = 0.1   # 조정 단위
 _vol_ratio_current = VOL_RATIO_DEFAULT   # 현재 적용 중인 값
 _vol_ratio_pending = False               # 사용자 승인 대기 중
-_last_trade_ts     = 0.0                 # 마지막 거래 시각
+_last_trade_ts     = time.time()         # 마지막 거래 시각 (시작 시점으로 초기화)
 _last_adjust_ts    = 0.0                 # 마지막 조정 시각
 _adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
 _recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
@@ -811,7 +811,7 @@ def _snapshot_market():
         "slots_max":         MAX_SLOTS,
         "avg_vol_ratio":     avg_vol_ratio,
         "near_trigger":      near_trigger_count,
-        "no_trade_h":        round((time.time() - _last_trade_ts) / 3600, 1) if _last_trade_ts > 0 else 0,
+        "no_trade_h":        round((time.time() - _last_trade_ts) / 3600, 1),
         "recent_trades_6h":  len(_recent_trades_ts),
     }
 
@@ -882,7 +882,7 @@ def check_vol_ratio_adjust():
     global _vol_ratio_pending
 
     now      = time.time()
-    no_trade = now - _last_trade_ts if _last_trade_ts > 0 else now  # 시작 직후 예외
+    no_trade = now - _last_trade_ts
 
     # ── 복구 체크: 6시간 내 거래 2건 이상 ────────────────────
     recent_count = len(_recent_trades_ts)
@@ -1085,7 +1085,7 @@ def handle_command(text, req_id=""):
 
     elif cmd[0] == "/volstatus":
         now = time.time()
-        no_trade_h = (now - _last_trade_ts) / 3600 if _last_trade_ts > 0 else 0
+        no_trade_h = (now - _last_trade_ts) / 3600
         cooldown_left = max(0, _adjust_cooldown - (now - _last_adjust_ts)) / 3600
         _write_ipc_result(
             f"📊 거래량 기준 현황\n"
