@@ -59,6 +59,16 @@ UPBIT_BASE    = "https://api.upbit.com/v1"
 FEE_RATE      = 0.0005
 MIN_ORDER_KRW = 5_000
 MIN_TRADE_KRW = 20_000   # 슬롯당 최소 예산
+
+# 장세별 슬롯당 예산 비율 (TOTAL_BUDGET 대비)
+# 상승장: 5슬롯 × 18% = 90% 투자, 10% 유보
+# 중립장: 3슬롯 × 30% = 90% 투자, 10% 유보
+# 하락장: 2슬롯 × 25% = 50% 투자, 50% 유보
+SLOT_BUDGET_RATIO = {
+    "bull":    0.18,
+    "neutral": 0.28,
+    "bear":    0.25,
+}
 LOOP_INTERVAL  = 10
 WATCH_COUNT    = 30
 WATCH_INTERVAL = 300     # 시세 일괄 조회 주기 (초) — 1시간봉은 5분마다면 충분
@@ -234,6 +244,37 @@ _daily_ma_cache = {}
 _daily_ma_ts    = {}
 DAILY_MA_TTL    = 3600
 
+def get_hourly_ma(market, short=20, long=60):
+    """시간봉 MA20, MA60 API 직접 조회"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/60",
+            params={"market": market, "count": long + 5}, timeout=5
+        )
+        if r.status_code == 200:
+            closes = [c["trade_price"] for c in reversed(r.json())]
+            ma_s = sum(closes[-short:]) / short if len(closes) >= short else None
+            ma_l = sum(closes[-long:]) / long if len(closes) >= long else None
+            return ma_s, ma_l
+    except Exception as e:
+        cprint(f"[시간봉MA 오류] {market}: {e}", Fore.YELLOW)
+    return None, None
+
+# 시간봉 MA 캐시 (5분마다 갱신)
+_hourly_ma_cache = {}
+_hourly_ma_ts    = {}
+HOURLY_MA_TTL    = 300
+
+def get_hourly_ma_cached(market):
+    import time as _t
+    now = _t.time()
+    if market in _hourly_ma_cache and now - _hourly_ma_ts.get(market, 0) < HOURLY_MA_TTL:
+        return _hourly_ma_cache[market]
+    ma20, ma60 = get_hourly_ma(market)
+    _hourly_ma_cache[market] = (ma20, ma60)
+    _hourly_ma_ts[market]    = now
+    return ma20, ma60
+
 def get_daily_ma_cached(market):
     import time as _t
     now = _t.time()
@@ -292,14 +333,14 @@ def get_regime_conditions():
     """
     regime = _market_regime
     if regime == "bull":
-        primary   = dict(rsi_max=30, drop_min=2.0, vol_ratio_min=1.2, vol_min=2.0, vol_max=8.0, is_secondary=False)
-        secondary = dict(rsi_max=35, drop_min=2.5, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=True)
+        primary   = dict(rsi_max=30, drop_min=1.0, vol_ratio_min=1.0, vol_min=1.0, vol_max=8.0, is_secondary=False)
+        secondary = dict(rsi_max=35, drop_min=1.5, vol_ratio_min=1.1, vol_min=1.0, vol_max=8.0, is_secondary=True)
         return primary, secondary
     elif regime == "neutral":
         primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=False)
         return primary, None
     else:  # bear
-        primary = dict(rsi_max=25, drop_min=3.0, vol_ratio_min=1.5, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=1.3, vol_min=1.0, vol_max=8.0, is_secondary=False)
         return primary, None
 
 
@@ -376,6 +417,8 @@ def _make_coin_state(market):
         "trade_count":    0,
         "daily_pnl":      0.0,
         "real_data_count": 0,
+        "bear_entry_rsi":  None,   # 하락장 진입 시 RSI 기록 (조기손절용)
+        "bear_entry_candle": 0,    # 진입 후 경과 봉 수
         **p,
     }
 
@@ -449,7 +492,12 @@ def do_buy(market, price, reason):
             cprint(f"[슬롯 부족] {market} 매수 불가 ({len(slots)}/{MAX_SLOTS})", Fore.YELLOW)
             return False
 
-    per_slot = max(MIN_TRADE_KRW, TOTAL_BUDGET // max(MAX_SLOTS, 1))
+    regime = _market_regime or "neutral"
+    ratio  = SLOT_BUDGET_RATIO.get(regime, 0.28)
+    # 하락장: 포지션 50%로 추가 축소
+    if regime == "bear":
+        ratio = ratio * 0.5
+    per_slot = max(MIN_ORDER_KRW, int(TOTAL_BUDGET * ratio))
     balance  = get_balance_krw()
     order_krw = int(min(per_slot, balance) * 0.98)
     if order_krw < MIN_ORDER_KRW:
@@ -464,6 +512,8 @@ def do_buy(market, price, reason):
         "has_stock": True, "buy_price": avg_p,
         "filled_qty": filled, "be_active": False,
         "highest_profit": 0.0, "buy_time": time.time(),
+        "bear_entry_rsi": calc_rsi(coins.get(market, {}).get("history", [])) if regime == "bear" else None,
+        "bear_entry_candle": 0,
     })
     with slots_lock:
         slots.add(market)
@@ -523,6 +573,18 @@ def check_sell(market, price):
     qty    = c["filled_qty"]
     pnl_pct = (price - buy_p) / buy_p * 100
 
+    # ── 하락장 조기손절 체크 ─────────────────────────────────
+    if _market_regime == "bear" and c.get("bear_entry_rsi") is not None:
+        c["bear_entry_candle"] = c.get("bear_entry_candle", 0) + 1
+        if c["bear_entry_candle"] <= 2:
+            cur_rsi = calc_rsi(c.get("history", []))
+            entry_rsi = c["bear_entry_rsi"]
+            if cur_rsi is not None and cur_rsi <= entry_rsi:
+                # RSI 미상승 → -0.8% 조기손절
+                if pnl_pct <= -0.8:
+                    do_sell(market, price, f"하락장 조기손절 RSI미반등 {pnl_pct:+.2f}%")
+                    return
+
     # 트레일링 스탑
     if pnl_pct > c["highest_profit"]:
         c["highest_profit"] = pnl_pct
@@ -536,7 +598,14 @@ def check_sell(market, price):
 
     # 익절
     if pnl_pct >= c["target"]:
-        do_sell(market, price, f"익절 {pnl_pct:+.2f}%")
+        reason_tp = f"익절 {pnl_pct:+.2f}%"
+        # 하락장은 +1.0% 고정 익절
+        if _market_regime == "bear" and pnl_pct >= 1.0:
+            do_sell(market, price, f"하락장 익절 {pnl_pct:+.2f}%")
+            return
+        elif _market_regime != "bear":
+            do_sell(market, price, reason_tp)
+            return
     # 트레일링
     elif trail_trigger and pnl_pct <= trail_stop:
         do_sell(market, price, f"트레일링 {pnl_pct:+.2f}% (고점:{c['highest_profit']:.2f}%)")
@@ -544,8 +613,43 @@ def check_sell(market, price):
     elif be_stop:
         do_sell(market, price, f"본절 보호 {pnl_pct:+.2f}%")
     # 손절
-    elif pnl_pct <= c["max_loss"]:
-        do_sell(market, price, f"손절 {pnl_pct:+.2f}%")
+    else:
+        bear_stop = -1.2 if _market_regime == "bear" else c["max_loss"]
+        if pnl_pct <= bear_stop:
+            reason = f"하락장 손절 {pnl_pct:+.2f}%" if _market_regime == "bear" else f"손절 {pnl_pct:+.2f}%"
+            do_sell(market, price, reason)
+
+def _get_5min_candles(market, count=5):
+    """최근 5분봉 종가 리스트 반환 (오래된 순)"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/5",
+            params={"market": market, "count": count}, timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            # API는 최신순 반환 → 역순으로 오래된 순 정렬
+            candles = list(reversed(data))
+            return candles
+    except Exception as e:
+        cprint(f"[5분봉 오류] {market}: {e}", Fore.YELLOW)
+    return []
+
+def _check_bear_extra(market):
+    """하락장 추가 조건: 최근 3봉 중 최소 1봉 음봉(-1.0% 이상 하락)
+    반환: True = 조건 충족
+    """
+    candles = _get_5min_candles(market, count=3)
+    if len(candles) < 3:
+        return False
+    for c in candles:
+        o = c.get("opening_price", 0)
+        cl = c.get("trade_price", 0)
+        if o > 0 and cl > 0:
+            change = (cl - o) / o * 100
+            if change <= -1.0:
+                return True
+    return False
 
 # ============================================================
 # [9] 매수 신호 체크 — 복합 점수제
@@ -570,9 +674,10 @@ def check_buy_score(market, price, volume, open_price=0):
     if time.time() - c["last_sell_time"] < c["cooldown"]: return False, 0
 
     rsi  = calc_rsi(h)
-    ma20 = calc_ma(h, 20)
-    ma60 = calc_ma(h, 60)
     vol  = calc_vol_pct(c["timed"])
+
+    # 시간봉 MA는 API에서 직접 가져옴 (history 혼재 문제 방지)
+    ma20, ma60 = get_hourly_ma_cached(market)
 
     if rsi is None or ma20 is None or ma60 is None: return False, 0
 
@@ -595,9 +700,8 @@ def check_buy_score(market, price, volume, open_price=0):
 
     # 공통 필수 조건
     if ma20 <= ma60: return False, 0                          # 시간봉 추세
-    if vol is None or not (2.0 <= vol <= 8.0): return False, 0  # 변동성
-    if open_price > 0 and price <= open_price: return False, 0  # 양봉
-    if p1 is None or rsi <= p1: return False, 0               # 반등
+    if vol is None or not (1.0 <= vol <= 8.0): return False, 0  # 변동성 하한 1%, 양봉 조건 제거
+    # RSI 반등 공통 필수에서 제거
 
     # ── 장세별 트리거 체크 ────────────────────────────────────
     primary, secondary = get_regime_conditions()
@@ -624,7 +728,27 @@ def check_buy_score(market, price, volume, open_price=0):
 
     if matched_cond is None: return False, 0
 
-    # ── 복합 점수 계산 ───────────────────────────────────────
+    # ── 하락장 추가 조건 ─────────────────────────────────────
+    if _market_regime == "bear":
+        # 최근 2봉 중 최소 1봉 음봉 (1시간봉 기준 — 현재 봉 + 이전 봉)
+        h_list = list(h)
+        bear_neg_ok = False
+        if len(h_list) >= 2:
+            # history에는 종가만 있으므로 open_price와 현재가로 현재봉 판단
+            cur_change = (price - open_price) / open_price * 100 if open_price > 0 else 0
+            if cur_change < 0:
+                bear_neg_ok = True
+            elif len(h_list) >= 3:
+                # 이전 봉: h_list[-2] vs h_list[-3]
+                prev_change = (h_list[-2] - h_list[-3]) / h_list[-3] * 100 if h_list[-3] > 0 else 0
+                if prev_change < 0:
+                    bear_neg_ok = True
+        if not bear_neg_ok:
+            return False, 0
+
+        # 5분봉 기준 최근 3봉 중 -1.0% 이상 하락봉
+        if not _check_bear_extra(market):
+            return False, 0
     rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
     drop_score = 30 if drop_pct >= 4.0 else 20 if drop_pct >= 3.0 else 10
     vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10 if vol_ratio >= 1.2 else 0
@@ -785,15 +909,17 @@ def handle_command(text, req_id=""):
             h = list(c.get("history", []))
             cnt = c.get("real_data_count", 0)
             if cnt < REAL_DATA_MIN:
+                # 프리필 즉시 실행
+                prefill(m)
+                cnt = c.get("real_data_count", 0)
+            if cnt < REAL_DATA_MIN:
                 prob_list.append((m, 0, f"데이터 수집중 {cnt}/{REAL_DATA_MIN}"))
                 checked += 1
                 continue
-                checked += 1
-                continue
             rsi = calc_rsi(h)
-            ma20 = calc_ma(h, 20)
-            ma60 = calc_ma(h, 60)
             vol = calc_vol_pct(c.get("timed", []))
+            # 시간봉 MA API 직접 조회
+            ma20, ma60 = get_hourly_ma_cached(m)
             price = h[-1] if h else 0
             p1 = c.get("prev_rsi")
             p2 = c.get("prev_rsi2")
@@ -810,10 +936,10 @@ def handle_command(text, req_id=""):
 
             def _check_trigger(cond_t):
                 if rsi > cond_t["rsi_max"]: return f"RSI과열 {rsi:.1f}(≤{cond_t['rsi_max']})"
-                if p1 is None or rsi <= p1: return f"RSI반등없음 {rsi:.1f}"
+
                 if ma20 is None or ma20 <= (ma60 or 0): return f"MA하락"
                 if drop_pct_w < cond_t["drop_min"]: return f"눌림부족 {drop_pct_w:.1f}%(≥{cond_t['drop_min']}%)"
-                if vol is None or not (2.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
+                if vol is None or not (1.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
                 if vol_ratio_w < cond_t["vol_ratio_min"]: return f"거래량부족 {vol_ratio_w:.1f}배(≥{cond_t['vol_ratio_min']}배)"
                 if _market_regime == "bull" and d_ma20_w is not None and d_ma60_w is not None and d_ma20_w <= d_ma60_w:
                     return "일봉하락추세"
@@ -832,7 +958,7 @@ def handle_command(text, req_id=""):
                 scores.append(1.0 if drop_pct_w >= drop_target else max(0, drop_pct_w / drop_target))
                 if vol is None:
                     scores.append(0.2)
-                elif 2.0 <= vol <= 8.0:
+                elif 1.0 <= vol <= 8.0:
                     scores.append(1.0)
                 elif vol < 2.0:
                     scores.append(max(0, vol / 2.0))
@@ -852,19 +978,30 @@ def handle_command(text, req_id=""):
             elif rsi is None:
                 prob_list.append((m, 0, "데이터 없음"))
             else:
-                prob_pri = _calc_prob(primary_w)
-                prob_sec = _calc_prob(secondary_w) if secondary_w else 0
-                prob = max(prob_pri, prob_sec)
-                best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
-                hints = []
-                if rsi > best_cond["rsi_max"]:
-                    hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
-                if drop_pct_w < best_cond["drop_min"]:
-                    hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
-                if vol_ratio_w < best_cond["vol_ratio_min"]:
-                    hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
-                hint_str = ", ".join(hints[:2])
-                prob_list.append((m, prob, hint_str))
+                # 공통 필수 탈락 여부 먼저 체크
+                common_fail = []
+                if ma20 is None or ma60 is None or ma20 <= ma60:
+                    common_fail.append("MA하락")
+                if vol is None or not (1.0 <= vol <= 8.0):
+                    common_fail.append(f"변동성{vol:.1f}%" if vol else "변동성없음")
+                # 양봉은 open_price 없이 판단 불가 → 생략
+
+                if common_fail:
+                    prob_list.append((m, 0, ", ".join(common_fail)))
+                else:
+                    prob_pri = _calc_prob(primary_w)
+                    prob_sec = _calc_prob(secondary_w) if secondary_w else 0
+                    prob = max(prob_pri, prob_sec)
+                    best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
+                    hints = []
+                    if rsi > best_cond["rsi_max"]:
+                        hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
+                    if drop_pct_w < best_cond["drop_min"]:
+                        hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
+                    if vol_ratio_w < best_cond["vol_ratio_min"]:
+                        hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
+                    hint_str = ", ".join(hints[:2])
+                    prob_list.append((m, prob, hint_str))
             checked += 1
         hot  = sorted([(m,p,h) for m,p,h in prob_list if p >= 70], key=lambda x: x[1], reverse=True)
         mid  = sorted([(m,p,h) for m,p,h in prob_list if 40 <= p < 70], key=lambda x: x[1], reverse=True)
@@ -879,8 +1016,8 @@ def handle_command(text, req_id=""):
                 lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if cold:
             lines.append("⏳ 아직 멀었음")
-            for m, p, _ in cold:
-                lines.append(f"  {m.replace('KRW-','')}: {p}점")
+            for m, p, h in cold:
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if not prob_list and not holding:
             lines.append("감시 종목 없음")
         _write_ipc_result("\n".join(lines), req_id)
@@ -891,10 +1028,15 @@ def prefill(market):
     c = get_or_create_coin(market)
     prices = get_ohlcv(market, count=REAL_DATA_MIN + 10, interval=CANDLE_INTERVAL)
     if prices:
-        for p in prices:
+        now_ts = time.time()
+        candle_sec = CANDLE_INTERVAL * 60  # 캔들 간격(초)
+        for i, p in enumerate(prices):
             c["history"].append(p)
-        c["real_data_count"] = len(prices)
-        cprint(f"[프리필] {market} {len(prices)}개 로드", Fore.CYAN)
+            # timed에 과거 타임스탬프로 역산해서 삽입 (변동성 계산용)
+            past_ts = now_ts - (len(prices) - 1 - i) * candle_sec
+            c["timed"].append((past_ts, p))
+        c["real_data_count"] = max(REAL_DATA_MIN, len(prices))
+        cprint(f"[프리필] {market} {len(prices)}개 로드 (timed 포함)", Fore.CYAN)
 
 # ============================================================
 # [14] 메인 루프
