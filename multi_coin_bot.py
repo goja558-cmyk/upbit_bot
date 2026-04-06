@@ -103,6 +103,113 @@ _adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
 _recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
 VOL_RATIO_LOG_FILE = os.path.join(BASE_DIR, "vol_ratio_log.csv")
 
+# ── 인디케이터 로그 시스템 ────────────────────────────────────
+INDICATOR_LOG_INTERVAL = 300   # 종목당 기록 인터벌 (5분)
+_indicator_last_ts     = {}    # {market: last_log_ts}
+# fwd_return 추적: {market: [(log_ts, price, row_path, row_lineno), ...]}
+# 간단하게 {market: (ts, price)} 로 직전 기록만 유지
+_indicator_pending_fwd = {}    # {market: {"ts": float, "price": float, "file": str}}
+
+
+def _get_indicator_log_path(market):
+    """logs/indicators/MARKET/YYYY-MM-DD.csv"""
+    coin = market.replace("KRW-", "")
+    log_dir = os.path.join(BASE_DIR, "logs", "indicators", coin)
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"{date.today().strftime('%Y-%m-%d')}.csv")
+
+
+def _write_indicator_row(path, row):
+    header = not os.path.exists(path)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            if header:
+                f.write(
+                    "datetime,market,price,hour,rsi,drop_pct,vol_ratio,vol_pct,"
+                    "h_ma20,h_ma60,d_ma20,d_ma60,near_trigger,signal_score,"
+                    "entry_possible,log_type,regime,"
+                    "fwd_return_5m,fwd_return_10m,fwd_ts\n"
+                )
+            f.write(row + "\n")
+    except Exception as e:
+        cprint(f"[인디케이터 로그 오류] {e}", Fore.YELLOW)
+
+
+def _update_fwd_returns(market, current_price):
+    """직전 pending 행의 fwd_return을 현재가로 채워 덮어씀."""
+    pend = _indicator_pending_fwd.get(market)
+    if not pend:
+        return
+    elapsed = time.time() - pend["ts"]
+    # 5분(300s) 이상 지났으면 fwd 채우기
+    if elapsed < INDICATOR_LOG_INTERVAL:
+        return
+    try:
+        fwd = round((current_price - pend["price"]) / pend["price"] * 100, 4)
+        fpath = pend["file"]
+        if not os.path.exists(fpath):
+            return
+        with open(fpath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # 마지막 실제 데이터 행 (헤더 제외) 중 fwd가 비어있는 행 수정
+        for i in range(len(lines) - 1, 0, -1):
+            parts = lines[i].rstrip("\n").split(",")
+            if len(parts) >= 20 and parts[17] == "" and parts[0].startswith(pend["dt"]):
+                parts[17] = str(fwd)   # fwd_return_5m
+                parts[18] = str(fwd)   # fwd_return_10m (5분봉 기준이라 동일)
+                lines[i] = ",".join(parts) + "\n"
+                break
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        cprint(f"[fwd 업데이트 오류] {market}: {e}", Fore.YELLOW)
+    finally:
+        _indicator_pending_fwd.pop(market, None)
+
+
+def log_indicator(market, price, rsi, drop_pct, vol_ratio, vol_pct,
+                  h_ma20, h_ma60, d_ma20, d_ma60,
+                  signal_score, entry_possible, log_type):
+    """5분 인터벌로 종목별 지표를 날짜별 CSV에 기록."""
+    now = time.time()
+    last = _indicator_last_ts.get(market, 0)
+    if now - last < INDICATOR_LOG_INTERVAL:
+        return
+
+    # 직전 pending fwd 채우기 시도
+    _update_fwd_returns(market, price)
+
+    _indicator_last_ts[market] = now
+    dt_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hour    = datetime.now().hour
+    primary, _ = get_regime_conditions()
+    near    = round(primary["vol_ratio_min"] - vol_ratio, 4) if vol_ratio < primary["vol_ratio_min"] else 0.0
+
+    row = (
+        f"{dt_str},{market},{price},{hour},"
+        f"{round(rsi,2) if rsi is not None else ''},"
+        f"{round(drop_pct,4) if drop_pct is not None else ''},"
+        f"{round(vol_ratio,4) if vol_ratio is not None else ''},"
+        f"{round(vol_pct,4) if vol_pct is not None else ''},"
+        f"{round(h_ma20,2) if h_ma20 is not None else ''},"
+        f"{round(h_ma60,2) if h_ma60 is not None else ''},"
+        f"{round(d_ma20,2) if d_ma20 is not None else ''},"
+        f"{round(d_ma60,2) if d_ma60 is not None else ''},"
+        f"{round(near,4)},"
+        f"{signal_score},{entry_possible},{log_type},{_market_regime},"
+        f",,{now}"   # fwd_return_5m, fwd_return_10m는 나중에 채움
+    )
+    path = _get_indicator_log_path(market)
+    _write_indicator_row(path, row)
+
+    # fwd pending 등록
+    _indicator_pending_fwd[market] = {
+        "ts":    now,
+        "price": price,
+        "file":  path,
+        "dt":    dt_str[:16],   # YYYY-MM-DD HH:MM 으로 행 매칭
+    }
+
 def load_config():
     global _cfg, TELEGRAM_TOKEN, CHAT_ID, ACCESS_KEY, SECRET_KEY
     global TOTAL_BUDGET, MAX_SLOTS
@@ -669,9 +776,25 @@ def check_buy_score(market, price, volume, open_price=0):
     # 일봉 MA
     d_ma20, d_ma60 = get_daily_ma_cached(market)
 
+    # near_vol: vol_ratio가 기준 -0.3 이내면 near로 분류
+    primary_c, _ = get_regime_conditions()
+    near_vol = (primary_c["vol_ratio_min"] - 0.3) <= vol_ratio < primary_c["vol_ratio_min"]
+
     # 공통 필수 조건
-    if ma20 <= ma60: return False, 0                          # 시간봉 추세
-    if vol is None or not (1.0 <= vol <= 8.0): return False, 0  # 변동성 하한 1%, 양봉 조건 제거
+    if ma20 <= ma60:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+    if vol is None or not (1.0 <= vol <= 8.0):
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol or 0,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
     # RSI 반등 공통 필수에서 제거
 
     # ── 장세별 트리거 체크 ────────────────────────────────────
@@ -697,17 +820,39 @@ def check_buy_score(market, price, volume, open_price=0):
             if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
                 matched_cond = secondary
 
-    if matched_cond is None: return False, 0
+    if matched_cond is None:
+        # 신호 없음 — near 여부 판단 후 로그
+        _log_type = "near" if near_vol else "watch"
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type=_log_type,
+        )
+        return False, 0
 
     # ── 복합 점수 계산 ───────────────────────────────────────
     rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
     drop_score = 30 if drop_pct >= 4.0 else 20 if drop_pct >= 3.0 else 10
     vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10 if vol_ratio >= 1.2 else 0
     total_score = rsi_score + drop_score + vol_score
-    if total_score < 10: return False, 0
+    if total_score < 10:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=total_score, entry_possible=0, log_type="near",
+        )
+        return False, 0
 
     # 보조 트리거면 점수에 is_secondary 태그
     is_sec = matched_cond.get("is_secondary", False)
+
+    # 신호 발생 로그
+    log_indicator(
+        market, price, rsi, drop_pct, vol_ratio, vol,
+        ma20, ma60, d_ma20, d_ma60,
+        signal_score=total_score, entry_possible=1, log_type="signal",
+    )
+
     return True, total_score + (0.01 if is_sec else 0)  # 소수점으로 구분
 
 
