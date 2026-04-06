@@ -91,6 +91,18 @@ SECRET_KEY     = ""
 TOTAL_BUDGET   = 50_000
 MAX_SLOTS      = 2
 
+# ── vol_ratio 자동 조정 시스템 ────────────────────────────────
+VOL_RATIO_DEFAULT  = 1.3   # 중립장 기본값
+VOL_RATIO_MIN_CAP  = 1.1   # 최저 한도
+VOL_RATIO_STEP     = 0.1   # 조정 단위
+_vol_ratio_current = VOL_RATIO_DEFAULT   # 현재 적용 중인 값
+_vol_ratio_pending = False               # 사용자 승인 대기 중
+_last_trade_ts     = 0.0                 # 마지막 거래 시각
+_last_adjust_ts    = 0.0                 # 마지막 조정 시각
+_adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
+_recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
+VOL_RATIO_LOG_FILE = os.path.join(BASE_DIR, "vol_ratio_log.csv")
+
 def load_config():
     global _cfg, TELEGRAM_TOKEN, CHAT_ID, ACCESS_KEY, SECRET_KEY
     global TOTAL_BUDGET, MAX_SLOTS
@@ -337,7 +349,7 @@ def get_regime_conditions():
         secondary = dict(rsi_max=35, drop_min=1.5, vol_ratio_min=1.1, vol_min=1.0, vol_max=8.0, is_secondary=True)
         return primary, secondary
     elif regime == "neutral":
-        primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=1.3, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=_vol_ratio_current, vol_min=2.0, vol_max=8.0, is_secondary=False)
         return primary, None
     else:  # bear
         primary = dict(rsi_max=25, drop_min=3.0, vol_ratio_min=1.5, vol_min=2.0, vol_max=8.0, is_secondary=False)
@@ -552,6 +564,12 @@ def do_sell(market, price, reason):
     c["daily_pnl"]  += pnl
     c["trade_count"] += 1
     c["last_sell_time"] = time.time()
+
+    # vol_ratio 복구 판단용 거래 시각 기록
+    global _last_trade_ts, _recent_trades_ts
+    _last_trade_ts = time.time()
+    _recent_trades_ts.append(time.time())
+    _recent_trades_ts = [t for t in _recent_trades_ts if time.time() - t <= 6 * 3600]
     c.update({"has_stock": False, "buy_price": 0.0, "filled_qty": 0.0,
                "be_active": False, "highest_profit": 0.0, "buy_time": 0.0})
 
@@ -759,7 +777,86 @@ def check_trend_signal(market, price, volume):
     return True, total + 0.5   # 0.5 소수점으로 추세추종 구분
 
 # ============================================================
-# [10] 감시 종목 목록
+# [10-B] vol_ratio 자동 조정 시스템
+# ============================================================
+def _log_vol_ratio(new_val, reason):
+    """vol_ratio 변경 이력 CSV 로깅."""
+    header = not os.path.exists(VOL_RATIO_LOG_FILE)
+    try:
+        with open(VOL_RATIO_LOG_FILE, "a", encoding="utf-8") as f:
+            if header:
+                f.write("dt,vol_ratio_current,reason\n")
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{new_val},{reason}\n")
+    except Exception as e:
+        cprint(f"[vol_ratio 로그 오류] {e}", Fore.YELLOW)
+
+
+def _set_vol_ratio(new_val, reason):
+    """vol_ratio 값 변경 + 로깅."""
+    global _vol_ratio_current, _last_adjust_ts
+    _vol_ratio_current = round(new_val, 2)
+    _last_adjust_ts    = time.time()
+    _log_vol_ratio(_vol_ratio_current, reason)
+    cprint(f"[vol_ratio] {_vol_ratio_current} ({reason})", Fore.CYAN)
+
+
+def check_vol_ratio_adjust():
+    """무거래 감지 → 완화 제안 / 거래 회복 → 복구. 메인루프에서 주기적으로 호출."""
+    global _vol_ratio_pending
+
+    now      = time.time()
+    no_trade = now - _last_trade_ts if _last_trade_ts > 0 else now  # 시작 직후 예외
+
+    # ── 복구 체크: 6시간 내 거래 2건 이상 ────────────────────
+    recent_count = len(_recent_trades_ts)
+    if _vol_ratio_current < VOL_RATIO_DEFAULT and recent_count >= 2:
+        new_val = min(VOL_RATIO_DEFAULT, _vol_ratio_current + VOL_RATIO_STEP)
+        _set_vol_ratio(new_val, "auto_restore")
+        send_msg(
+            f"📈 거래 회복 감지 (6h내 {recent_count}건)\n"
+            f"거래량 기준 복구: {_vol_ratio_current - VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}"
+        )
+        _vol_ratio_pending = False
+        return
+
+    # 쿨다운 중이면 이하 로직 스킵
+    if now - _last_adjust_ts < _adjust_cooldown:
+        return
+
+    # ── 12시간 무거래 → 사용자에게 완화 제안 ─────────────────
+    if no_trade >= 12 * 3600 and not _vol_ratio_pending:
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            send_msg(
+                f"⚠️ 12시간 무거래 — 거래량 기준이 최저({VOL_RATIO_MIN_CAP})입니다.\n"
+                f"다른 조건(RSI·눌림)을 확인해주세요."
+            )
+            return
+        proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _vol_ratio_pending = True
+        send_msg(
+            f"⚠️ 12시간 무거래 감지\n"
+            f"거래량 기준 완화 제안: {_vol_ratio_current:.1f} → {proposed:.1f}\n"
+            f"적용하려면 /voldown 입력\n"
+            f"유지하려면 /volkeep 입력"
+        )
+        return
+
+    # ── 24시간 무거래 → 자동으로 한 단계 더 완화 ────────────
+    if no_trade >= 24 * 3600:
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            return
+        new_val = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _set_vol_ratio(new_val, "auto_24h")
+        _vol_ratio_pending = False
+        send_msg(
+            f"🔧 24시간 무거래 — 거래량 기준 자동 완화\n"
+            f"{_vol_ratio_current + VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}\n"
+            f"(최저 한도: {VOL_RATIO_MIN_CAP})"
+        )
+
+
+# ============================================================
+# [10-C] 감시 종목 목록
 # ============================================================
 _watch_markets    = []
 _watch_markets_ts = 0.0
@@ -870,6 +967,41 @@ def handle_command(text, req_id=""):
         with slots_lock:
             s = list(slots)
         _write_ipc_result(f"슬롯 {len(s)}/{MAX_SLOTS}: {', '.join(s) or '없음'}", req_id)
+
+    elif cmd[0] == "/voldown":
+        global _vol_ratio_pending
+        if not _vol_ratio_pending:
+            _write_ipc_result("⚠️ 현재 완화 제안이 없습니다.", req_id)
+            return
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            _vol_ratio_pending = False
+            _write_ipc_result(f"⚠️ 이미 최저 한도({VOL_RATIO_MIN_CAP})입니다.", req_id)
+            return
+        proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _set_vol_ratio(proposed, "manual")
+        _vol_ratio_pending = False
+        _write_ipc_result(
+            f"✅ 거래량 기준 완화 적용\n"
+            f"{_vol_ratio_current + VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}\n"
+            f"쿨다운: 6시간", req_id
+        )
+
+    elif cmd[0] == "/volkeep":
+        _vol_ratio_pending = False
+        _write_ipc_result(f"✅ 거래량 기준 유지 ({_vol_ratio_current:.1f})", req_id)
+
+    elif cmd[0] == "/volstatus":
+        now = time.time()
+        no_trade_h = (now - _last_trade_ts) / 3600 if _last_trade_ts > 0 else 0
+        cooldown_left = max(0, _adjust_cooldown - (now - _last_adjust_ts)) / 3600
+        _write_ipc_result(
+            f"📊 거래량 기준 현황\n"
+            f"현재: {_vol_ratio_current:.1f}  기본: {VOL_RATIO_DEFAULT:.1f}  최저: {VOL_RATIO_MIN_CAP:.1f}\n"
+            f"무거래 경과: {no_trade_h:.1f}h\n"
+            f"6h내 거래: {len(_recent_trades_ts)}건\n"
+            f"조정 쿨다운 잔여: {cooldown_left:.1f}h\n"
+            f"승인 대기중: {'✅' if _vol_ratio_pending else '없음'}", req_id
+        )
 
     elif cmd[0] in ("/why", "/왜"):
         import time as _t
@@ -1096,6 +1228,9 @@ def run_bot():
 
             # 장세 감지 (1시간마다 자동 갱신)
             detect_market_regime()
+
+            # vol_ratio 자동 조정 체크
+            check_vol_ratio_adjust()
 
             # IPC 상태 주기적 전송
             _write_status()
