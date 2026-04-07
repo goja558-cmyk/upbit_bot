@@ -272,7 +272,7 @@ def _start_ipc_thread():
 
 def _handle_ipc_cmd(text):
     """매니저에서 받은 명령 처리 → _write_ipc_result로 응답."""
-    global kill_switch_active, mdd_active  # elif 안 중복 선언 금지 — 최상단에서 한 번만
+    global kill_switch_active, mdd_active, peak_value  # elif 안 중복 선언 금지 — 최상단에서 한 번만
     cmd = text.strip().split()
     if not cmd:
         return
@@ -364,6 +364,13 @@ def _handle_ipc_cmd(text):
                 }
         portfolio.clear()
         portfolio.update(new_portfolio)
+        # 싱크 후 peak_value 비정상 감지 → 재설정
+        pf_val = sum(pos["avg_price"] * pos["qty"] for pos in new_portfolio.values())
+        actual = pf_val if pf_val > 0 else TOTAL_BUDGET
+        if peak_value > actual * 3:   # peak가 현재 평가액 3배 초과면 비정상
+            peak_value = actual
+            mdd_active = False
+            cprint(f"[싱크] peak_value 비정상 → {actual:,.0f}원 재설정", Fore.YELLOW)
         _save_state()
         lines = ["✅ 싱크 완료", f"보유: {len(portfolio)}종목"]
         for code, pos in portfolio.items():
@@ -395,9 +402,9 @@ def _ipc_send_status():
     global peak_value
     val  = _calc_portfolio_value()
     cash = get_cash_balance()
-    # portfolio 없고 현금만 있을 때 peak_value 초기화 방지
-    if peak_value <= 0 or (not portfolio and cash >= TOTAL_BUDGET * 0.8):
-        peak_value = max(peak_value, val + cash)
+    # peak_value 초기화 — portfolio도 없고 peak도 0일 때만 (최초 1회)
+    if peak_value <= 0 and not portfolio:
+        peak_value = TOTAL_BUDGET
     dd   = (val - peak_value) / peak_value * 100 if peak_value > 0 else 0.0
     lines = [
         f"📊 섹터봇 현황",

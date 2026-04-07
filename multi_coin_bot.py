@@ -810,6 +810,9 @@ def check_buy_score(market, price, volume, open_price=0):
         avg5 = sum(vol_h[-6:-1]) / 5
         vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
 
+    # 캔들 실체 비율 (시가 대비 종가 움직임)
+    candle_body_pct = abs(price - open_price) / open_price * 100 if open_price > 0 else 0.0
+
     # 일봉 MA
     d_ma20, d_ma60 = get_daily_ma_cached(market)
 
@@ -817,7 +820,26 @@ def check_buy_score(market, price, volume, open_price=0):
     primary_c, _ = get_regime_conditions()
     near_vol = (primary_c["vol_ratio_min"] - 0.3) <= vol_ratio < primary_c["vol_ratio_min"]
 
-    # 공통 필수 조건
+    # ── 공통 필수 조건 ───────────────────────────────────────
+    # 1단계: 최소 변동성 필수 (죽은 코인 제거)
+    if vol is None or vol < 0.8:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol or 0,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+
+    # 변동성 상한 (급등락 중인 코인 제외)
+    if vol > 8.0:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+
+    # 시간봉 MA 추세 확인
     if ma20 <= ma60:
         log_indicator(
             market, price, rsi, drop_pct, vol_ratio, vol,
@@ -825,14 +847,17 @@ def check_buy_score(market, price, volume, open_price=0):
             signal_score=0, entry_possible=0, log_type="watch",
         )
         return False, 0
-    if vol is None or not (1.0 <= vol <= 8.0):
+
+    # 2단계: 보조 조건 (vol_ratio OR 캔들 실체) — 진짜 움직임 확인
+    body_ok = candle_body_pct >= 0.6
+    vol_ok  = vol_ratio >= 1.05
+    if not vol_ok and not body_ok:
         log_indicator(
-            market, price, rsi, drop_pct, vol_ratio, vol or 0,
+            market, price, rsi, drop_pct, vol_ratio, vol,
             ma20, ma60, d_ma20, d_ma60,
-            signal_score=0, entry_possible=0, log_type="watch",
+            signal_score=0, entry_possible=0, log_type="near",
         )
         return False, 0
-    # RSI 반등 공통 필수에서 제거
 
     # ── 장세별 트리거 체크 ────────────────────────────────────
     primary, secondary = get_regime_conditions()
@@ -840,25 +865,21 @@ def check_buy_score(market, price, volume, open_price=0):
 
     # 기본 트리거 체크
     if (rsi <= primary["rsi_max"] and
-        drop_pct >= primary["drop_min"] and
-        vol_ratio >= primary["vol_ratio_min"]):
-        # 상승장: 일봉 필터 추가
+        drop_pct >= primary["drop_min"]):
         if _market_regime == "bull":
             if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
                 matched_cond = primary
         else:
             matched_cond = primary
 
-    # 보조 트리거 체크 (상승장 전용, 기본 트리거 미충족 시)
+    # 보조 트리거 체크 (상승장 전용)
     if matched_cond is None and secondary is not None:
         if (rsi <= secondary["rsi_max"] and
-            drop_pct >= secondary["drop_min"] and
-            vol_ratio >= secondary["vol_ratio_min"]):
+            drop_pct >= secondary["drop_min"]):
             if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
                 matched_cond = secondary
 
     if matched_cond is None:
-        # 신호 없음 — near 여부 판단 후 로그
         _log_type = "near" if near_vol else "watch"
         log_indicator(
             market, price, rsi, drop_pct, vol_ratio, vol,
@@ -870,7 +891,23 @@ def check_buy_score(market, price, volume, open_price=0):
     # ── 복합 점수 계산 ───────────────────────────────────────
     rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
     drop_score = 30 if drop_pct >= 4.0 else 20 if drop_pct >= 3.0 else 10
-    vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10 if vol_ratio >= 1.2 else 0
+
+    # vol_score: 거래량 + 변동성 구간별 점수 (컷이 아닌 가중치)
+    vol_score = (
+        30 if vol_ratio >= 2.0 else
+        20 if vol_ratio >= 1.5 else
+        15 if vol_ratio >= 1.1 else
+        10 if vol_ratio >= 1.05 else
+        0
+    )
+    vola_score = (
+        10 if vol >= 1.2 else
+        5  if vol >= 0.8 else
+        0
+    )
+    # 캔들 실체 보너스 (거래량 부족 시 보완)
+    body_score = 5 if body_ok and vol_ratio < 1.05 else 0
+    vol_score  = min(30, vol_score + vola_score + body_score)
     total_score = rsi_score + drop_score + vol_score
     if total_score < 10:
         log_indicator(
@@ -1280,9 +1317,9 @@ def handle_command(text, req_id=""):
         import time as _t
         regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
         primary_c, secondary_c = get_regime_conditions()
-        cond_str = f"기본 RSI≤{primary_c['rsi_max']} 눌림≥{primary_c['drop_min']}% 거래량≥{primary_c['vol_ratio_min']}배"
+        cond_str = f"기본 RSI≤{primary_c['rsi_max']} 눌림≥{primary_c['drop_min']}% 변동성≥0.8% + (거래량≥1.05 OR 실체≥0.6%)"
         if secondary_c:
-            cond_str += f"\n보조 RSI≤{secondary_c['rsi_max']} 눌림≥{secondary_c['drop_min']}% 거래량≥{secondary_c['vol_ratio_min']}배"
+            cond_str += f"\n보조 RSI≤{secondary_c['rsi_max']} 눌림≥{secondary_c['drop_min']}%"
         lines = ["🔍 매수 조건 요약", f"━━━━━━━━━━━━━━━━━━━━",
                  f"장세: {regime_kor}  슬롯: {_primary_slots()}+{_secondary_slots()}개 (추세+{TREND_SLOTS})",
                  cond_str]
@@ -1334,15 +1371,14 @@ def handle_command(text, req_id=""):
                 vol_ratio_w = vol_h_w[-1] / avg5_w if avg5_w > 0 else 1.0
 
             def _check_trigger(cond_t):
-                if rsi > cond_t["rsi_max"]: return f"RSI과열 {rsi:.1f}(≤{cond_t['rsi_max']})"
-
-                if ma20 is None or ma20 <= (ma60 or 0): return f"MA하락"
-                if drop_pct_w < cond_t["drop_min"]: return f"눌림부족 {drop_pct_w:.1f}%(≥{cond_t['drop_min']}%)"
-                if vol is None or not (1.0 <= vol <= 8.0): return f"변동성부족 {vol:.1f}%" if vol else "변동성없음"
-                if vol_ratio_w < cond_t["vol_ratio_min"]: return f"거래량부족 {vol_ratio_w:.1f}배(≥{cond_t['vol_ratio_min']}배)"
+                if rsi > cond_t["rsi_max"]: return f"RSI {rsi:.0f}→{cond_t['rsi_max']}"
+                if ma20 is None or ma20 <= (ma60 or 0): return "MA하락"
+                if drop_pct_w < cond_t["drop_min"]: return f"눌림 {drop_pct_w:.1f}→{cond_t['drop_min']}%"
+                if vol is None or vol < 0.8: return f"변동성부족 {vol:.2f}%" if vol else "변동성없음"
+                if vol_ratio_w < 1.05 and (vol or 0) < 0.6: return f"거래량+실체 모두 부족"
                 if _market_regime == "bull" and d_ma20_w is not None and d_ma60_w is not None and d_ma20_w <= d_ma60_w:
                     return "일봉하락추세"
-                return None  # 통과
+                return None
 
             def _calc_prob(cond_t):
                 scores = []
@@ -1381,9 +1417,12 @@ def handle_command(text, req_id=""):
                 common_fail = []
                 if ma20 is None or ma60 is None or ma20 <= ma60:
                     common_fail.append("MA하락")
-                if vol is None or not (1.0 <= vol <= 8.0):
+                if vol is None or vol < 0.8:
                     common_fail.append(f"변동성{vol:.1f}%" if vol else "변동성없음")
-                # 양봉은 open_price 없이 판단 불가 → 생략
+                elif vol > 8.0:
+                    common_fail.append(f"변동성과다{vol:.1f}%")
+                elif vol_ratio_w < 1.05 and (vol or 0) < 0.6:
+                    common_fail.append(f"거래량{vol_ratio_w:.1f}+실체부족")
 
                 if common_fail:
                     prob_list.append((m, 0, ", ".join(common_fail)))
@@ -1397,8 +1436,8 @@ def handle_command(text, req_id=""):
                         hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
                     if drop_pct_w < best_cond["drop_min"]:
                         hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
-                    if vol_ratio_w < best_cond["vol_ratio_min"]:
-                        hints.append(f"거래량 {vol_ratio_w:.1f}→{best_cond['vol_ratio_min']}")
+                    if vol_ratio_w < 1.05 and (vol or 0) < 0.6:
+                        hints.append(f"거래량 {vol_ratio_w:.1f}OR실체부족")
                     hint_str = ", ".join(hints[:2])
                     prob_list.append((m, prob, hint_str))
             checked += 1
