@@ -97,11 +97,48 @@ VOL_RATIO_MIN_CAP  = 1.1   # 최저 한도
 VOL_RATIO_STEP     = 0.1   # 조정 단위
 _vol_ratio_current = VOL_RATIO_DEFAULT   # 현재 적용 중인 값
 _vol_ratio_pending = False               # 사용자 승인 대기 중
-_last_trade_ts     = time.time()         # 마지막 거래 시각 (시작 시점으로 초기화)
+_last_trade_ts     = 0.0                 # 마지막 거래 시각 (시작 시 파일에서 복원)
 _last_adjust_ts    = 0.0                 # 마지막 조정 시각
 _adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
 _recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
 VOL_RATIO_LOG_FILE = os.path.join(BASE_DIR, "vol_ratio_log.csv")
+_TRADE_STATE_FILE  = os.path.join(BASE_DIR, "vol_trade_state.json")
+
+
+def _save_trade_state():
+    """마지막 거래 시각을 파일에 저장 — 재시작 후 복원용."""
+    try:
+        with open(_TRADE_STATE_FILE, "w") as f:
+            json.dump({
+                "last_trade_ts":    _last_trade_ts,
+                "vol_ratio_current": _vol_ratio_current,
+                "last_adjust_ts":   _last_adjust_ts,
+            }, f)
+    except Exception as e:
+        cprint(f"[trade_state 저장 오류] {e}", Fore.YELLOW)
+
+
+def _load_trade_state():
+    """재시작 시 마지막 거래 시각 / vol_ratio 복원."""
+    global _last_trade_ts, _vol_ratio_current, _last_adjust_ts
+    if not os.path.exists(_TRADE_STATE_FILE):
+        # 파일 없으면 충분히 오래된 시각으로 초기화 (즉시 체크 방지용 1시간 전)
+        _last_trade_ts = time.time() - 3600
+        return
+    try:
+        with open(_TRADE_STATE_FILE) as f:
+            data = json.load(f)
+        _last_trade_ts    = float(data.get("last_trade_ts",    time.time() - 3600))
+        _vol_ratio_current = float(data.get("vol_ratio_current", VOL_RATIO_DEFAULT))
+        _last_adjust_ts   = float(data.get("last_adjust_ts",   0.0))
+        elapsed = (time.time() - _last_trade_ts) / 3600
+        cprint(
+            f"[vol_state 복원] vol_ratio={_vol_ratio_current} / "
+            f"마지막 거래 {elapsed:.1f}시간 전", Fore.CYAN
+        )
+    except Exception as e:
+        cprint(f"[trade_state 복원 오류] {e}", Fore.YELLOW)
+        _last_trade_ts = time.time() - 3600
 
 # ── 인디케이터 로그 시스템 ────────────────────────────────────
 INDICATOR_LOG_INTERVAL = 300   # 종목당 기록 인터벌 (5분)
@@ -676,6 +713,7 @@ def do_sell(market, price, reason):
     _last_trade_ts = time.time()
     _recent_trades_ts.append(time.time())
     _recent_trades_ts = [t for t in _recent_trades_ts if time.time() - t <= 6 * 3600]
+    _save_trade_state()   # 재시작 후 복원용
     c.update({"has_stock": False, "buy_price": 0.0, "filled_qty": 0.0,
                "be_active": False, "highest_profit": 0.0, "buy_time": 0.0})
 
@@ -1019,6 +1057,7 @@ def _set_vol_ratio(new_val, reason):
         applied          = "Y",
     )
     cprint(f"[vol_ratio] {old_val} → {_vol_ratio_current} ({reason})", Fore.CYAN)
+    _save_trade_state()   # vol_ratio 변경도 저장
 
 
 def check_vol_ratio_adjust():
@@ -1432,6 +1471,7 @@ def run_bot():
     global _running, daily_pnl, _last_reset_day
 
     load_config()
+    _load_trade_state()   # 마지막 거래 시각 / vol_ratio 복원
 
     if not JWT_OK:
         print("❌ PyJWT 없음. pip install PyJWT"); sys.exit(1)
