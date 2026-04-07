@@ -1239,9 +1239,6 @@ def handle_command(text, req_id=""):
 
     elif cmd[0] == "/voldown":
         global _vol_ratio_pending
-        if not _vol_ratio_pending:
-            _write_ipc_result("⚠️ 현재 완화 제안이 없습니다.", req_id)
-            return
         if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
             _vol_ratio_pending = False
             _write_ipc_result(f"⚠️ 이미 최저 한도({VOL_RATIO_MIN_CAP})입니다.", req_id)
