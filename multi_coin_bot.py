@@ -164,7 +164,7 @@ def _write_indicator_row(path, row):
                     "datetime,market,price,hour,rsi,drop_pct,vol_ratio,vol_pct,"
                     "h_ma20,h_ma60,d_ma20,d_ma60,near_trigger,signal_score,"
                     "entry_possible,log_type,regime,"
-                    "fwd_return_5m,fwd_return_10m,fwd_ts\n"
+                    "fwd_return_5m,fwd_return_10m,fwd_ts,fwd_filled\n"
                 )
             f.write(row + "\n")
     except Exception as e:
@@ -187,12 +187,13 @@ def _update_fwd_returns(market, current_price):
             return
         with open(fpath, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        # 마지막 실제 데이터 행 (헤더 제외) 중 fwd가 비어있는 행 수정
+        # 마지막 실제 데이터 행 중 fwd가 비어있는 행 수정
         for i in range(len(lines) - 1, 0, -1):
             parts = lines[i].rstrip("\n").split(",")
-            if len(parts) >= 20 and parts[17] == "" and parts[0].startswith(pend["dt"]):
+            if len(parts) >= 21 and parts[17] == "" and parts[0].startswith(pend["dt"]):
                 parts[17] = str(fwd)   # fwd_return_5m
-                parts[18] = str(fwd)   # fwd_return_10m (5분봉 기준이라 동일)
+                parts[18] = str(fwd)   # fwd_return_10m
+                parts[20] = "1"        # fwd_filled
                 lines[i] = ",".join(parts) + "\n"
                 break
         with open(fpath, "w", encoding="utf-8") as f:
@@ -233,7 +234,7 @@ def log_indicator(market, price, rsi, drop_pct, vol_ratio, vol_pct,
         f"{round(d_ma60,2) if d_ma60 is not None else ''},"
         f"{round(near,4)},"
         f"{signal_score},{entry_possible},{log_type},{_market_regime},"
-        f",,{now}"   # fwd_return_5m, fwd_return_10m는 나중에 채움
+        f",,{now},0"   # fwd_return_5m, fwd_return_10m 나중에 채움 / fwd_filled=0
     )
     path = _get_indicator_log_path(market)
     _write_indicator_row(path, row)
@@ -1099,7 +1100,7 @@ def _set_vol_ratio(new_val, reason):
 
 def check_vol_ratio_adjust():
     """무거래 감지 → 완화 제안 / 거래 회복 → 복구. 메인루프에서 주기적으로 호출."""
-    global _vol_ratio_pending
+    global _vol_ratio_pending, _last_adjust_ts
 
     now      = time.time()
     no_trade = now - _last_trade_ts
@@ -1127,6 +1128,8 @@ def check_vol_ratio_adjust():
                 f"⚠️ 12시간 무거래 — 거래량 기준이 최저({VOL_RATIO_MIN_CAP})입니다.\n"
                 f"다른 조건(RSI·눌림)을 확인해주세요."
             )
+            _vol_ratio_pending = True   # 중복 알림 방지
+            _last_adjust_ts = now       # 쿨다운 시작
             return
         proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
         _vol_ratio_pending = True
@@ -1457,7 +1460,11 @@ def handle_command(text, req_id=""):
             for m, p, h in cold:
                 lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
         if not prob_list and not holding:
-            lines.append("감시 종목 없음")
+            markets = get_watch_markets()
+            if markets:
+                lines.append(f"⏳ 데이터 수집 중 ({len(markets)}개 종목 — 약 5분 후 표시)")
+            else:
+                lines.append("감시 종목 없음")
 
         # 추세추종 후보 표시
         trend_list = []
@@ -1606,16 +1613,12 @@ def run_bot():
 
             # 추세추종 신호 수집
             trend_signals = []
-            for td in tickers:
-                market = td.get("market", "")
+            for market, td in tickers.items():
+                with slots_lock:
+                    if market in slots: continue
                 price  = float(td.get("trade_price", 0))
                 volume = td.get("acc_trade_volume_24h", 0)
                 if not market or price <= 0: continue
-                with slots_lock:
-                    if market in slots: continue   # 이미 보유 중
-                # 역추세 슬롯과 종목 중복 방지
-                with slots_lock:
-                    if market in slots: continue
                 c = get_or_create_coin(market)
                 ok, score = check_trend_signal(market, price, volume)
                 if ok:
