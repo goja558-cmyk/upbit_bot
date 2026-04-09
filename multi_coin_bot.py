@@ -324,18 +324,24 @@ def send_order(side, market, qty_or_price):
         cprint(f"[주문 오류] {e}", Fore.RED)
     return 0, 0
 
-def confirm_order(uuid, retry=8):
-    for _ in range(retry):
+def confirm_order(uuid, retry=15):
+    """주문 체결 확인. done/cancel이면 반환, wait이면 재시도."""
+    for i in range(retry):
         try:
             h = _upbit_headers()
             r = requests.get(f"{UPBIT_BASE}/order", headers=h,
                              params={"uuid": uuid}, timeout=5)
             if r.status_code == 200:
                 d = r.json()
-                if d.get("state") in ("done", "cancel"):
-                    filled = float(d.get("executed_volume", 0))
-                    funds  = float(d.get("executed_funds", 0))
-                    avg_p  = funds / filled if filled > 0 else 0
+                state  = d.get("state")
+                filled = float(d.get("executed_volume", 0))
+                funds  = float(d.get("executed_funds", 0))
+                avg_p  = funds / filled if filled > 0 else 0
+                if state in ("done", "cancel"):
+                    return filled, avg_p
+                # wait 상태지만 일부 체결된 경우 — 마지막 시도에서 반환
+                if state == "wait" and filled > 0 and i >= retry - 3:
+                    cprint(f"[주문 부분체결] {uuid} filled={filled:.6f}", Fore.YELLOW)
                     return filled, avg_p
         except Exception:
             pass
@@ -1315,6 +1321,61 @@ def handle_command(text, req_id=""):
             f"조정 쿨다운 잔여: {cooldown_left:.1f}h\n"
             f"승인 대기중: {'✅' if _vol_ratio_pending else '없음'}", req_id
         )
+
+    elif cmd[0] == "/sync":
+        """업비트 실제 보유 잔고 → coins/slots 강제 동기화."""
+        try:
+            h = _upbit_headers()
+            r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=5)
+            if r.status_code != 200:
+                _write_ipc_result("❌ 잔고 조회 실패", req_id)
+                return
+            accounts = r.json()
+            synced = []
+            with coins_lock:
+                # 기존 slots 초기화
+                with slots_lock:
+                    old_slots = set(slots)
+                # 실제 보유 코인 반영
+                for a in accounts:
+                    currency = a.get("currency", "")
+                    if currency == "KRW":
+                        continue
+                    market = f"KRW-{currency}"
+                    balance = float(a.get("balance", 0))
+                    avg_buy = float(a.get("avg_buy_price", 0))
+                    if balance <= 0 or avg_buy <= 0:
+                        continue
+                    # coins에 반영
+                    c = get_or_create_coin(market)
+                    c["has_stock"]     = True
+                    c["buy_price"]     = avg_buy
+                    c["filled_qty"]    = balance
+                    c["be_active"]     = False
+                    c["highest_profit"] = 0.0
+                    c["buy_time"]      = c.get("buy_time") or time.time()
+                    # slots에 반영
+                    with slots_lock:
+                        slots.add(market)
+                    synced.append(f"{currency}: {balance:.6f} @ {avg_buy:,.2f}원")
+                # 실제 없는데 slots에 있는 것 제거
+                for market in list(old_slots):
+                    found = any(f"KRW-{a.get('currency')}" == market
+                                and float(a.get("balance", 0)) > 0
+                                for a in accounts)
+                    if not found:
+                        with slots_lock:
+                            slots.discard(market)
+                        c = coins.get(market)
+                        if c:
+                            c["has_stock"] = False
+            if synced:
+                _write_ipc_result(f"✅ 동기화 완료\n" + "\n".join(synced), req_id)
+            else:
+                _write_ipc_result("✅ 동기화 완료 — 보유 코인 없음", req_id)
+            _write_status()
+        except Exception as e:
+            _write_ipc_result(f"❌ 동기화 오류: {e}", req_id)
 
     elif cmd[0] in ("/why", "/왜"):
         import time as _t
