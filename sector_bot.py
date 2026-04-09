@@ -1,2435 +1,1733 @@
 """
 ==============================================================
-  섹터 로테이션 자동매매 봇 v1.0
-  전략서 기반 구현 — 기존 kis_bot.py KIS API 인프라 활용
+  멀티코인 자동매매 봇 v1.0
+  - 프로세스 1개로 30개 종목 감시
+  - 슬롯 수 = 예산 ÷ 20,000 (자동 계산)
+  - 신호 강도 순으로 슬롯 할당 → 매수
+  - 종목별 독립 포지션 관리
+  - 기존 upbit_bot.py 매매 로직 (RSI V-Turn, 트레일링 등) 그대로 사용
 
-  ▶ 전략 요약:
-    - ETF 10종 중 모멘텀 상위 2~3개만 보유
-    - 20일+60일 수익률 가중 모멘텀 스코어
-    - 킬 스위치 / MDD -10% 전량 KOFR 대피
-    - 트레일링 스탑 (+6% 후 고점 -2%)
-    - 손절 -5%
-    - 10만원 소액 테스트 — 종목당 최소 단위 분배
-
-  ▶ 실행:
-    python sector_bot.py
-
-  ▶ 설정 파일: sector_cfg.yaml (아래 양식 참고)
-    app_key:        "여기에_KIS_APP_KEY"
-    app_secret:     "여기에_KIS_APP_SECRET"
-    account_no:     "12345678"     # 계좌번호 앞 8자리
-    account_suffix: "01"           # 계좌번호 뒤 2자리
-    telegram_token: "봇토큰"
-    chat_id:        "내채팅ID"
-    mock:           true           # true=모의투자 false=실투자
-    total_budget:   100000         # 전체 예산(원)
+  upbit_cfg.yaml 동일하게 사용
 ==============================================================
 """
 
 BOT_VERSION = "1.0"
-BOT_NAME    = "섹터로테이션봇"
-BOT_TAG     = "📊 섹터"
+BOT_TAG     = "🪙 멀티코인"
 
-import os, sys, time, json, yaml, requests, threading, math, traceback
-from datetime import datetime, date, timedelta
-from colorama import Fore, Style, init as colorama_init
+import sys, os, time, json, csv, requests, yaml, shutil, traceback, threading
+import numpy as np
+from datetime import datetime, date
+from collections import deque
+from urllib.parse import urlencode
 
-colorama_init(autoreset=True)
+try:
+    import jwt as pyjwt
+    JWT_OK = True
+except ImportError:
+    JWT_OK = False
 
-# ============================================================
-# [1] 경로 설정
-# ============================================================
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-CFG_FILE      = os.path.join(BASE_DIR, "sector_cfg.yaml")
-LOG_FILE      = os.path.join(BASE_DIR, "sector_trade_log.csv")
-STATE_FILE    = os.path.join(BASE_DIR, "sector_state.json")
-SHARED_DIR    = os.path.join(BASE_DIR, "shared")
-LOG_DIR       = os.path.join(BASE_DIR, "logs", "sector")
-os.makedirs(SHARED_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)
+    COLOR_OK = True
+except ImportError:
+    COLOR_OK = False
+    class Fore:
+        GREEN = YELLOW = RED = CYAN = MAGENTA = WHITE = RESET = ""
+    class Style:
+        BRIGHT = RESET_ALL = DIM = ""
 
-
-def cprint(msg, color=Fore.WHITE, bright=False):
-    prefix = Style.BRIGHT if bright else ""
+def cprint(text, color="", bright=False, **_):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{prefix}{color}[{ts}] {msg}{Style.RESET_ALL}")
-
+    prefix = (Style.BRIGHT if bright else "") + color if COLOR_OK else ""
+    print(f"{prefix}[{ts}] {text}{Style.RESET_ALL if COLOR_OK else ''}")
 
 # ============================================================
-# [2] ETF 유니버스 (전략서 4.1)
+# [1] 경로 / 상수
 # ============================================================
-ETF_UNIVERSE = {
-    "396500": {"name": "TIGER 반도체TOP10",    "max_weight": 0.25, "tag": "성장"},
-    "152100": {"name": "PLUS K방산",           "max_weight": 0.15, "tag": "모멘텀"},
-    "494670": {"name": "TIGER 조선TOP10",      "max_weight": 0.15, "tag": "모멘텀"},
-    "143860": {"name": "TIGER 헬스케어",       "max_weight": 0.15, "tag": "방어"},
-    "305720": {"name": "KODEX 2차전지산업",    "max_weight": 0.05, "tag": "고위험"},
-    "445290": {"name": "KODEX 로봇액티브",     "max_weight": 0.05, "tag": "고위험"},
-    "381170": {"name": "HANARO 원자력iSelect", "max_weight": 0.15, "tag": "성장"},
-    "091170": {"name": "TIGER 은행",           "max_weight": 0.15, "tag": "방어"},
-    "227560": {"name": "TIGER 200 생활소비재", "max_weight": 0.15, "tag": "방어"},
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.join(BASE_DIR, "shared")
+os.makedirs(SHARED_DIR, exist_ok=True)
+
+import argparse as _ap
+_p = _ap.ArgumentParser(add_help=False)
+_p.add_argument("--config", default=None)
+_args, _ = _p.parse_known_args()
+CFG_FILE = os.path.abspath(_args.config) if _args.config else os.path.join(BASE_DIR, "upbit_cfg.yaml")
+
+UPBIT_BASE    = "https://api.upbit.com/v1"
+FEE_RATE      = 0.0005
+MIN_ORDER_KRW = 5_000
+MIN_TRADE_KRW = 20_000   # 슬롯당 최소 예산
+
+# 장세별 슬롯당 예산 비율 (TOTAL_BUDGET 대비)
+# 상승장: 5슬롯 × 18% = 90% 투자, 10% 유보
+# 중립장: 3슬롯 × 30% = 90% 투자, 10% 유보
+# 하락장: 2슬롯 × 25% = 50% 투자, 50% 유보
+SLOT_BUDGET_RATIO = {
+    "bull":    0.18,
+    "neutral": 0.28,
+    "bear":    0.25,
 }
-KOFR_CODE    = "449170"
-KOFR_NAME    = "TIGER KOFR금리액티브"
-INVERSE_CODE = "114800"
-INVERSE_NAME = "KODEX 인버스"
+LOOP_INTERVAL  = 10
+WATCH_COUNT    = 30
+WATCH_INTERVAL = 300     # 시세 일괄 조회 주기 (초) — 1시간봉은 5분마다면 충분
+REAL_DATA_MIN  = 48      # 매수 허용 최소 데이터 수 (48시간치)
+HISTORY_LEN    = 200
+COOLDOWN_SEC   = 3600    # 1시간 쿨다운
+CANDLE_INTERVAL = 60     # 1시간봉
+
+# 스테이블/저변동 블랙리스트
+BLACKLIST = {"KRW-USDT","KRW-USDC","KRW-DAI","KRW-BUSD","KRW-BTC"}
 
 # ============================================================
-# [3] 전략 파라미터
+# [2] 설정
 # ============================================================
-MOMENTUM_DAYS_SHORT  = 20     # 단기 모멘텀 기간
-MOMENTUM_DAYS_LONG   = 60     # 장기 모멘텀 기간
-MOMENTUM_W_SHORT     = 0.5
-MOMENTUM_W_LONG      = 0.5
-TOP_N_ETF            = 5      # 상위 몇 개 편입 (30만원 기준 5개)
-MIN_SCORE_THRESHOLD  = -5.0   # 이하면 대피 (0% → -5%로 완화)
+_cfg           = {}
+TELEGRAM_TOKEN = ""
+CHAT_ID        = ""
+ACCESS_KEY     = ""
+SECRET_KEY     = ""
+TOTAL_BUDGET   = 50_000
+MAX_SLOTS      = 2
 
-TRAIL_START_PCT  = 4.0        # 트레일링 스탑 시작 수익률 (6%→4%)
-TRAIL_GAP_PCT    = 2.0        # 트레일링 스탑 간격 (%)
-STOP_LOSS_PCT    = -5.0       # 손절 (%)
-MAX_DD_PCT       = -10.0      # 계좌 MDD 한도 (%)
-KILL_DAY_LOSS    = -4.0       # 킬 스위치 일일 손실 (-3%→-4% 완화)
-
-# ── 대피 단계 파라미터 ─────────────────────────────────────
-D1_KOSPI_PCT   = -2.0   # NORMAL→DEFENSE_1 코스피 조건 (-1.5%→-2% 완화)
-D1_PF_PCT      = -3.0   # NORMAL→DEFENSE_1 포트폴리오 수익률 조건 (-2%→-3% 완화)
-D2_KOSPI_PCT   = -2.0   # DEFENSE_1→2 코스피 조건
-D2_CONSEC      = 2      # DEFENSE_1→2 연속하락일 조건
-D3_KOSPI_PCT   = -3.0   # DEFENSE_2→3 코스피 조건
-D3_CONSEC      = 3      # DEFENSE_2→3 연속하락일 조건
-
-D_DOWN_3TO2    = -1.5   # DEFENSE_3→2 완화 조건 (코스피)
-D_DOWN_2TO1    = -0.5   # DEFENSE_2→1 완화 조건 (코스피)
-D_DOWN_1WAIT   =  0.0   # DEFENSE_1→복귀대기 조건 (코스피)
-
-INVERSE_TRAIL_GAP   = 2.0    # 인버스 트레일링 스탑 간격 (%)
-INVERSE_STOP_LOSS   = -4.0   # 인버스 손절 (%)
-
-RESUME_KOSPI_PCT    =  0.5   # 자동 복귀 코스피 조건 (+1%→+0.5% 완화)
-RESUME_VOL_RATIO    =  1.1   # 자동 복귀 거래량 비율 (1.2→1.1 완화)
-OVERHEAT_PCT     = 15.0       # 과열 필터: 5일 수익률 초과 시 비중 축소 (제외→축소)
-
-COOLDOWN_DAYS    = 14         # 섹터 쿨다운 일수
-
-TRADE_START_H    = 9
-TRADE_START_M    = 10
-TRADE_BUY_END_H  = 15
-TRADE_BUY_END_M  = 20
-TRADE_SELL_END_H = 15
-TRADE_SELL_END_M = 25
-NO_BUY_FRIDAY    = True
-
-MIN_VOLUME_KRW   = 5_000_000_000  # 일 거래대금 50억
-MAX_SPREAD_PCT   = 0.5
-KOFR_MIN_RATIO   = 0.15           # KOFR 상시 최소 비중
-
-# ============================================================
-# [4] 전역 상태
-# ============================================================
-_cfg             = {}
-TELEGRAM_TOKEN   = ""
-CHAT_ID          = ""
-TOTAL_BUDGET     = 100_000
-IS_MOCK          = True
-
-portfolio        = {}     # {code: {qty, avg_price, high_price, entry_date}}
-cooldown_list    = {}     # {code: date until}
-kill_switch_active = False
-mdd_active       = False
-peak_value       = 0.0
-initial_value    = 0.0
-daily_pnl_krw    = 0
-daily_loss_base  = 100_000
-last_reset_day   = None
-trade_count      = 0
-
-# ── 대피 시스템 상태 ──────────────────────────────────────
-# defense_stage: NORMAL / DEFENSE_1 / DEFENSE_2 / DEFENSE_3 / DEFENSE_WAIT
-defense_stage        = "NORMAL"
-kospi_baseline       = 0.0      # 당일 장 시작 시 코스피 기준가
-_kospi_baseline_set  = False    # 당일 기준가 캡처 여부
-consecutive_down_days = 0       # 코스피 연속 하락일수
-inverse_peak_return  = 0.0      # 인버스 보유 중 고점 수익률
-defense_down_date    = None     # 단계 하향 조건 충족 시작일 (1일 유지 확인)
-_last_update_id  = 0
-_tg_lock         = threading.Lock()
-_defense_lock    = threading.Lock()   # 대피 단계 진입 중복 방지
-
-# KIS 인증
-_access_token    = ""
-_token_expire    = 0.0
-
-# Rate limit
-_bucket_tokens   = 4.0
-_bucket_last     = time.time()
-_BUCKET_CAP      = 4
-_BUCKET_RATE     = 3.0
-
-# ============================================================
-# [4-B] IPC: 매니저 ↔ 섹터봇 통신
-#   - upbit_bot.py 와 동일한 패턴 사용
-#   - cmd 파일명: shared/cmd_stock.json  (manager가 stock 워커에 쓰는 경로)
-#   - result 파일명: shared/result_stock.json
-# ============================================================
-_IPC_CMD_FILE    = None
-_IPC_RESULT_FILE = None
-_IPC_REQ_ID      = ""
-_is_ipc_context  = False
-_IPC_THREAD_STARTED = False
-_MANAGER_PID_FILE   = os.path.join(SHARED_DIR, "manager.pid")
+# ── vol_ratio 자동 조정 시스템 ────────────────────────────────
+VOL_RATIO_DEFAULT  = 1.3   # 중립장 기본값
+VOL_RATIO_MIN_CAP  = 1.1   # 최저 한도
+VOL_RATIO_STEP     = 0.1   # 조정 단위
+_vol_ratio_current = VOL_RATIO_DEFAULT   # 현재 적용 중인 값
+_vol_ratio_pending = False               # 사용자 승인 대기 중
+_last_trade_ts     = 0.0                 # 마지막 거래 시각 (시작 시 파일에서 복원)
+_last_adjust_ts    = 0.0                 # 마지막 조정 시각
+_adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
+_recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
+VOL_RATIO_LOG_FILE = os.path.join(BASE_DIR, "vol_ratio_log.csv")
+_TRADE_STATE_FILE  = os.path.join(BASE_DIR, "vol_trade_state.json")
 
 
-def _init_ipc():
-    global _IPC_CMD_FILE, _IPC_RESULT_FILE
-    _IPC_CMD_FILE    = os.path.join(SHARED_DIR, "cmd_stock.json")
-    _IPC_RESULT_FILE = os.path.join(SHARED_DIR, "result_stock.json")
-
-
-def _manager_is_running():
-    if not os.path.exists(_MANAGER_PID_FILE):
-        return False
+def _save_trade_state():
+    """마지막 거래 시각을 파일에 저장 — 재시작 후 복원용."""
     try:
+        with open(_TRADE_STATE_FILE, "w") as f:
+            json.dump({
+                "last_trade_ts":    _last_trade_ts,
+                "vol_ratio_current": _vol_ratio_current,
+                "last_adjust_ts":   _last_adjust_ts,
+            }, f)
+    except Exception as e:
+        cprint(f"[trade_state 저장 오류] {e}", Fore.YELLOW)
+
+
+def _load_trade_state():
+    """재시작 시 마지막 거래 시각 / vol_ratio 복원."""
+    global _last_trade_ts, _vol_ratio_current, _last_adjust_ts
+    if not os.path.exists(_TRADE_STATE_FILE):
+        # 파일 없으면 충분히 오래된 시각으로 초기화 (즉시 체크 방지용 1시간 전)
+        _last_trade_ts = time.time() - 3600
+        return
+    try:
+        with open(_TRADE_STATE_FILE) as f:
+            data = json.load(f)
+        _last_trade_ts    = float(data.get("last_trade_ts",    time.time() - 3600))
+        _vol_ratio_current = float(data.get("vol_ratio_current", VOL_RATIO_DEFAULT))
+        _last_adjust_ts   = float(data.get("last_adjust_ts",   0.0))
+        elapsed = (time.time() - _last_trade_ts) / 3600
+        cprint(
+            f"[vol_state 복원] vol_ratio={_vol_ratio_current} / "
+            f"마지막 거래 {elapsed:.1f}시간 전", Fore.CYAN
+        )
+    except Exception as e:
+        cprint(f"[trade_state 복원 오류] {e}", Fore.YELLOW)
+        _last_trade_ts = time.time() - 3600
+
+# ── 인디케이터 로그 시스템 ────────────────────────────────────
+INDICATOR_LOG_INTERVAL = 300   # 종목당 기록 인터벌 (5분)
+_indicator_last_ts     = {}    # {market: last_log_ts}
+# fwd_return 추적: {market: [(log_ts, price, row_path, row_lineno), ...]}
+# 간단하게 {market: (ts, price)} 로 직전 기록만 유지
+_indicator_pending_fwd = {}    # {market: {"ts": float, "price": float, "file": str}}
+
+
+def _get_indicator_log_path(market=None):
+    """logs/indicators/YYYY-MM-DD.csv — 모든 코인 하나의 파일"""
+    log_dir = os.path.join(BASE_DIR, "logs", "indicators")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"{date.today().strftime('%Y-%m-%d')}.csv")
+
+
+def _write_indicator_row(path, row):
+    header = not os.path.exists(path)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            if header:
+                f.write(
+                    "datetime,market,price,hour,rsi,drop_pct,vol_ratio,vol_pct,"
+                    "h_ma20,h_ma60,d_ma20,d_ma60,near_trigger,signal_score,"
+                    "entry_possible,log_type,regime,"
+                    "fwd_return_5m,fwd_return_10m,fwd_ts,fwd_filled\n"
+                )
+            f.write(row + "\n")
+    except Exception as e:
+        cprint(f"[인디케이터 로그 오류] {e}", Fore.YELLOW)
+
+
+def _update_fwd_returns(market, current_price):
+    """직전 pending 행의 fwd_return을 현재가로 채워 덮어씀."""
+    pend = _indicator_pending_fwd.get(market)
+    if not pend:
+        return
+    elapsed = time.time() - pend["ts"]
+    # 5분(300s) 이상 지났으면 fwd 채우기
+    if elapsed < INDICATOR_LOG_INTERVAL:
+        return
+    try:
+        fwd = round((current_price - pend["price"]) / pend["price"] * 100, 4)
+        fpath = pend["file"]
+        if not os.path.exists(fpath):
+            return
+        with open(fpath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # 마지막 실제 데이터 행 중 fwd가 비어있는 행 수정
+        for i in range(len(lines) - 1, 0, -1):
+            parts = lines[i].rstrip("\n").split(",")
+            if len(parts) >= 21 and parts[17] == "" and parts[0].startswith(pend["dt"]):
+                parts[17] = str(fwd)   # fwd_return_5m
+                parts[18] = str(fwd)   # fwd_return_10m
+                parts[20] = "1"        # fwd_filled
+                lines[i] = ",".join(parts) + "\n"
+                break
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        cprint(f"[fwd 업데이트 오류] {market}: {e}", Fore.YELLOW)
+    finally:
+        _indicator_pending_fwd.pop(market, None)
+
+
+def log_indicator(market, price, rsi, drop_pct, vol_ratio, vol_pct,
+                  h_ma20, h_ma60, d_ma20, d_ma60,
+                  signal_score, entry_possible, log_type):
+    """5분 인터벌로 종목별 지표를 날짜별 CSV에 기록."""
+    now = time.time()
+    last = _indicator_last_ts.get(market, 0)
+    if now - last < INDICATOR_LOG_INTERVAL:
+        return
+
+    # 직전 pending fwd 채우기 시도
+    _update_fwd_returns(market, price)
+
+    _indicator_last_ts[market] = now
+    dt_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hour    = datetime.now().hour
+    primary, _ = get_regime_conditions()
+    near    = round(primary["vol_ratio_min"] - vol_ratio, 4) if vol_ratio < primary["vol_ratio_min"] else 0.0
+
+    row = (
+        f"{dt_str},{market},{price},{hour},"
+        f"{round(rsi,2) if rsi is not None else ''},"
+        f"{round(drop_pct,4) if drop_pct is not None else ''},"
+        f"{round(vol_ratio,4) if vol_ratio is not None else ''},"
+        f"{round(vol_pct,4) if vol_pct is not None else ''},"
+        f"{round(h_ma20,2) if h_ma20 is not None else ''},"
+        f"{round(h_ma60,2) if h_ma60 is not None else ''},"
+        f"{round(d_ma20,2) if d_ma20 is not None else ''},"
+        f"{round(d_ma60,2) if d_ma60 is not None else ''},"
+        f"{round(near,4)},"
+        f"{signal_score},{entry_possible},{log_type},{_market_regime},"
+        f",,{now},0"   # fwd_return_5m, fwd_return_10m 나중에 채움 / fwd_filled=0
+    )
+    path = _get_indicator_log_path(market)
+    _write_indicator_row(path, row)
+
+    # fwd pending 등록
+    _indicator_pending_fwd[market] = {
+        "ts":    now,
+        "price": price,
+        "file":  path,
+        "dt":    dt_str[:16],   # YYYY-MM-DD HH:MM 으로 행 매칭
+    }
+
+def load_config():
+    global _cfg, TELEGRAM_TOKEN, CHAT_ID, ACCESS_KEY, SECRET_KEY
+    global TOTAL_BUDGET, MAX_SLOTS
+    if not os.path.exists(CFG_FILE):
+        print(f"❌ {CFG_FILE} 없음"); sys.exit(1)
+    with open(CFG_FILE, encoding="utf-8") as f:
+        _cfg = yaml.safe_load(f) or {}
+    TELEGRAM_TOKEN = _cfg.get("telegram_token", "")
+    CHAT_ID        = str(_cfg.get("chat_id", ""))
+    ACCESS_KEY     = _cfg.get("access_key", "")
+    SECRET_KEY     = _cfg.get("secret_key", "")
+    # manager_cfg.yaml의 total_budget 우선, 없으면 upbit_cfg.yaml의 budget
+    mgr_cfg_file = os.path.join(os.path.dirname(CFG_FILE), "manager_cfg.yaml")
+    mgr_budget = 0
+    if os.path.exists(mgr_cfg_file):
+        import yaml as _yaml
+        with open(mgr_cfg_file, encoding="utf-8") as _f:
+            _mcfg = _yaml.safe_load(_f) or {}
+        mgr_budget = int(_mcfg.get("total_budget", 0))
+    TOTAL_BUDGET   = mgr_budget or int(_cfg.get("budget", 50_000))
+    MAX_SLOTS      = max(1, TOTAL_BUDGET // MIN_TRADE_KRW)
+    cprint(f"✅ 설정 로드 (예산:{TOTAL_BUDGET:,}원 / 슬롯:{MAX_SLOTS}개)", Fore.GREEN)
+
+# ============================================================
+# [3] 업비트 API
+# ============================================================
+def _upbit_headers(body=None):
+    import uuid, hmac, hashlib
+    payload = {"access_key": ACCESS_KEY, "nonce": str(uuid.uuid4())}
+    if body:
+        import urllib.parse
+        query = urllib.parse.urlencode(body)
+        m = hashlib.sha512(); m.update(query.encode())
+        payload["query_hash"] = m.hexdigest()
+        payload["query_hash_alg"] = "SHA512"
+    token = pyjwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    if isinstance(token, bytes): token = token.decode()
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def get_price_and_volume(market):
+    try:
+        r = requests.get(f"{UPBIT_BASE}/ticker", params={"markets": market}, timeout=5)
+        if r.status_code == 200:
+            d = r.json()[0]
+            return d.get("trade_price", 0), d.get("acc_trade_volume_24h", 0)
+    except Exception as e:
+        cprint(f"[API] {market} 시세 오류: {e}", Fore.YELLOW)
+    return 0, 0
+
+def get_balance_krw():
+    try:
+        h = _upbit_headers()
+        r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=5)
+        if r.status_code == 200:
+            for a in r.json():
+                if a.get("currency") == "KRW":
+                    return float(a.get("balance", 0))
+    except Exception as e:
+        cprint(f"[잔고 조회 오류] {e}", Fore.YELLOW)
+    return 0
+
+def send_order(side, market, qty_or_price):
+    try:
+        if side == "BUY":
+            body = {"market": market, "side": "bid",
+                    "price": str(int(qty_or_price)), "ord_type": "price"}
+        else:
+            body = {"market": market, "side": "ask",
+                    "volume": str(qty_or_price), "ord_type": "market"}
+        h = _upbit_headers(body)
+        r = requests.post(f"{UPBIT_BASE}/orders", headers=h, json=body, timeout=10)
+        if r.status_code in (200, 201):
+            return confirm_order(r.json().get("uuid", ""))
+    except Exception as e:
+        cprint(f"[주문 오류] {e}", Fore.RED)
+    return 0, 0
+
+def confirm_order(uuid, retry=15):
+    """주문 체결 확인. done/cancel이면 반환, wait이면 재시도."""
+    for i in range(retry):
+        try:
+            h = _upbit_headers()
+            r = requests.get(f"{UPBIT_BASE}/order", headers=h,
+                             params={"uuid": uuid}, timeout=5)
+            if r.status_code == 200:
+                d = r.json()
+                state  = d.get("state")
+                filled = float(d.get("executed_volume", 0))
+                funds  = float(d.get("executed_funds", 0))
+                avg_p  = funds / filled if filled > 0 else 0
+                if state in ("done", "cancel"):
+                    return filled, avg_p
+                # wait 상태지만 일부 체결된 경우 — 마지막 시도에서 반환
+                if state == "wait" and filled > 0 and i >= retry - 3:
+                    cprint(f"[주문 부분체결] {uuid} filled={filled:.6f}", Fore.YELLOW)
+                    return filled, avg_p
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return 0, 0
+
+def get_ohlcv(market, count=200, interval=None):
+    if interval is None:
+        interval = CANDLE_INTERVAL
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/{interval}",
+            params={"market": market, "count": count}, timeout=5
+        )
+        if r.status_code == 200:
+            return [c["trade_price"] for c in reversed(r.json())]
+    except Exception as e:
+        cprint(f"[OHLCV 오류] {market}: {e}", Fore.YELLOW)
+    return []
+
+# ============================================================
+# [4] 지표 계산
+# ============================================================
+def calc_rsi(prices, period=14):
+    arr = list(prices)
+    if len(arr) < period + 1: return None
+    deltas = [arr[i] - arr[i-1] for i in range(1, len(arr))]
+    gains  = [max(d, 0) for d in deltas]
+    losses = [abs(min(d, 0)) for d in deltas]
+    avg_g = sum(gains[-period:]) / period
+    avg_l = sum(losses[-period:]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period-1) + gains[i]) / period
+        avg_l = (avg_l * (period-1) + losses[i]) / period
+    if avg_l == 0: return 100.0
+    rs = avg_g / avg_l
+    return round(100 - 100 / (1 + rs), 2)
+
+def calc_ma(prices, n):
+    arr = list(prices)
+    if len(arr) < n: return None
+    return sum(arr[-n:]) / n
+
+def get_daily_ma(market, short=20, long=60):
+    """일봉 MA20, MA60 조회 — 상위 타임프레임 필터용"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/days",
+            params={"market": market, "count": long + 5}, timeout=5
+        )
+        if r.status_code == 200:
+            closes = [c["trade_price"] for c in reversed(r.json())]
+            ma_s = sum(closes[-short:]) / short if len(closes) >= short else None
+            ma_l = sum(closes[-long:]) / long if len(closes) >= long else None
+            return ma_s, ma_l
+    except Exception as e:
+        cprint(f"[일봉MA 오류] {market}: {e}", Fore.YELLOW)
+    return None, None
+
+# 일봉 MA 캐시 (1시간마다 갱신)
+_daily_ma_cache = {}
+_daily_ma_ts    = {}
+DAILY_MA_TTL    = 3600
+
+def get_hourly_ma(market, short=20, long=60):
+    """시간봉 MA20, MA60 API 직접 조회"""
+    try:
+        r = requests.get(
+            f"{UPBIT_BASE}/candles/minutes/60",
+            params={"market": market, "count": long + 5}, timeout=5
+        )
+        if r.status_code == 200:
+            closes = [c["trade_price"] for c in reversed(r.json())]
+            ma_s = sum(closes[-short:]) / short if len(closes) >= short else None
+            ma_l = sum(closes[-long:]) / long if len(closes) >= long else None
+            return ma_s, ma_l
+    except Exception as e:
+        cprint(f"[시간봉MA 오류] {market}: {e}", Fore.YELLOW)
+    return None, None
+
+# 시간봉 MA 캐시 (5분마다 갱신)
+_hourly_ma_cache = {}
+_hourly_ma_ts    = {}
+HOURLY_MA_TTL    = 300
+
+def get_hourly_ma_cached(market):
+    import time as _t
+    now = _t.time()
+    if market in _hourly_ma_cache and now - _hourly_ma_ts.get(market, 0) < HOURLY_MA_TTL:
+        return _hourly_ma_cache[market]
+    ma20, ma60 = get_hourly_ma(market)
+    _hourly_ma_cache[market] = (ma20, ma60)
+    _hourly_ma_ts[market]    = now
+    return ma20, ma60
+
+def get_daily_ma_cached(market):
+    import time as _t
+    now = _t.time()
+    if market in _daily_ma_cache and now - _daily_ma_ts.get(market, 0) < DAILY_MA_TTL:
+        return _daily_ma_cache[market]
+    ma20, ma60 = get_daily_ma(market)
+    _daily_ma_cache[market] = (ma20, ma60)
+    _daily_ma_ts[market]    = now
+    return ma20, ma60
+
+
+# 장세 캐시 (1시간마다 갱신)
+_market_regime       = "neutral"   # "bull" / "neutral" / "bear"
+_market_regime_ts    = 0.0
+_market_regime_ttl   = 3600
+_BASE_MAX_SLOTS      = 5   # 상승장 기준 슬롯
+
+def detect_market_regime():
+    """일봉 MA20/MA60 이격률로 장세 구분.
+    상승: 이격률 ≥ +2%  /  중립: -2%~+2%  /  하락: ≤ -2%
+    대표 종목 BTC 기준 (시장 전체 대리 지표)
+    """
+    global _market_regime, _market_regime_ts, MAX_SLOTS
+    import time as _t
+    now = _t.time()
+    if now - _market_regime_ts < _market_regime_ttl:
+        return _market_regime
+    try:
+        ma20, ma60 = get_daily_ma("KRW-BTC", short=20, long=60)
+        if ma20 and ma60 and ma60 > 0:
+            gap = (ma20 - ma60) / ma60 * 100
+            if gap >= 2.0:
+                regime = "bull"
+                slots  = _BASE_MAX_SLOTS        # 5슬롯
+            elif gap <= -2.0:
+                regime = "bear"
+                slots  = max(2, _BASE_MAX_SLOTS - 3)  # 2슬롯
+            else:
+                regime = "neutral"
+                slots  = max(3, _BASE_MAX_SLOTS - 2)  # 3슬롯
+            _market_regime    = regime
+            MAX_SLOTS         = slots
+            _market_regime_ts = now
+            cprint(f"[장세] {regime.upper()} | MA이격 {gap:+.1f}% | 슬롯 {slots}개", Fore.CYAN)
+        else:
+            cprint("[장세] MA조회 실패 — 중립 유지", Fore.YELLOW)
+    except Exception as e:
+        cprint(f"[장세 감지 오류] {e}", Fore.YELLOW)
+    return _market_regime
+
+
+def get_regime_conditions():
+    """장세별 진입 조건 반환.
+    상승장: (기본 트리거, 보조 트리거) 튜플
+    중립/하락장: (기본 트리거, None)
+    """
+    regime = _market_regime
+    if regime == "bull":
+        primary   = dict(rsi_max=30, drop_min=1.0, vol_ratio_min=1.0, vol_min=1.0, vol_max=8.0, is_secondary=False)
+        secondary = dict(rsi_max=35, drop_min=1.5, vol_ratio_min=1.1, vol_min=1.0, vol_max=8.0, is_secondary=True)
+        return primary, secondary
+    elif regime == "neutral":
+        primary = dict(rsi_max=28, drop_min=2.0, vol_ratio_min=_vol_ratio_current, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        return primary, None
+    else:  # bear
+        primary = dict(rsi_max=25, drop_min=3.0, vol_ratio_min=1.5, vol_min=2.0, vol_max=8.0, is_secondary=False)
+        return primary, None
+
+
+TREND_SLOTS = 1        # 추세추종 전용 슬롯 (항상 1개)
+TREND_BUDGET_RATIO = 0.20   # 추세추종 예산 비율 (전체의 20%)
+
+def _primary_slots():
+    """기본 트리거 슬롯 수: 상승장 3개, 나머지 전체."""
+    if _market_regime == "bull":
+        return max(1, MAX_SLOTS - 2)
+    return MAX_SLOTS
+
+
+def _secondary_slots():
+    """보조 트리거 슬롯 수: 상승장 2개, 나머지 0."""
+    if _market_regime == "bull":
+        return 2
+    return 0
+
+
+def _trend_slots():
+    """추세추종 슬롯: 항상 1개."""
+    return TREND_SLOTS
+
+
+def calc_vol_pct(timed_prices):
+    now = time.time()
+    recent = [p for t, p in timed_prices if now - t <= 18000]  # 5시간
+    if len(recent) < 2: return None
+    return (max(recent) - min(recent)) / min(recent) * 100
+
+# ============================================================
+# [5] 종목별 상태 관리
+# ============================================================
+# coins[market] = {
+#   "history": deque, "vol_history": deque, "timed": deque,
+#   "has_stock": bool, "buy_price": float, "filled_qty": float,
+#   "be_active": bool, "prev_rsi": None, "prev_rsi2": None,
+#   "target": float, "max_loss": float, "drop": float,
+#   "trail_start": float, "trail_gap": float, "be_trigger": float,
+#   "rsi_buy": int, "vol_min": float, "vol_max": float,
+#   "cooldown": float (last_sell_time), "buy_time": float,
+#   "highest_profit": float, "trade_count": int,
+#   "daily_pnl": float, "real_data_count": int,
+# }
+coins       = {}
+coins_lock  = threading.Lock()
+
+# 슬롯: 현재 보유 중인 종목 집합
+slots       = set()
+slots_lock  = threading.Lock()
+
+# 전체 일간/주간 손익
+daily_pnl   = 0.0
+weekly_pnl  = 0.0
+_last_reset_day  = date.today()
+
+# 파라미터 프로파일 — 1시간봉 + 복합 점수제 기준
+COIN_PROFILES = {
+    "KRW-XRP":  dict(target=2.5, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
+    "KRW-ETH":  dict(target=2.0, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.7, be_trigger=0.7, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
+    "KRW-SOL":  dict(target=3.0, max_loss=-2.0, drop=2.0, trail_start=2.0, trail_gap=1.0, be_trigger=1.0, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=7200),
+    "KRW-DOGE": dict(target=2.5, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600),
+}
+PROFILE_DEFAULT = dict(target=2.0, max_loss=-1.5, drop=2.0, trail_start=1.5, trail_gap=0.8, be_trigger=0.8, rsi_buy=50, vol_min=2.0, vol_max=8.0, cooldown=3600)
+
+def _make_coin_state(market):
+    p = {**PROFILE_DEFAULT, **COIN_PROFILES.get(market, {})}
+    return {
+        "history":        deque(maxlen=HISTORY_LEN),
+        "vol_history":    deque(maxlen=HISTORY_LEN),
+        "timed":          deque(maxlen=200),
+        "has_stock":      False,
+        "buy_price":      0.0,
+        "filled_qty":     0.0,
+        "be_active":      False,
+        "prev_rsi":       None,
+        "prev_rsi2":      None,
+        "highest_profit": 0.0,
+        "buy_time":       0.0,
+        "last_sell_time": 0.0,
+        "trade_count":    0,
+        "daily_pnl":      0.0,
+        "real_data_count": 0,
+        **p,
+    }
+
+def get_or_create_coin(market):
+    with coins_lock:
+        if market not in coins:
+            coins[market] = _make_coin_state(market)
+        return coins[market]
+
+# ============================================================
+# [6] 텔레그램
+# ============================================================
+_tg_lock = threading.Lock()
+
+def send_msg(text, market=None, level="normal"):
+    tag = f"[{market}] " if market else ""
+    full = f"{BOT_TAG} {tag}\n{text}"
+    try:
+        with _tg_lock:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": full[:4000]},
+                timeout=5
+            )
+    except Exception as e:
+        cprint(f"[텔레그램 오류] {e}", Fore.YELLOW)
+
+# IPC
+_MANAGER_PID_FILE = os.path.join(SHARED_DIR, "manager.pid")
+_IPC_CMD_FILE     = os.path.join(SHARED_DIR, "cmd_multicoin.json")
+_IPC_RES_FILE     = os.path.join(SHARED_DIR, "result_multicoin.json")
+_IPC_REQ_ID       = ""
+
+def _is_manager_running():
+    try:
+        if not os.path.exists(_MANAGER_PID_FILE): return False
         with open(_MANAGER_PID_FILE) as f:
             pid = int(f.read().strip())
         return os.path.exists(f"/proc/{pid}")
     except Exception:
         return False
 
-
-def _get_result_file():
-    if not _IPC_RESULT_FILE:
-        return None
-    if _IPC_REQ_ID:
-        base = _IPC_RESULT_FILE.replace(".json", "")
-        return f"{base}_{_IPC_REQ_ID}.json"
-    return _IPC_RESULT_FILE
-
-
-def _atomic_write_result(data: dict):
-    rf = _get_result_file()
-    if not rf:
-        return
-    tmp = rf + ".tmp"
+def _write_ipc_result(text, req_id=""):
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, rf)
+        rid = req_id or _IPC_REQ_ID
+        fname = f"result_multicoin{'_'+rid if rid else ''}.json"
+        path  = os.path.join(SHARED_DIR, fname)
+        tmp   = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"result": text, "req_id": rid, "ts": time.time()}, f)
+        os.replace(tmp, path)
+        os.chmod(path, 0o664)
     except Exception as e:
-        cprint(f"[IPC 쓰기 오류] {e}", Fore.YELLOW)
+        cprint(f"[IPC 결과 오류] {e}", Fore.YELLOW)
 
+# ============================================================
+# [7] 매수 / 매도
+# ============================================================
+_order_lock = threading.Lock()
 
-def _write_ipc_result(result_text, keyboard=None):
-    """IPC 컨텍스트일 때만 결과 파일에 씀."""
-    if not _is_ipc_context:
-        return
-    _atomic_write_result({"result": result_text, "keyboard": keyboard, "ts": time.time()})
+def do_buy(market, price, reason):
+    global daily_pnl
+    c = get_or_create_coin(market)
 
+    with _order_lock:
+        if c["has_stock"]: return False
 
-def _start_ipc_thread():
-    """매니저 명령을 0.3초마다 폴링하는 스레드."""
-    global _IPC_THREAD_STARTED
-    if _IPC_THREAD_STARTED:
-        return
-    _IPC_THREAD_STARTED = True
+    # 슬롯 체크
+    with slots_lock:
+        if market not in slots and len(slots) >= MAX_SLOTS:
+            cprint(f"[슬롯 부족] {market} 매수 불가 ({len(slots)}/{MAX_SLOTS})", Fore.YELLOW)
+            return False
 
-    def _ipc_loop():
-        while True:
-            try:
-                if _IPC_CMD_FILE and os.path.exists(_IPC_CMD_FILE):
-                    tmp = _IPC_CMD_FILE + ".read"
-                    try:
-                        os.rename(_IPC_CMD_FILE, tmp)
-                    except OSError:
-                        time.sleep(0.3)
-                        continue
-                    try:
-                        with open(tmp, encoding="utf-8") as f:
-                            data = json.load(f)
-                        os.remove(tmp)
-                        cmd_text = data.get("cmd", "")
-                        req_id   = data.get("req_id", "")
-                        if cmd_text:
-                            cprint(f"[IPC] {cmd_text}", Fore.CYAN)
-                            globals()["_IPC_REQ_ID"]     = req_id
-                            globals()["_is_ipc_context"] = True
-                            try:
-                                _handle_ipc_cmd(cmd_text)
-                            finally:
-                                globals()["_is_ipc_context"] = False
-                                globals()["_IPC_REQ_ID"]     = ""
-                    except Exception as e:
-                        cprint(f"[IPC 처리 오류] {e}", Fore.YELLOW)
-                        try:
-                            os.remove(tmp)
-                        except Exception:
-                            pass
-            except Exception as e:
-                cprint(f"[IPC 루프 오류] {e}", Fore.YELLOW)
-            time.sleep(0.3)
-
-    t = threading.Thread(target=_ipc_loop, daemon=True, name="ipc-sector")
-    t.start()
-    cprint("✅ IPC 스레드 시작 (cmd_stock.json 감시 중)", Fore.CYAN)
-
-
-def _handle_ipc_cmd(text):
-    """매니저에서 받은 명령 처리 → _write_ipc_result로 응답."""
-    global kill_switch_active, mdd_active, peak_value  # elif 안 중복 선언 금지 — 최상단에서 한 번만
-    cmd = text.strip().split()
-    if not cmd:
-        return
-    c = cmd[0].lower()
-
-    if c in ("/status", "/s", "/상태"):
-        _ipc_send_status()
-    elif c in ("/portfolio", "/p", "/포트"):
-        _ipc_send_portfolio()
-    elif c in ("/scores", "/score", "/스코어"):
-        _ipc_send_scores()
-    elif c in ("/why", "/왜", "/왜안사"):
-        holdings = list(portfolio.keys())
-        stage = defense_stage
-        scores = get_all_scores() or {}
-        ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-        lines = [
-            f"🔍 왜 안사? [{stage}]",
-            f"━━━━━━━━━━━━━━━━━━━━",
-        ]
-        if stage != "NORMAL":
-            lines.append(f"❌ 대피 단계: {stage} → 매수 불가")
-        elif kill_switch_active:
-            lines.append("❌ 킬스위치 ON → 매수 불가")
-        elif mdd_active:
-            lines.append("❌ MDD 한도 초과 → 매수 불가")
-        else:
-            lines.append("✅ 매수 가능 상태")
-        lines.append("─────────────────")
-        if ranked:
-            lines.append("📊 모멘텀 스코어 상위 3개:")
-            for i, (code, d) in enumerate(ranked[:3], 1):
-                held = "📦" if code in holdings else ""
-                cd = "⏸쿨다운" if code in cooldown_list else ""
-                lines.append(f"{i}. {ETF_UNIVERSE.get(code,{}).get('name',code)}{held}{cd}: {d['score']:+.1f}%")
-        _write_ipc_result("[normal] " + "\n".join(lines))
-    elif c in ("/bollinger", "/bb"):
-        holdings = list(portfolio.keys())
-        msg = "\n\n".join(get_bollinger_status(c) for c in holdings) if holdings else "보유없음"
-        _write_ipc_result("[normal] " + msg)
-    elif c in ("/investor", "/수급"):
-        holdings = list(portfolio.keys())
-        msg = "\n\n".join(get_investor_status(c) for c in holdings) if holdings else "보유없음"
-        _write_ipc_result("[normal] " + msg)
-    elif c in ("/rebalance", "/r", "/리밸"):
-        _write_ipc_result("[normal] 🔄 리밸런싱 시작 (백그라운드)...")
-        threading.Thread(target=_do_rebalance, daemon=True).start()
-    elif c in ("/kofr", "/대피"):
-        _write_ipc_result("[critical] 🚨 DEFENSE_1 대피 실행 중...")
-        threading.Thread(target=lambda: _enter_defense_1("매니저 명령"), daemon=True).start()
-    elif c in ("/resume", "/복귀"):
-        _write_ipc_result("[normal] 🟢 복귀 실행 중...")
-        threading.Thread(target=_do_resume, daemon=True).start()
-    elif c in ("/defense", "/대피단계"):
-        _write_ipc_result(f"[normal] 🛡 현재 대피 단계: {defense_stage}")
-    elif c in ("/kill", "/킬"):
-        kill_switch_active = True
-        _save_state()
-        _write_ipc_result("[critical] 🔴 킬 스위치 ON")
-    elif c in ("/unkill", "/킬해제"):
-        kill_switch_active = False
-        _save_state()
-        _write_ipc_result("[normal] 🟢 킬 스위치 OFF — 매매 재개")
-    elif c in ("/start",):
-        kill_switch_active = False
-        mdd_active = False
-        _save_state()
-        _write_ipc_result("[normal] 🟢 섹터봇 재개됨")
-    elif c in ("/stop",):
-        kill_switch_active = True
-        _save_state()
-        _write_ipc_result("[critical] ⏹ 섹터봇 정지 (킬스위치 ON)")
-    elif c in ("/sync", "/싱크"):
-        real = get_kis_holdings()
-        if not real:
-            _write_ipc_result("[normal] ⚠️ KIS 잔고 조회 실패 또는 보유 없음")
-            return
-        # ETF 유니버스 + KOFR만 반영
-        valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
-        new_portfolio = {}
-        for code, pos in real.items():
-            if code in valid_codes:
-                old = portfolio.get(code, {})
-                new_portfolio[code] = {
-                    "qty":        pos["qty"],
-                    "avg_price":  pos["avg_price"],
-                    "high_price": max(old.get("high_price", 0), pos["avg_price"]),
-                    "entry_date": old.get("entry_date", str(date.today())),
-                }
-        portfolio.clear()
-        portfolio.update(new_portfolio)
-        # 싱크 후 peak_value 비정상 감지 → 재설정
-        pf_val = sum(pos["avg_price"] * pos["qty"] for pos in new_portfolio.values())
-        actual = pf_val if pf_val > 0 else TOTAL_BUDGET
-        if peak_value > actual * 3:   # peak가 현재 평가액 3배 초과면 비정상
-            peak_value = actual
-            mdd_active = False
-            cprint(f"[싱크] peak_value 비정상 → {actual:,.0f}원 재설정", Fore.YELLOW)
-        _save_state()
-        lines = ["✅ 싱크 완료", f"보유: {len(portfolio)}종목"]
-        for code, pos in list(portfolio.items()):
-            name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-            lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
-        _write_ipc_result("[normal] " + "\n".join(lines))
-
-    elif c in ("/help", "/도움말"):
-        _write_ipc_result(
-            "[normal] 📋 섹터봇 명령어\n"
-            "/status    — 현재 상태\n"
-            "/portfolio — 보유 ETF\n"
-            "/scores    — 모멘텀 스코어\n"
-            "/rebalance — 수동 리밸런싱\n"
-            "/kofr      — DEFENSE_1 대피\n"
-            "/resume    — 복귀 (ETF 재매수)\n"
-            "/defense   — 현재 대피 단계\n"
-            "/kill      — 킬 스위치 ON\n"
-            "/unkill    — 킬 스위치 OFF\n"
-            "/start     — 재개\n"
-            "/stop      — 정지\n"
-            "/sync      — KIS 실제 잔고로 동기화"
-        )
+    regime = _market_regime or "neutral"
+    # 추세추종 여부 판단 (reason에 "추세" 포함)
+    if "추세" in reason:
+        ratio = TREND_BUDGET_RATIO
     else:
-        _write_ipc_result(f"[normal] ⚠️ 알 수 없는 명령: {text}")
+        ratio = SLOT_BUDGET_RATIO.get(regime, 0.28)
+    per_slot = max(MIN_ORDER_KRW, int(TOTAL_BUDGET * ratio))
+    balance  = get_balance_krw()
+    order_krw = int(min(per_slot, balance) * 0.98)
+    if order_krw < MIN_ORDER_KRW:
+        cprint(f"[잔고 부족] {market} 잔고:{balance:,.0f}원", Fore.YELLOW)
+        return False
 
+    filled, avg_p = send_order("BUY", market, order_krw)
+    if filled <= 0 or avg_p <= 0:
+        return False
 
-def _ipc_send_status():
-    global peak_value
-    val  = _calc_portfolio_value()
-    cash = get_cash_balance()
-    # peak_value 초기화 — portfolio도 없고 peak도 0일 때만 (최초 1회)
-    if peak_value <= 0 and not portfolio:
-        peak_value = TOTAL_BUDGET
-    # MDD는 포트폴리오 평가액 기준 (현금 포함 시 매도 직후 튀는 문제 방지)
-    dd   = (val - peak_value) / peak_value * 100 if peak_value > 0 and portfolio else 0.0
-    lines = [
-        f"📊 섹터봇 현황",
-        f"━━━━━━━━━━━━━━━━━━",
-        f"포트폴리오: {val:,.0f}원",
-        f"오늘 손익:  {daily_pnl_krw:+,}원",
-        f"MDD:        {dd:.1f}%",
-        f"킬스위치:   {'🔴 ON' if kill_switch_active else '🟢 OFF'}",
-        f"MDD모드:    {'🔴 ON' if mdd_active else '🟢 OFF'}",
-        f"대피단계:   {defense_stage}",
-        f"보유:       {len(portfolio)}종목",
-    ]
-    for code, pos in list(portfolio.items()):
-        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
-    _write_ipc_result("[normal] " + "\n".join(lines))
-
-
-def _ipc_send_portfolio():
-    if not portfolio:
-        _write_ipc_result("[normal] 보유 ETF 없음 (현금 대기)")
-        return
-    lines = ["📦 보유 ETF"]
-    for code, pos in list(portfolio.items()):
-        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원 (편입:{pos['entry_date']})")
-    _write_ipc_result("[normal] " + "\n".join(lines))
-
-
-def _ipc_send_scores():
-    """IPC 컨텍스트에서 스코어 계산 — 동기 실행."""
-    scores = get_all_scores()
-    if not scores:
-        _write_ipc_result("[normal] ❌ 스코어 계산 실패 (데이터 없음)")
-        return
-    ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-    lines  = ["📊 모멘텀 스코어 순위"]
-    for i, (code, data) in enumerate(ranked, 1):
-        name = ETF_UNIVERSE.get(code, {}).get("name", code)
-        cd   = " 🚫쿨다운" if is_cooldown(code) else ""
-        held = " 📦보유" if code in portfolio else ""
-        lines.append(f"{i}. {name}{cd}{held}: {data['score']:+.1f}%")
-    _write_ipc_result("[normal] " + "\n".join(lines))
-
-# ============================================================
-# [5] 설정 로드
-# ============================================================
-def load_config():
-    global _cfg, TELEGRAM_TOKEN, CHAT_ID, TOTAL_BUDGET, IS_MOCK
-    global initial_value, peak_value, daily_loss_base
-    if not os.path.exists(CFG_FILE):
-        _make_default_config()
-        cprint(f"❌ {CFG_FILE} 파일이 없어서 기본 양식을 생성했습니다.", Fore.RED, bright=True)
-        cprint("   sector_cfg.yaml 에 KIS API 키와 텔레그램 정보를 입력 후 재실행하세요.", Fore.YELLOW)
-        sys.exit(1)
-    with open(CFG_FILE, encoding="utf-8") as f:
-        _cfg = yaml.safe_load(f) or {}
-    TELEGRAM_TOKEN  = _cfg.get("telegram_token", "")
-    CHAT_ID         = str(_cfg.get("chat_id", ""))
-    TOTAL_BUDGET    = int(_cfg.get("total_budget", 100_000))
-    IS_MOCK         = bool(_cfg.get("mock", True))
-    initial_value   = float(_cfg.get("initial_value", TOTAL_BUDGET))
-    peak_value      = float(_cfg.get("peak_value",    initial_value))
-    daily_loss_base = TOTAL_BUDGET  # 장 시작 시 _daily_reset()에서 실제값으로 갱신됨
-    _init_ipc()   # IPC 파일 경로 초기화
-    cprint(f"✅ 설정 로드 — 예산:{TOTAL_BUDGET:,}원 / {'모의투자' if IS_MOCK else '실투자'}", Fore.GREEN)
-
-
-def _make_default_config():
-    default = {
-        "app_key":        "여기에_KIS_APP_KEY",
-        "app_secret":     "여기에_KIS_APP_SECRET",
-        "account_no":     "12345678",
-        "account_suffix": "01",
-        "telegram_token": "여기에_텔레그램_봇_토큰",
-        "chat_id":        "여기에_내_채팅_ID",
-        "mock":           True,
-        "total_budget":   100000,
-    }
-    with open(CFG_FILE, "w", encoding="utf-8") as f:
-        yaml.dump(default, f, allow_unicode=True, default_flow_style=False)
-
-
-# ============================================================
-# [6] 인프라: Rate Limit / API / KIS 인증
-# ============================================================
-def _acquire_token():
-    global _bucket_tokens, _bucket_last
-    now = time.time()
-    _bucket_tokens = min(_BUCKET_CAP, _bucket_tokens + (now - _bucket_last) * _BUCKET_RATE)
-    _bucket_last   = now
-    if _bucket_tokens < 1.0:
-        time.sleep((1.0 - _bucket_tokens) / _BUCKET_RATE)
-        _bucket_tokens = 0.0
-    else:
-        _bucket_tokens -= 1.0
-
-
-def api_call(method, url, **kwargs):
-    _acquire_token()
-    for attempt in range(3):
-        try:
-            r = getattr(requests, method)(url, timeout=10, **kwargs)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                time.sleep(int(r.headers.get("Retry-After", 2)))
-                continue
-            cprint(f"[API {r.status_code}] {url[-60:]}", Fore.YELLOW)
-        except Exception as e:
-            cprint(f"[API 오류 {attempt+1}] {e}", Fore.RED)
-            time.sleep(2)
-    return {}
-
-
-def _prod_url():
-    """주문용 URL — 모의/실투자 구분"""
-    return (
-        "https://openapivts.koreainvestment.com:29443"
-        if IS_MOCK
-        else "https://openapi.koreainvestment.com:9443"
-    )
-
-def _market_url():
-    """시세/차트 조회용 URL — 항상 실서버 (모의서버는 데이터 30일 제한)"""
-    return "https://openapi.koreainvestment.com:9443"
-
-
-def get_kis_token():
-    global _access_token, _token_expire
-    # 기존 토큰 유효하면 재사용
-    if _access_token and time.time() < _token_expire:
-        return _access_token
-    # 장 시간(평일 8:00~16:00)에만 토큰 발급 시도
-    now_dt = datetime.now()
-    is_weekday = now_dt.weekday() < 5  # 월~금
-    is_market_hours = 8 <= now_dt.hour < 16
-    if not (is_weekday and is_market_hours):
-        if _access_token:
-            cprint(f"[토큰] 장외 시간 — 기존 토큰 유지 (만료: {datetime.fromtimestamp(_token_expire).strftime('%H:%M')})", Fore.CYAN)
-            return _access_token
-        else:
-            cprint("[토큰] 장외 시간 — 토큰 발급 건너뜀", Fore.YELLOW)
-            return ""
-    res = api_call("post", f"{_prod_url()}/oauth2/tokenP", json={
-        "grant_type": "client_credentials",
-        "appkey":     _cfg.get("app_key", ""),
-        "appsecret":  _cfg.get("app_secret", ""),
+    c.update({
+        "has_stock": True, "buy_price": avg_p,
+        "filled_qty": filled, "be_active": False,
+        "highest_profit": 0.0, "buy_time": time.time(),
     })
-    _access_token = res.get("access_token", "")
-    _token_expire = time.time() + 3600 * 11
-    if _access_token:
-        cprint("✅ KIS 토큰 발급 성공", Fore.GREEN)
+    with slots_lock:
+        slots.add(market)
+
+    target_p = avg_p * (1 + c["target"] / 100)
+    stop_p   = avg_p * (1 + c["max_loss"] / 100)
+    send_msg(
+        f"🛒 매수 완료!\n"
+        f"매수가: {avg_p:,.2f}원  수량: {filled:.6f}\n"
+        f"목표가: {target_p:,.2f}원  손절가: {stop_p:,.2f}원\n"
+        f"이유: {reason}", market=market, level="critical"
+    )
+    _write_status()
+    return True
+
+def do_sell(market, price, reason):
+    global daily_pnl
+    c = get_or_create_coin(market)
+    if not c["has_stock"]: return False
+
+    filled, avg_p = send_order("SELL", market, c["filled_qty"])
+    if filled <= 0:
+        send_msg(f"🚨 매도 실패! 직접 매도하세요.\n이유: {reason}", market=market, level="critical")
+        return False
+
+    actual = avg_p if avg_p > 0 else price
+    fee    = (c["buy_price"] * c["filled_qty"] + actual * filled) * FEE_RATE
+    pnl    = (actual - c["buy_price"]) * filled - fee
+
+    daily_pnl       += pnl
+    c["daily_pnl"]  += pnl
+    c["trade_count"] += 1
+    c["last_sell_time"] = time.time()
+
+    # vol_ratio 복구 판단용 거래 시각 기록
+    global _last_trade_ts, _recent_trades_ts
+    _last_trade_ts = time.time()
+    _recent_trades_ts.append(time.time())
+    _recent_trades_ts = [t for t in _recent_trades_ts if time.time() - t <= 6 * 3600]
+    _save_trade_state()   # 재시작 후 복원용
+    c.update({"has_stock": False, "buy_price": 0.0, "filled_qty": 0.0,
+               "be_active": False, "highest_profit": 0.0, "buy_time": 0.0})
+
+    with slots_lock:
+        slots.discard(market)
+
+    send_msg(
+        f"{'🟢 익절' if pnl >= 0 else '🔴 손절'} 매도 완료!\n"
+        f"매도가: {actual:,.2f}원\n"
+        f"이번 손익: {pnl:+,.0f}원\n"
+        f"이유: {reason}", market=market, level="critical"
+    )
+    _write_status()
+    return True
+
+# ============================================================
+# [8] 매도 조건 체크 (보유 중 루프)
+# ============================================================
+def check_sell(market, price):
+    c = coins.get(market)
+    if not c or not c["has_stock"]: return
+
+    buy_p  = c["buy_price"]
+    qty    = c["filled_qty"]
+    pnl_pct = (price - buy_p) / buy_p * 100
+
+    # 트레일링 스탑
+    if pnl_pct > c["highest_profit"]:
+        c["highest_profit"] = pnl_pct
+    trail_trigger = c["highest_profit"] >= c["trail_start"]
+    trail_stop    = c["highest_profit"] - c["trail_gap"]
+
+    # 본절 보호
+    if pnl_pct >= c["be_trigger"]:
+        c["be_active"] = True
+    be_stop = pnl_pct <= 0 and c["be_active"]
+
+    # 익절
+    if pnl_pct >= c["target"]:
+        do_sell(market, price, f"익절 {pnl_pct:+.2f}%")
+    # 트레일링
+    elif trail_trigger and pnl_pct <= trail_stop:
+        do_sell(market, price, f"트레일링 {pnl_pct:+.2f}% (고점:{c['highest_profit']:.2f}%)")
+    # 본절 보호
+    elif be_stop:
+        do_sell(market, price, f"본절 보호 {pnl_pct:+.2f}%")
+    # 손절 (추세추종은 -0.7%, 역추세는 기본 max_loss)
     else:
-        cprint("❌ KIS 토큰 발급 실패 — API 키를 확인하세요", Fore.RED)
-    return _access_token
+        trend_stop = -0.7 if c.get("is_trend", False) else c["max_loss"]
+        if pnl_pct <= trend_stop:
+            do_sell(market, price, f"손절 {pnl_pct:+.2f}%")
+
+# ============================================================
+# [9] 매수 신호 체크 — 복합 점수제
+# ============================================================
+def check_buy_score(market, price, volume, open_price=0):
+    """복합 점수제 매수 신호 체크.
+    반환: (신호여부, 점수 0~100)
+    점수 구성: RSI 40점 + MA이격 30점 + 거래량 30점
+    """
+    c = get_or_create_coin(market)
+    if c["has_stock"]: return False, 0
+
+    h = c["history"]
+    h.append(price)
+    if volume: c["vol_history"].append(volume)
+    c["timed"].append((time.time(), price))
+    c["real_data_count"] += 1
+
+    if c["real_data_count"] < REAL_DATA_MIN: return False, 0
+
+    # 쿨다운
+    if time.time() - c["last_sell_time"] < c["cooldown"]: return False, 0
+
+    rsi  = calc_rsi(h)
+    vol  = calc_vol_pct(c["timed"])
+
+    # 시간봉 MA는 API에서 직접 가져옴 (history 혼재 문제 방지)
+    ma20, ma60 = get_hourly_ma_cached(market)
+
+    if rsi is None or ma20 is None or ma60 is None: return False, 0
+
+    c["prev_rsi2"] = c["prev_rsi"]
+    c["prev_rsi"]  = rsi
+    p1 = c["prev_rsi2"]  # 이전 RSI
+
+    # ── 공통 전처리 ──────────────────────────────────────────
+    drop_pct = (ma20 - price) / ma20 * 100 if ma20 > 0 else 0
+
+    # 거래량 배율
+    vol_h = list(c["vol_history"])
+    vol_ratio = 1.0
+    if len(vol_h) >= 6 and vol_h[-1] > 0:
+        avg5 = sum(vol_h[-6:-1]) / 5
+        vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+
+    # 캔들 실체 비율 (시가 대비 종가 움직임)
+    candle_body_pct = abs(price - open_price) / open_price * 100 if open_price > 0 else 0.0
+
+    # 일봉 MA
+    d_ma20, d_ma60 = get_daily_ma_cached(market)
+
+    # near_vol: vol_ratio가 기준 -0.3 이내면 near로 분류
+    primary_c, _ = get_regime_conditions()
+    near_vol = (primary_c["vol_ratio_min"] - 0.3) <= vol_ratio < primary_c["vol_ratio_min"]
+
+    # ── 공통 필수 조건 ───────────────────────────────────────
+    # 1단계: 최소 변동성 필수 (죽은 코인 제거)
+    if vol is None or vol < 0.8:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol or 0,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+
+    # 변동성 상한 (급등락 중인 코인 제외)
+    if vol > 8.0:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+
+    # 시간봉 MA 추세 확인
+    if ma20 <= ma60:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="watch",
+        )
+        return False, 0
+
+    # 2단계: 보조 조건 (vol_ratio OR 캔들 실체) — 진짜 움직임 확인
+    body_ok = candle_body_pct >= 0.6
+    vol_ok  = vol_ratio >= 1.05
+    if not vol_ok and not body_ok:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type="near",
+        )
+        return False, 0
+
+    # ── 장세별 트리거 체크 ────────────────────────────────────
+    primary, secondary = get_regime_conditions()
+    matched_cond = None
+
+    # 기본 트리거 체크
+    if (rsi <= primary["rsi_max"] and
+        drop_pct >= primary["drop_min"]):
+        if _market_regime == "bull":
+            if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
+                matched_cond = primary
+        else:
+            matched_cond = primary
+
+    # 보조 트리거 체크 (상승장 전용)
+    if matched_cond is None and secondary is not None:
+        if (rsi <= secondary["rsi_max"] and
+            drop_pct >= secondary["drop_min"]):
+            if d_ma20 is None or d_ma60 is None or d_ma20 > d_ma60:
+                matched_cond = secondary
+
+    if matched_cond is None:
+        _log_type = "near" if near_vol else "watch"
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=0, entry_possible=0, log_type=_log_type,
+        )
+        return False, 0
+
+    # ── 복합 점수 계산 ───────────────────────────────────────
+    rsi_score  = max(0, min(40, (30 - rsi) * 2)) if rsi <= 30 else 0
+    drop_score = 30 if drop_pct >= 4.0 else 20 if drop_pct >= 3.0 else 10
+
+    # vol_score: 거래량 + 변동성 구간별 점수 (컷이 아닌 가중치)
+    vol_score = (
+        30 if vol_ratio >= 2.0 else
+        20 if vol_ratio >= 1.5 else
+        15 if vol_ratio >= 1.1 else
+        10 if vol_ratio >= 1.05 else
+        0
+    )
+    vola_score = (
+        10 if vol >= 1.2 else
+        5  if vol >= 0.8 else
+        0
+    )
+    # 캔들 실체 보너스 (거래량 부족 시 보완)
+    body_score = 5 if body_ok and vol_ratio < 1.05 else 0
+    vol_score  = min(30, vol_score + vola_score + body_score)
+    total_score = rsi_score + drop_score + vol_score
+    if total_score < 10:
+        log_indicator(
+            market, price, rsi, drop_pct, vol_ratio, vol,
+            ma20, ma60, d_ma20, d_ma60,
+            signal_score=total_score, entry_possible=0, log_type="near",
+        )
+        return False, 0
+
+    # 보조 트리거면 점수에 is_secondary 태그
+    is_sec = matched_cond.get("is_secondary", False)
+
+    # 신호 발생 로그
+    log_indicator(
+        market, price, rsi, drop_pct, vol_ratio, vol,
+        ma20, ma60, d_ma20, d_ma60,
+        signal_score=total_score, entry_possible=1, log_type="signal",
+    )
+
+    return True, total_score + (0.01 if is_sec else 0)  # 소수점으로 구분
 
 
-def kis_headers(tr_id):
-    tok = get_kis_token()
-    if not tok:
-        return None
+# 하위 호환용
+def check_buy_signal(market, price, volume):
+    ok, score = check_buy_score(market, price, volume)
+    return ok, score
+
+
+def check_trend_signal(market, price, volume):
+    """추세추종 매수 신호 체크.
+    조건: 가격>MA20 + MA20상승중 + 최근5봉내MA20이탈이력 + MA20재돌파 + 이격≤1.5% + RSI50~65 + 거래량≥1.2배
+    반환: (신호여부, 점수)  점수는 소수점 0.5 태그로 추세추종 구분
+    """
+    c = get_or_create_coin(market)
+    if c["has_stock"]: return False, 0
+
+    h = list(c["history"])
+    if c["real_data_count"] < REAL_DATA_MIN: return False, 0
+    if time.time() - c["last_sell_time"] < c["cooldown"]: return False, 0
+    if len(h) < 10: return False, 0
+
+    rsi    = calc_rsi(h)
+    vol    = calc_vol_pct(c["timed"])
+    ma20, ma60 = get_hourly_ma_cached(market)
+
+    if rsi is None or ma20 is None: return False, 0
+
+    # RSI 50~65 구간 (과열 전 추세 초입)
+    if not (50 <= rsi <= 65): return False, 0
+
+    # 가격 > MA20
+    if price <= ma20: return False, 0
+
+    # MA20 이격 ≤ 1.5% (막 돌파한 초입만)
+    gap_pct = (price - ma20) / ma20 * 100
+    if gap_pct > 1.5: return False, 0
+
+    # 최근 5봉 내 MA20 이탈 이력 확인 (price_history 기준)
+    # history는 루프마다 현재가가 쌓이므로 최근 5개 봉 확인
+    recent5 = h[-6:-1] if len(h) >= 6 else h[:-1]
+    had_below = any(p < ma20 for p in recent5)
+    if not had_below: return False, 0   # 이탈 이력 없으면 탈락
+
+    # MA20 상승 중 (RSI 상승으로 대리 판단)
+    prev_rsi = c.get("prev_rsi")
+    if prev_rsi is None or rsi <= prev_rsi: return False, 0
+
+    # 변동성 필터
+    if vol is None or not (1.0 <= vol <= 8.0): return False, 0
+
+    # 거래량 ≥ 1.2배
+    vol_h = list(c["vol_history"])
+    vol_ratio = 1.0
+    if len(vol_h) >= 6 and vol_h[-1] > 0:
+        avg5 = sum(vol_h[-6:-1]) / 5
+        vol_ratio = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+    if vol_ratio < 1.2: return False, 0
+
+    # 점수 계산
+    rsi_score  = max(0, int((65 - rsi) / 15 * 40))   # RSI 낮을수록 고점수
+    gap_score  = 20 if gap_pct <= 0.5 else 15 if gap_pct <= 1.0 else 10  # 이격 작을수록 고점수
+    vol_score  = 30 if vol_ratio >= 2.0 else 20 if vol_ratio >= 1.5 else 10
+    total = rsi_score + gap_score + vol_score
+    if total < 10: return False, 0
+
+    return True, total + 0.5   # 0.5 소수점으로 추세추종 구분
+
+# ============================================================
+# [10-B] vol_ratio 자동 조정 시스템
+# ============================================================
+def _get_recommend_log_path():
+    """날짜별 추천 로그 파일 경로 반환."""
+    log_dir = os.path.join(BASE_DIR, "logs", "recommend")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"{date.today().strftime('%Y-%m-%d')}.csv")
+
+
+def _snapshot_market():
+    """추천 당시 시장 상황 스냅샷 — 나중에 '그때 상황'을 재현할 수 있도록."""
+    with slots_lock:
+        holding = list(slots)
+    # 감시 종목 중 vol_ratio 분포 (최근 수집된 값 기준)
+    vol_ratios = []
+    near_trigger_count = 0
+    with coins_lock:
+        snap = dict(coins)
+    for m, c in snap.items():
+        vol_h = list(c.get("vol_history", []))
+        if len(vol_h) >= 6 and vol_h[-1] > 0:
+            avg5 = sum(vol_h[-6:-1]) / 5
+            vr = vol_h[-1] / avg5 if avg5 > 0 else 1.0
+            vol_ratios.append(round(vr, 2))
+            # 현재 기준 - 0.2 이내면 "near_trigger"로 간주
+            if _vol_ratio_current - 0.2 <= vr < _vol_ratio_current:
+                near_trigger_count += 1
+    avg_vol_ratio = round(sum(vol_ratios) / len(vol_ratios), 2) if vol_ratios else 0.0
     return {
-        "Content-Type":  "application/json; charset=utf-8",
-        "authorization": f"Bearer {tok}",
-        "appkey":        _cfg.get("app_key", ""),
-        "appsecret":     _cfg.get("app_secret", ""),
-        "tr_id":         tr_id,
-        "custtype":      "P",
+        "regime":            _market_regime,
+        "slots_used":        len(holding),
+        "slots_max":         MAX_SLOTS,
+        "avg_vol_ratio":     avg_vol_ratio,
+        "near_trigger":      near_trigger_count,
+        "no_trade_h":        round((time.time() - _last_trade_ts) / 3600, 1),
+        "recent_trades_6h":  len(_recent_trades_ts),
     }
 
 
-def _acnt():
-    return _cfg.get("account_no", ""), _cfg.get("account_suffix", "01")
-
-
-# ============================================================
-# [7] 텔레그램
-# ============================================================
-def send_msg(text, force=False):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        cprint(f"[TG 미설정] {text[:80]}", Fore.YELLOW)
-        return
-    h = datetime.now().hour
-    if 2 <= h < 7 and not force:
-        return
-    tagged = f"[{BOT_TAG}]\n{text}"
-    with _tg_lock:
-        for attempt in range(2):
-            try:
-                res = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": CHAT_ID, "text": tagged[:4000]},
-                    timeout=5,
-                )
-                if res.status_code == 200:
-                    return
-            except Exception as e:
-                cprint(f"[TG 오류] {e}", Fore.YELLOW)
-            time.sleep(1)
-
-
-def poll_telegram():
-    global _last_update_id
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
-    try:
-        res = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params={"offset": _last_update_id + 1, "timeout": 2},
-            timeout=5,
-        )
-        if res.status_code != 200:
-            return
-        for upd in res.json().get("result", []):
-            _last_update_id = upd["update_id"]
-            msg  = upd.get("message", {})
-            text = msg.get("text", "").strip()
-            if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
-                continue
-            if text:
-                _handle_cmd(text.split())
-    except Exception:
-        pass
-
-
-def _handle_cmd(cmd):
-    global kill_switch_active   # elif 블록 안 global은 Python 오류 — 최상단 선언 필수
-    if not cmd:
-        return
-    c = cmd[0].lower()
-
-    if c in ("/status", "/s", "/상태"):
-        _send_status()
-    elif c in ("/portfolio", "/p", "/포트"):
-        _send_portfolio()
-    elif c in ("/scores", "/score", "/스코어"):
-        _send_scores()
-    elif c in ("/why", "/왜", "/왜안사"):
-        holdings = list(portfolio.keys())
-        stage = defense_stage
-        scores = get_all_scores() or {}
-        ranked = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-        lines = [f"🔍 왜 안사? [{stage}]", "━━━━━━━━━━━━━━━━━━━━"]
-        if stage != "NORMAL":
-            lines.append(f"❌ 대피 단계: {stage}")
-        elif kill_switch_active:
-            lines.append("❌ 킬스위치 ON")
-        elif mdd_active:
-            lines.append("❌ MDD 한도 초과")
-        else:
-            lines.append("✅ 매수 가능 상태")
-        lines.append("─────────────────")
-        for i, (code, d) in enumerate(ranked[:3], 1):
-            held = "📦" if code in holdings else ""
-            lines.append(f"{i}. {ETF_UNIVERSE.get(code,{}).get('name',code)}{held}: {d['score']:+.1f}%")
-        send_msg("\n".join(lines), force=True)
-    elif c in ("/bollinger", "/bb"):
-        for code in (list(portfolio.keys()) or ["보유없음"]):
-            send_msg(get_bollinger_status(code) if code != "보유없음" else "보유없음", force=True)
-    elif c in ("/investor", "/수급"):
-        for code in (list(portfolio.keys()) or ["보유없음"]):
-            send_msg(get_investor_status(code) if code != "보유없음" else "보유없음", force=True)
-    elif c in ("/rebalance", "/r", "/리밸"):
-        send_msg("🔄 수동 리밸런싱 실행 중...", force=True)
-        threading.Thread(target=_do_rebalance, daemon=True).start()
-    elif c in ("/kofr", "/대피"):
-        send_msg("🚨 DEFENSE_1 대피 실행 중...", force=True)
-        threading.Thread(target=lambda: _enter_defense_1("수동 대피"), daemon=True).start()
-    elif c in ("/resume", "/복귀"):
-        send_msg("🟢 복귀 실행 중...", force=True)
-        threading.Thread(target=_do_resume, daemon=True).start()
-    elif c in ("/kill", "/킬"):
-        kill_switch_active = True
-        _save_state()
-        send_msg("🔴 킬 스위치 ON — 모든 매매 중단\n/unkill 로 해제", force=True)
-    elif c in ("/unkill", "/킬해제"):
-        kill_switch_active = False
-        _save_state()
-        send_msg("🟢 킬 스위치 OFF — 매매 재개", force=True)
-    elif c in ("/sync", "/싱크"):
-        real = get_kis_holdings()
-        if not real:
-            send_msg("⚠️ KIS 잔고 조회 실패 또는 보유 없음", force=True)
-            return
-        valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
-        new_portfolio = {}
-        for code, pos in real.items():
-            if code in valid_codes:
-                old = portfolio.get(code, {})
-                new_portfolio[code] = {
-                    "qty":        pos["qty"],
-                    "avg_price":  pos["avg_price"],
-                    "high_price": max(old.get("high_price", 0), pos["avg_price"]),
-                    "entry_date": old.get("entry_date", str(date.today())),
-                }
-        portfolio.clear()
-        portfolio.update(new_portfolio)
-        _save_state()
-        lines = ["✅ 싱크 완료", f"보유: {len(portfolio)}종목"]
-        for code, pos in list(portfolio.items()):
-            name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-            lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
-        send_msg("\n".join(lines), force=True)
-
-    elif c in ("/help", "/도움말"):
-        send_msg(
-            "📋 명령어 목록\n"
-            "/status    — 현재 상태\n"
-            "/portfolio — 보유 ETF\n"
-            "/scores    — 모멘텀 스코어 순위\n"
-            "/rebalance — 수동 리밸런싱\n"
-            "/kofr      — DEFENSE_1 대피\n"
-            "/resume    — 복귀 (ETF 재매수)\n"
-            "/kill      — 킬 스위치 ON\n"
-            "/unkill    — 킬 스위치 OFF\n"
-            "/sync      — KIS 실제 잔고로 동기화",
-            force=True,
-        )
-
-
-# ============================================================
-# [8] 시장 데이터
-# ============================================================
-def get_price_info(code):
-    """현재가, 전일종가, 거래대금, 호가 조회"""
-    h = kis_headers("FHKST01010100")
-    if not h:
-        return {}
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-price",
-        headers=h,
-        params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code},
-    )
-    out = res.get("output", {})
-    if not out:
-        return {}
-    try:
-        return {
-            "price":      int(out.get("stck_prpr",    0) or 0),
-            "prev_close": int(out.get("stck_sdpr",    0) or 0),
-            "bid":        int(out.get("bidp",          0) or 0),
-            "ask":        int(out.get("askp",          0) or 0),
-            "volume_krw": int(out.get("acml_tr_pbmn",  0) or 0),
-            "open":       int(out.get("stck_oprc",     0) or 0),
-            "high":       int(out.get("stck_hgpr",     0) or 0),
-            "low":        int(out.get("stck_lwpr",     0) or 0),
-        }
-    except Exception as e:
-        cprint(f"[가격 파싱 오류 {code}] {e}", Fore.YELLOW)
-        return {}
-
-
-def get_daily_chart(code, n_days=70):
-    """일봉 종가 + 거래대금 리스트 반환 (오래된 것 먼저)
-    반환: (closes, vol_krw_list) 튜플"""
-    h = kis_headers("FHKST01010400")
-    if not h:
-        return [], []
-
-    closes_all  = []
-    vol_all     = []
-    date_to     = date.today()
-
-    for _ in range(5):
-        date_from = date_to - timedelta(days=50)
-        res = api_call(
-            "get",
-            f"{_market_url()}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-            headers=h,
-            params={
-                "fid_cond_mrkt_div_code": "J",
-                "fid_input_iscd":         code,
-                "fid_input_date_1":       date_from.strftime("%Y%m%d"),
-                "fid_input_date_2":       date_to.strftime("%Y%m%d"),
-                "fid_period_div_code":    "D",
-                "fid_org_adj_prc":        "0",
-            },
-        )
-        output = res.get("output2", []) or res.get("output", [])
-        if not output:
-            break
-
-        batch_c = []
-        batch_v = []
-        for row in output:
-            try:
-                c = int(row.get("stck_clpr", 0) or 0)
-                v = int(row.get("acml_tr_pbmn", 0) or 0)
-                if c > 0:
-                    batch_c.append(c)
-                    batch_v.append(v)
-            except Exception:
-                pass
-
-        if not batch_c:
-            break
-
-        closes_all = batch_c + closes_all
-        vol_all    = batch_v + vol_all
-
-        if len(closes_all) >= n_days:
-            break
-
-        date_to = date_from - timedelta(days=1)
-        time.sleep(0.2)
-
-    return closes_all[-n_days:], vol_all[-n_days:]
-
-
-def get_kospi_info():
-    """코스피 현재 정보 반환: price, change_pct(전일대비), volume"""
-    h = kis_headers("FHKUP03500100")
-    if not h:
-        return {}
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-price",
-        headers=h,
-        params={"fid_cond_mrkt_div_code": "U", "fid_input_iscd": "0001"},
-    )
-    out = res.get("output", {})
-    try:
-        return {
-            "price":      float(out.get("bstp_nmix_prpr",      0) or 0),
-            "change_pct": float(out.get("bstp_nmix_prdy_ctrt", 0) or 0),
-            "volume":     int(out.get("acml_vol",              0) or 0),
-        }
-    except Exception:
-        return {}
-
-
-def get_kospi_change_pct():
-    """코스피 당일 등락률 (전일 종가 대비) — 기존 호환용"""
-    return get_kospi_info().get("change_pct", 0.0)
-
-
-def get_kospi_intraday_pct():
-    """코스피 장중 등락률 — 당일 기준가(kospi_baseline) 대비"""
-    if kospi_baseline <= 0:
-        return 0.0
-    price = get_kospi_info().get("price", 0.0)
-    if price <= 0:
-        return 0.0
-    return (price - kospi_baseline) / kospi_baseline * 100
-
-
-def get_kospi_volume_ratio():
-    """코스피 현재 거래량 / 최근 5일 평균 거래량"""
-    h = kis_headers("FHKST03010100")
-    if not h:
-        return 1.0
-    today_str = date.today().strftime("%Y%m%d")
-    past_str  = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
-        headers=h,
-        params={
-            "fid_cond_mrkt_div_code": "U",
-            "fid_input_iscd":         "0001",
-            "fid_input_date_1":       past_str,
-            "fid_input_date_2":       today_str,
-            "fid_period_div_code":    "D",
-        },
-    )
-    rows = res.get("output2", []) or res.get("output", [])
-    vols = []
-    for r in rows:
-        try:
-            v = int(r.get("acml_vol", 0) or 0)
-            if v > 0:
-                vols.append(v)
-        except Exception:
-            pass
-    if len(vols) < 2:
-        return 1.0
-    avg5  = sum(vols[1:6]) / min(len(vols[1:6]), 5)  # 전일 포함 최대 5일
-    today = vols[0] if vols else avg5
-    return today / avg5 if avg5 > 0 else 1.0
-
-
-def get_kospi_ma5():
-    """코스피 5일 이동평균"""
-    h = kis_headers("FHKST03010100")
-    if not h:
-        return 0.0
-    today_str = date.today().strftime("%Y%m%d")
-    past_str  = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
-        headers=h,
-        params={
-            "fid_cond_mrkt_div_code": "U",
-            "fid_input_iscd":         "0001",
-            "fid_input_date_1":       past_str,
-            "fid_input_date_2":       today_str,
-            "fid_period_div_code":    "D",
-        },
-    )
-    rows = res.get("output2", []) or res.get("output", [])
-    closes = []
-    for r in rows[1:6]:   # 오늘 제외, 최근 5거래일
-        try:
-            c = float(r.get("bstp_nmix_clpr", 0) or 0)
-            if c > 0:
-                closes.append(c)
-        except Exception:
-            pass
-    return sum(closes) / len(closes) if closes else 0.0
-
-
-def update_consecutive_down_days():
-    """연속하락일수 갱신 — 매일 장 시작 전 1회 호출"""
-    global consecutive_down_days
-    h = kis_headers("FHKST03010100")
-    if not h:
-        return
-    today_str = date.today().strftime("%Y%m%d")
-    past_str  = (date.today() - timedelta(days=15)).strftime("%Y%m%d")
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price",
-        headers=h,
-        params={
-            "fid_cond_mrkt_div_code": "U",
-            "fid_input_iscd":         "0001",
-            "fid_input_date_1":       past_str,
-            "fid_input_date_2":       today_str,
-            "fid_period_div_code":    "D",
-        },
-    )
-    rows = res.get("output2", []) or res.get("output", [])
-    closes = []
-    for r in rows[:8]:
-        try:
-            c = float(r.get("bstp_nmix_clpr", 0) or 0)
-            if c > 0:
-                closes.append(c)
-        except Exception:
-            pass
-    # 최신→과거 순 → 연속 하락일 카운트
-    count = 0
-    for i in range(len(closes) - 1):
-        if closes[i] < closes[i + 1]:   # 오늘 < 전일 → 하락
-            count += 1
-        else:
-            break
-    consecutive_down_days = count
-    cprint(f"[연속하락일] {count}일", Fore.CYAN)
-
-
-def get_cash_balance():
-    """주문 가능 현금 조회"""
-    tr = "VTTC8908R" if IS_MOCK else "TTTC8908R"
-    h  = kis_headers(tr)
-    if not h:
-        return 0
-    acnt_no, suffix = _acnt()
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
-        headers=h,
-        params={
-            "CANO":         acnt_no,
-            "ACNT_PRDT_CD": suffix,
-            "PDNO":         "005930",
-            "ORD_UNPR":     "0",
-            "ORD_DVSN":     "02",
-            "CMA_EVLU_AMT_ICLD_YN": "Y",
-            "OVRS_ICLD_YN": "N",
-        },
-    )
-    try:
-        return int(res.get("output", {}).get("ord_psbl_cash", 0) or 0)
-    except Exception:
-        return 0
-
-
-def get_kis_holdings():
-    """KIS 실제 보유 주식 잔고 조회 → {code: {qty, avg_price}} 반환"""
-    tr = "VTTC8434R" if IS_MOCK else "TTTC8434R"
-    h  = kis_headers(tr)
-    if not h:
-        return {}
-    acnt_no, suffix = _acnt()
-    result = {}
-    try:
-        res = api_call(
-            "get",
-            f"{_prod_url()}/uapi/domestic-stock/v1/trading/inquire-balance",
-            headers=h,
-            params={
-                "CANO":            acnt_no,
-                "ACNT_PRDT_CD":    suffix,
-                "AFHR_FLPR_YN":    "N",
-                "OFL_YN":          "",
-                "INQR_DVSN":       "02",
-                "UNPR_DVSN":       "01",
-                "FUND_STTL_ICLD_YN": "N",
-                "FNCG_AMT_AUTO_RDPT_YN": "N",
-                "PRCS_DVSN":       "01",
-                "CTX_AREA_FK100":  "",
-                "CTX_AREA_NK100":  "",
-            },
-        )
-        for item in res.get("output1", []):
-            code = item.get("pdno", "")
-            qty  = int(item.get("hldg_qty", 0) or 0)
-            avg  = float(item.get("pchs_avg_pric", 0) or 0)
-            if code and qty > 0:
-                result[code] = {"qty": qty, "avg_price": avg}
-    except Exception as e:
-        cprint(f"[잔고 조회 오류] {e}", Fore.YELLOW)
-    return result
-
-
-# ============================================================
-# [9] 주문
-# ============================================================
-def get_tick_size(price):
-    if price < 2000:    return 1
-    if price < 5000:    return 5
-    if price < 20000:   return 10
-    if price < 50000:   return 50
-    if price < 200000:  return 100
-    if price < 500000:  return 500
-    return 1000
-
-
-def send_order(code, side, qty, price=0):
-    """side: BUY or SELL / price=0 → 시장가"""
-    if qty <= 0:
-        return False
-    tr_map = {
-        ("BUY",  True):  "VTTC0802U",
-        ("BUY",  False): "TTTC0802U",
-        ("SELL", True):  "VTTC0801U",
-        ("SELL", False): "TTTC0801U",
-    }
-    h = kis_headers(tr_map[(side, IS_MOCK)])
-    if not h:
-        return False
-    acnt_no, suffix = _acnt()
-    body = {
-        "CANO":         acnt_no,
-        "ACNT_PRDT_CD": suffix,
-        "PDNO":         code,
-        "ORD_DVSN":     "01" if price == 0 else "00",
-        "ORD_QTY":      str(qty),
-        "ORD_UNPR":     str(price) if price > 0 else "0",
-    }
-    res = api_call("post",
-        f"{_prod_url()}/uapi/domestic-stock/v1/trading/order-cash",
-        headers=h, json=body,
-    )
-    if res.get("rt_cd") == "0":
-        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        cprint(
-            f"✅ [{side}] {name} {qty}주 @ {'시장가' if price==0 else f'{price:,}원'}",
-            Fore.GREEN, bright=True,
-        )
-        return True
-    cprint(f"❌ 주문 실패 [{side}] {code} — {res.get('msg1','')}", Fore.RED)
-    return False
-
-
-
-# ============================================================
-# [PATCH] 볼린저밴드 + 투자자 동향
-# ============================================================
-import numpy as _np_ind
-
-_BB_PERIOD = 20
-_BB_K      = 2.0
-_BB_NEAR   = 0.15   # %B 이하면 하단 근처
-_INV_FILTER = False  # 섹터봇 ETF는 외국인/기관 0이 흔해서 필터 비활성화
-_INV_CACHE  = {}
-_INV_TTL    = 300   # 5분 캐시
-
-
-def get_minute_candles(code, count=30):
-    """당일 분봉 조회 FHKST03010200"""
-    from datetime import datetime as _dt
-    h = kis_headers("FHKST03010200")
-    if not h:
-        return []
-    now_str = _dt.now().strftime("%H%M%S")
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-        headers=h,
-        params={
-            "FID_ETC_CLS_CODE":       "",
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD":         code,
-            "FID_INPUT_HOUR_1":       now_str,
-            "FID_PW_DATA_INCU_YN":    "N",
-        }
-    )
-    try:
-        return [
-            {
-                "open":  int(c.get("stck_oprc", 0)),
-                "high":  int(c.get("stck_hgpr", 0)),
-                "low":   int(c.get("stck_lwpr", 0)),
-                "close": int(c.get("stck_prpr", 0)),
-            }
-            for c in (res.get("output2", []) or [])[:count]
-        ]
-    except Exception as e:
-        cprint(f"[분봉 오류] {e}", Fore.YELLOW)
-        return []
-
-
-def calc_bollinger(candles, period=20, k=2.0):
-    """볼린저밴드 계산. 반환: (upper, mid, lower, pct_b)"""
-    if len(candles) < period:
-        return None, None, None, None
-    closes = [c["close"] for c in candles[-period:]]
-    mid    = sum(closes) / period
-    std    = float(_np_ind.std(closes))
-    upper  = mid + k * std
-    lower  = mid - k * std
-    cur    = closes[-1]
-    pct_b  = (cur - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
-    return upper, mid, lower, pct_b
-
-
-def is_hammer(c):
-    body = abs(c["close"] - c["open"])
-    if body == 0: return False
-    lw = min(c["open"], c["close"]) - c["low"]
-    uw = c["high"] - max(c["open"], c["close"])
-    return lw >= body * 2 and uw <= body * 0.3
-
-
-def is_bullish_reversal(candles):
-    if len(candles) < 2: return False
-    return candles[-2]["close"] < candles[-2]["open"] and candles[-1]["close"] > candles[-1]["open"]
-
-
-def check_bollinger_signal(code):
-    """볼린저 신호. 반환: (통과여부, 메시지)"""
-    return True, "BB필터비활성"  # 섹터봇 ETF 매수에는 불필요
-
-
-def get_investor_flow(code):
-    """투자자 동향. 반환: (외국인_순매수, 기관_순매수)"""
-    import time as _t
-    now = _t.time()
-    cached = _INV_CACHE.get(code)
-    if cached and now - cached[0] < _INV_TTL:
-        return cached[1], cached[2]
-    h = kis_headers("FHKST01010900")
-    if not h:
-        return None, None
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-investor",
-        headers=h,
-        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
-    )
-    try:
-        out = res.get("output", [])
-        row = out[0] if isinstance(out, list) and out else out
-        frgn = int(row.get("frgn_ntby_qty", 0) or 0)
-        inst = int(row.get("orgn_ntby_qty", 0) or 0)
-        _INV_CACHE[code] = (now, frgn, inst)
-        return frgn, inst
-    except Exception as e:
-        cprint(f"[투자자 동향 오류] {e}", Fore.YELLOW)
-        return None, None
-
-
-def check_investor_signal(code):
-    """투자자 필터. 반환: (통과여부, 메시지)"""
-    if not _INV_FILTER:
-        return True, "필터OFF"
-    frgn, inst = get_investor_flow(code)
-    if frgn is None:
-        return True, "조회실패(통과)"
-    msg = f"외국인{frgn:+,} 기관{inst:+,}"
-    return (frgn > 0 or inst > 0), msg
-
-
-def get_bollinger_status(code):
-    candles = get_minute_candles(code, 30)
-    if not candles:
-        return f"{code}: 분봉 없음"
-    upper, mid, lower, pct_b = calc_bollinger(candles)
-    cur = candles[-1]["close"]
-    if pct_b is None:
-        return f"{code}: 계산 불가"
-    return (
-        f"📊 {code} 볼린저\n"
-        f"현재가: {cur:,}원\n"
-        f"상단: {upper:,.0f}  중간: {mid:,.0f}  하단: {lower:,.0f}\n"
-        f"%B: {pct_b:.2f}  망치: {'✅' if candles and is_hammer(candles[-1]) else '❌'}"
-        f"  양봉전환: {'✅' if is_bullish_reversal(candles) else '❌'}"
-    )
-
-
-def get_investor_status(code):
-    frgn, inst = get_investor_flow(code)
-    if frgn is None:
-        return f"{code}: 조회 실패"
-    return (
-        f"👥 {code} 수급\n"
-        f"외국인: {frgn:+,}주 {'✅' if frgn > 0 else '❌'}\n"
-        f"기관:   {inst:+,}주 {'✅' if inst > 0 else '❌'}\n"
-        f"신호: {'✅통과' if (frgn > 0 or inst > 0) else '❌차단'}"
-    )
-
-def buy_etf(code, budget_krw):
-    """ETF 매수 — 예산 내 최대 수량"""
-    info = get_price_info(code)
-    if not info or info["price"] <= 0:
-        cprint(f"[매수 실패] {code} 가격 조회 실패", Fore.YELLOW)
-        return 0
-    # ── 투자자 수급 필터 ────────────────────────────────────
-    inv_ok, inv_msg = check_investor_signal(code)
-    cprint(f"[매수필터] {code} 수급:{inv_msg}", Fore.CYAN)
-    if not inv_ok:
-        send_msg(f"⚠️ {code} 수급차단 — {inv_msg}", force=True)
-        return 0
-    # ────────────────────────────────────────────────────────
-    price = info.get("ask") or info["price"]
-    qty   = int(budget_krw / price)
-    if qty <= 0:
-        cprint(f"[매수 건너뜀] {code} 예산 {budget_krw:,}원 < 1주 ({price:,}원)", Fore.YELLOW)
-        return 0
-    tick        = get_tick_size(price)
-    order_price = price + tick
-    ok = send_order(code, "BUY", qty, order_price)
-    if ok:
-        _record_buy(code, order_price, qty)
-        _log_trade(code, "BUY", qty, order_price)
-        _log_trade_detail(
-            code=code, side="BUY", qty=qty, price=order_price,
-            pnl=0, reason="리밸런싱",
-            score=None, kospi_pct=get_kospi_change_pct(),
-            avg_price=order_price, high_price=order_price,
-        )
-    return qty if ok else 0
-
-
-def sell_etf(code, qty=None, reason=""):
-    """ETF 매도 — qty=None이면 전량"""
-    pos = portfolio.get(code)
-    if not pos:
-        return False
-    if qty is None:
-        qty = pos["qty"]
-    if qty <= 0:
-        return False
-    info  = get_price_info(code)
-    price = (info.get("bid") or info.get("price", 0)) if info else 0
-    tick  = get_tick_size(price) if price > 0 else 0
-    order_price = max(0, price - tick) if price > 0 else 0
-    ok = send_order(code, "SELL", qty, order_price)
-    if ok:
-        pnl = (order_price - pos["avg_price"]) * qty if order_price > 0 else 0
-        avg_p  = pos["avg_price"]
-        high_p = pos.get("high_price", avg_p)
-        entry  = pos.get("entry_date")
-        hold_days = (date.today() - date.fromisoformat(entry)).days if entry else None
-        peak_pnl  = (high_p - avg_p) / avg_p * 100 if avg_p > 0 else 0
-        final_pnl = (order_price - avg_p) / avg_p * 100 if avg_p > 0 else 0
-
-        _record_sell(code, qty, pnl, reason)
-        _log_trade(code, "SELL", qty, order_price, pnl=pnl, reason=reason)
-        _log_trade_detail(
-            code=code, side="SELL", qty=qty, price=order_price,
-            pnl=pnl, reason=reason,
-            kospi_pct=get_kospi_change_pct(),
-            hold_days=hold_days, avg_price=avg_p, high_price=high_p,
-        )
-        # 트레일링/손절 이력 기록
-        if reason in ("트레일링스탑", "손절", "인버스익절", "인버스손절"):
-            _log_trailing(
-                code=code,
-                trigger_type=reason,
-                entry_price=avg_p,
-                high_price=high_p,
-                exit_price=order_price,
-                peak_pnl_pct=peak_pnl,
-                final_pnl_pct=final_pnl,
-                hold_days=hold_days,
-            )
-    return ok
-
-
-# ============================================================
-# [10] 포트폴리오 기록
-# ============================================================
-def _record_buy(code, price, qty):
-    global peak_value
-    if code in portfolio:
-        old   = portfolio[code]
-        total = old["qty"] + qty
-        avg   = (old["avg_price"] * old["qty"] + price * qty) / total
-        portfolio[code]["qty"]        = total
-        portfolio[code]["avg_price"]  = avg
-        portfolio[code]["high_price"] = max(old["high_price"], price)
-    else:
-        portfolio[code] = {
-            "qty":        qty,
-            "avg_price":  price,
-            "high_price": price,
-            "entry_date": str(date.today()),
-        }
-    # 매수 후 포트폴리오 평가액으로 peak 갱신 (현금 잔고 API 없이)
-    pf_val = sum(pos["avg_price"] * pos["qty"] for pos in portfolio.values())
-    if pf_val > peak_value:
-        peak_value = pf_val
-    _save_state()
-
-
-def _record_sell(code, qty, pnl, reason):
-    global daily_pnl_krw, trade_count
-    daily_pnl_krw += int(pnl)
-    trade_count   += 1
-    if code in portfolio:
-        remaining = portfolio[code]["qty"] - qty
-        if remaining <= 0:
-            del portfolio[code]
-        else:
-            portfolio[code]["qty"] = remaining
-    _save_state()
-
-
-def _log_trade(code, side, qty, price, pnl=0, reason=""):
-    name        = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-    header_need = not os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        if header_need:
-            f.write("dt,code,name,side,qty,price,pnl_krw,reason\n")
-        f.write(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},"
-            f"{code},{name},{side},{qty},{price},{int(pnl)},{reason}\n"
-        )
-
-
-def _get_log_path(prefix=None):
-    """날짜별 단일 로그 파일 경로 반환."""
-    return os.path.join(LOG_DIR, f"sector_{date.today().strftime('%Y-%m-%d')}.csv")
-
-
-def _write_sector_log(row_dict):
-    """날짜별 단일 파일에 기록. log_type으로 행 구분."""
-    path   = _get_log_path()
+def _log_recommend(current_val, recommended_val, reason_type, reason_detail, applied, snap=None):
+    """추천 발생 시 상황과 함께 CSV에 기록.
+
+    reason_type  : no_trade / restore
+    reason_detail: 12h_no_trade / 24h_auto / manual / auto_restore
+    applied      : Y / N / pending
+    """
+    if snap is None:
+        snap = _snapshot_market()
+    path   = _get_recommend_log_path()
     header = not os.path.exists(path)
-    cols   = [
-        "dt", "log_type",
-        "code", "name", "side", "qty", "price", "avg_price", "pnl_krw", "pnl_pct",
-        "reason", "score", "regime", "kospi_pct", "hold_days", "high_price",
-        "old_stage", "new_stage", "consecutive_down_days", "pf_ret",
-        "trigger_type", "entry_price", "exit_price", "peak_pnl_pct", "final_pnl_pct", "capture_ratio_pct",
-    ]
+    row = (
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},"
+        f"{current_val},{recommended_val},"
+        f"{reason_type},{reason_detail},"
+        f"{snap['regime']},"
+        f"{snap['slots_used']}/{snap['slots_max']},"
+        f"{snap['avg_vol_ratio']},"
+        f"{snap['near_trigger']},"
+        f"{snap['no_trade_h']},"
+        f"{snap['recent_trades_6h']},"
+        f"{applied}\n"
+    )
     try:
         with open(path, "a", encoding="utf-8") as f:
             if header:
-                f.write(",".join(cols) + "\n")
-            row = [str(row_dict.get(c, "")) for c in cols]
-            f.write(",".join(row) + "\n")
+                f.write(
+                    "datetime,"
+                    "current_vol_ratio,recommended_vol_ratio,"
+                    "reason_type,reason_detail,"
+                    "regime,"
+                    "slots_used,"
+                    "avg_vol_ratio_market,"
+                    "near_trigger_count,"
+                    "no_trade_h,"
+                    "recent_trades_6h,"
+                    "applied\n"
+                )
+            f.write(row)
+        cprint(f"[추천로그] {reason_detail} | {current_val}→{recommended_val} | applied={applied}", Fore.CYAN)
     except Exception as e:
-        cprint(f"[섹터 로그 오류] {e}", Fore.YELLOW)
+        cprint(f"[추천로그 오류] {e}", Fore.YELLOW)
 
 
-def _log_trade_detail(code, side, qty, price, pnl=0, reason="",
-                      score=None, regime=None, kospi_pct=None,
-                      hold_days=None, avg_price=None, high_price=None):
-    name    = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-    pnl_pct = round((price - avg_price) / avg_price * 100, 3) if avg_price and avg_price > 0 else ""
-    _write_sector_log({
-        "dt":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "log_type":  "trade",
-        "code":      code, "name": name,
-        "side":      side, "qty": qty, "price": price,
-        "avg_price": avg_price or "", "pnl_krw": int(pnl) if pnl else 0,
-        "pnl_pct":   pnl_pct, "reason": reason,
-        "score":     round(score, 2) if score is not None else "",
-        "regime":    regime or _market_regime or "",
-        "kospi_pct": round(kospi_pct, 2) if kospi_pct is not None else "",
-        "hold_days": hold_days or "", "high_price": high_price or "",
-    })
-
-
-def _log_defense(old_stage, new_stage, reason="", kospi_pct=None, pf_ret=None):
-    _write_sector_log({
-        "dt":                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "log_type":              "defense",
-        "old_stage":             old_stage, "new_stage": new_stage,
-        "reason":                reason,
-        "kospi_pct":             round(kospi_pct, 2) if kospi_pct is not None else "",
-        "pf_ret":                round(pf_ret, 2) if pf_ret is not None else "",
-        "consecutive_down_days": consecutive_down_days,
-        "regime":                _market_regime or "",
-    })
-
-
-def _log_trailing(code, trigger_type, entry_price, high_price, exit_price,
-                  peak_pnl_pct, final_pnl_pct, hold_days=None):
-    name = ETF_UNIVERSE.get(code, {}).get("name", code)
-    kept = round(final_pnl_pct / peak_pnl_pct * 100, 1) if peak_pnl_pct and peak_pnl_pct != 0 else ""
-    _write_sector_log({
-        "dt":               datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "log_type":         "trailing",
-        "code":             code, "name": name,
-        "trigger_type":     trigger_type,
-        "entry_price":      entry_price, "high_price": high_price, "exit_price": exit_price,
-        "peak_pnl_pct":     round(peak_pnl_pct, 2),
-        "final_pnl_pct":    round(final_pnl_pct, 2),
-        "capture_ratio_pct": kept,
-        "hold_days":        hold_days or "",
-        "regime":           _market_regime or "",
-    })
-
-
-def _save_state():
-    data = {
-        "portfolio":            portfolio,
-        "cooldown_list":        {k: str(v) for k, v in cooldown_list.items()},
-        "kill_switch":          kill_switch_active,
-        "mdd_active":           mdd_active,
-        "peak_value":           peak_value,
-        "initial_value":        initial_value,
-        "daily_pnl_krw":        daily_pnl_krw,
-        "trade_count":          trade_count,
-        "last_reset_day":       str(last_reset_day) if last_reset_day else None,
-        "defense_stage":        defense_stage,
-        "consecutive_down_days": consecutive_down_days,
-        "inverse_peak_return":  inverse_peak_return,
-        "defense_down_date":    str(defense_down_date) if defense_down_date else None,
-        "ts":                   time.time(),
-    }
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-def _load_state():
-    global portfolio, cooldown_list, kill_switch_active, mdd_active
-    global peak_value, initial_value, daily_pnl_krw, trade_count, last_reset_day
-    global defense_stage, consecutive_down_days, inverse_peak_return, defense_down_date
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        portfolio             = data.get("portfolio", {})
-        raw_cd                = data.get("cooldown_list", {})
-        cooldown_list         = {k: date.fromisoformat(v) for k, v in raw_cd.items()}
-        kill_switch_active    = data.get("kill_switch", False)
-        mdd_active            = data.get("mdd_active", False)
-        initial_value         = float(data.get("initial_value", TOTAL_BUDGET))
-        peak_value            = float(data.get("peak_value",    initial_value))
-        daily_pnl_krw         = int(data.get("daily_pnl_krw",   0))
-        trade_count           = int(data.get("trade_count",      0))
-        lrd = data.get("last_reset_day")
-        last_reset_day        = date.fromisoformat(lrd) if lrd else None
-        defense_stage         = data.get("defense_stage", "NORMAL")
-        consecutive_down_days = int(data.get("consecutive_down_days", 0))
-        inverse_peak_return   = float(data.get("inverse_peak_return", 0.0))
-        ddd = data.get("defense_down_date")
-        defense_down_date     = date.fromisoformat(ddd) if ddd else None
-        cprint(f"✅ 상태 복원 — 포트폴리오 {len(portfolio)}종목 / 대피:{defense_stage}", Fore.GREEN)
-
-        # peak_value 자동 보정 — API 없이 포트폴리오 기준으로 검증
-        pf_val = sum(pos["avg_price"] * pos["qty"] for pos in portfolio.values())
-        pf_ref = pf_val if pf_val > 0 else TOTAL_BUDGET
-        if peak_value > pf_ref * 3:
-            cprint(f"[상태 복원] peak_value 비정상({peak_value:,.0f}) → {pf_ref:,.0f}원으로 재설정", Fore.YELLOW)
-            peak_value = pf_ref
-            mdd_active = False
-    except Exception as e:
-        cprint(f"[상태 복원 오류] {e}", Fore.YELLOW)
-
-
-# ============================================================
-# [11] 모멘텀 스코어 계산
-# ============================================================
-def calc_momentum_score(closes):
-    """20일+60일 가중 모멘텀 스코어 (%) — None이면 데이터 부족"""
-    if len(closes) < MOMENTUM_DAYS_LONG + 1:
-        return None
-    c_now = closes[-1]
-    c_20  = closes[-(MOMENTUM_DAYS_SHORT + 1)]
-    c_60  = closes[-(MOMENTUM_DAYS_LONG  + 1)]
-    r20   = (c_now / c_20 - 1) * 100 if c_20 > 0 else 0.0
-    r60   = (c_now / c_60 - 1) * 100 if c_60 > 0 else 0.0
-    return round(MOMENTUM_W_SHORT * r20 + MOMENTUM_W_LONG * r60, 3)
-
-
-def _ret_n(closes, n):
-    if len(closes) < n + 1:
-        return 0.0
-    return (closes[-1] / closes[-(n + 1)] - 1) * 100
-
-
-def get_all_scores():
-    """전 ETF 모멘텀 스코어 계산 → {code: {score, ret5, ret20, closes, avg_vol_krw}}"""
-    scores = {}
-    for code in ETF_UNIVERSE:
-        closes, vol_list = get_daily_chart(code, 70)
-        if not closes:
-            cprint(f"  [{code}] 데이터 없음", Fore.YELLOW)
-            continue
-        score = calc_momentum_score(closes)
-        if score is None:
-            cprint(f"  [{code}] 데이터 부족 ({len(closes)}일)", Fore.YELLOW)
-            continue
-        # 20일 평균 거래대금 계산
-        recent_vol = vol_list[-20:] if len(vol_list) >= 20 else vol_list
-        avg_vol_krw = sum(recent_vol) / len(recent_vol) if recent_vol else 0
-        scores[code] = {
-            "score":       score,
-            "ret5":        _ret_n(closes, 5),
-            "ret20":       _ret_n(closes, 20),
-            "closes":      closes,
-            "avg_vol_krw": avg_vol_krw,
-        }
-        time.sleep(0.3)
-    return scores
-
-
-# ============================================================
-# [12] 필터
-# ============================================================
-def is_tradeable_time(for_buy=True):
-    now  = datetime.now()
-    h, m = now.hour, now.minute
-    if h < TRADE_START_H or (h == TRADE_START_H and m < TRADE_START_M):
-        return False
-    if for_buy:
-        if h > TRADE_BUY_END_H or (h == TRADE_BUY_END_H and m >= TRADE_BUY_END_M):
-            return False
-        if NO_BUY_FRIDAY and now.weekday() == 4:
-            return False
-    else:
-        if h > TRADE_SELL_END_H or (h == TRADE_SELL_END_H and m >= TRADE_SELL_END_M):
-            return False
-    return True
-
-
-def is_kospi_no_trade():
-    """코스피 -3% 이하만 신규 매수 금지 (+3% 급등은 허용)"""
-    chg = get_kospi_change_pct()
-    if chg <= -3.0:
-        cprint(f"[No Trade Zone] 코스피 {chg:+.1f}%", Fore.YELLOW)
-        return True
-    return False
-
-
-def is_overheat(closes):
-    return _ret_n(closes, 5) > OVERHEAT_PCT
-
-
-def is_cooldown(code, closes=None):
-    until = cooldown_list.get(code)
-    if not until:
-        return False
-    # 조건부 해제: 20일 수익률이 회복됐으면 쿨다운 해제
-    if closes is not None and _ret_n(closes, 20) > 0:
-        del cooldown_list[code]
-        cprint(f"[쿨다운 해제] {code} 20일 수익률 회복 → 편입 허용", Fore.GREEN)
-        return False
-    if date.today() <= until:
-        return True
-    del cooldown_list[code]
-    return False
-
-
-def check_liquidity(info, avg_volume_krw=None):
-    """유동성 체크. avg_volume_krw가 있으면 상대 기준 사용, 없으면 절대 기준."""
-    vol_krw = info.get("volume_krw", 0)
-    if avg_volume_krw and avg_volume_krw > 0:
-        # 당일 거래대금이 20일 평균의 30% 미만이면 유동성 부족
-        if vol_krw < avg_volume_krw * 0.3:
-            return False
-    else:
-        if vol_krw < MIN_VOLUME_KRW:
-            return False
-    bid = info.get("bid", 0)
-    ask = info.get("ask", 0)
-    p   = info.get("price", 1)
-    if bid > 0 and ask > 0 and p > 0:
-        if (ask - bid) / p * 100 > MAX_SPREAD_PCT:
-            return False
-    return True
-
-
-def register_cooldown_if_needed(code, closes):
-    """20일 수익률 -10% 이하 → 쿨다운 등록"""
-    if _ret_n(closes, 20) <= -10.0:
-        until = date.today() + timedelta(days=COOLDOWN_DAYS)
-        cooldown_list[code] = until
-        cprint(f"[쿨다운 등록] {code} 20일 {_ret_n(closes,20):.1f}% → {until}까지", Fore.YELLOW)
-        return True
-    return False
-
-
-# ============================================================
-# [13] 킬 스위치 / MDD / 대피 시스템
-# ============================================================
-def _calc_portfolio_value():
-    total = 0
-    for code, pos in list(portfolio.items()):
-        info  = get_price_info(code)
-        raw   = info.get("price", 0) if info else 0
-        price = raw if raw > 0 else pos["avg_price"]
-        total += price * pos["qty"]
-    return total
-
-
-def check_kill_switch():
-    global kill_switch_active
-    if daily_loss_base <= 0:
-        return kill_switch_active
-    # 미실현 손실 포함: 현재 총 평가액과 당일 시작 기준 비교
-    pf_val   = _calc_portfolio_value()
-    cash     = get_cash_balance()
-    total    = pf_val + cash
-    loss_pct = (total - daily_loss_base) / daily_loss_base * 100
-    if loss_pct <= KILL_DAY_LOSS and not kill_switch_active:
-        kill_switch_active = True
-        send_msg(
-            f"🔴 킬 스위치 발동!\n"
-            f"당일 손실: {loss_pct:.1f}% (미실현 포함)\n"
-            f"→ DEFENSE_1 진입",
-            force=True,
-        )
-        threading.Thread(target=lambda: _enter_defense_1("킬 스위치"), daemon=True).start()
-    return kill_switch_active
-
-
-def check_mdd():
-    global mdd_active, peak_value
-    if peak_value <= 0:
-        return mdd_active
-    pf_val = _calc_portfolio_value()
-    # 포트폴리오가 없으면 MDD 체크 스킵 (현금만 있는 상태는 API 없이 판단 불가)
-    if not portfolio:
-        return mdd_active
-    if pf_val < TOTAL_BUDGET * 0.1:
-        cprint(f"[MDD 스킵] 포트 평가액 이상({pf_val:,}원) — 데이터 오류 의심", Fore.YELLOW)
-        return mdd_active
-    if pf_val > peak_value:
-        peak_value = pf_val
-    dd = (pf_val - peak_value) / peak_value * 100
-    if dd <= MAX_DD_PCT and not mdd_active:
-        mdd_active = True
-        send_msg(
-            f"🚨 MDD 한도 도달! ({dd:.1f}%)\n→ DEFENSE_1 진입",
-            force=True,
-        )
-        threading.Thread(target=lambda: _enter_defense_1("MDD 한도"), daemon=True).start()
-    return mdd_active
-
-
-# ── 대피 공통 유틸 ─────────────────────────────────────────
-def _sell_all_etf(exclude=None):
-    """인버스 제외 전 종목 시장가 매도. exclude: 추가 제외 코드 집합."""
-    excluded = {INVERSE_CODE}
-    if exclude:
-        excluded.update(exclude)
-    failed = []
-    for code in list(portfolio.keys()):
-        if code in excluded:
-            continue
-        ok = sell_etf(code, reason="대피매도")
-        if not ok:
-            # 재시도 2회
-            for _ in range(2):
-                time.sleep(1)
-                ok = sell_etf(code, reason="대피매도_재시도")
-                if ok:
-                    break
-        if not ok:
-            failed.append(code)
-        else:
-            time.sleep(0.5)
-    if failed:
-        send_msg(f"⚠️ 매도 실패: {', '.join(failed)}\n수동 처리 필요", force=True)
-    return len(failed) == 0
-
-
-def _get_inverse_return_pct():
-    """인버스 ETF 현재 수익률(%)"""
-    pos = portfolio.get(INVERSE_CODE)
-    if not pos or pos["avg_price"] <= 0:
-        return 0.0
-    info  = get_price_info(INVERSE_CODE)
-    price = (info.get("price", 0) if info else 0) or pos["avg_price"]
-    return (price - pos["avg_price"]) / pos["avg_price"] * 100
-
-
-def _buy_inverse_to_ratio(target_ratio):
-    """전체 자산 대비 인버스 비중이 target_ratio가 되도록 추가 매수."""
-    cash      = get_cash_balance()
-    pf_val    = _calc_portfolio_value()
-    total_val = pf_val + cash
-    if total_val <= 0:
-        return
-    inv_pos   = portfolio.get(INVERSE_CODE)
-    inv_val   = 0.0
-    if inv_pos:
-        info    = get_price_info(INVERSE_CODE)
-        price   = (info.get("price", 0) if info else 0) or inv_pos["avg_price"]
-        inv_val = price * inv_pos["qty"]
-    target_val = total_val * target_ratio
-    need       = target_val - inv_val
-    if need < 5_000:
-        return
-    buy_etf(INVERSE_CODE, int(need))
-
-
-def _sell_inverse_by_ratio(sell_ratio):
-    """전체 자산의 sell_ratio 만큼 인버스 매도."""
-    pos = portfolio.get(INVERSE_CODE)
-    if not pos:
-        return
-    pf_val    = _calc_portfolio_value()
-    cash      = get_cash_balance()
-    total_val = pf_val + cash
-    info      = get_price_info(INVERSE_CODE)
-    price     = (info.get("price", 0) if info else 0) or pos["avg_price"]
-    if price <= 0:
-        return
-    sell_val = total_val * sell_ratio
-    qty      = min(int(sell_val / price), pos["qty"])
-    if qty > 0:
-        sell_etf(INVERSE_CODE, qty, reason="단계하향매도")
-
-
-def _set_defense_stage(new_stage, reason=""):
-    global defense_stage, inverse_peak_return, defense_down_date
-    old = defense_stage
-    defense_stage = new_stage
-    if new_stage == "NORMAL":
-        inverse_peak_return = 0.0
-        defense_down_date   = None
-    cprint(f"[대피단계] {old} → {new_stage}  {reason}", Fore.MAGENTA, bright=True)
-    send_msg(
-        f"🛡 대피 단계 변경\n{old} → {new_stage}\n{reason}",
-        force=True,
+def _set_vol_ratio(new_val, reason):
+    """vol_ratio 값 변경 + 추천 로그 기록."""
+    global _vol_ratio_current, _last_adjust_ts
+    old_val            = _vol_ratio_current
+    _vol_ratio_current = round(new_val, 2)
+    _last_adjust_ts    = time.time()
+    # applied=Y 로 기록
+    _log_recommend(
+        current_val      = old_val,
+        recommended_val  = _vol_ratio_current,
+        reason_type      = "restore" if new_val > old_val else "no_trade",
+        reason_detail    = reason,
+        applied          = "Y",
     )
-    # DEFENSE 로그 기록
-    _log_defense(
-        old_stage  = old,
-        new_stage  = new_stage,
-        reason     = reason,
-        kospi_pct  = get_kospi_intraday_pct(),
-        pf_ret     = (_calc_portfolio_value() - initial_value) / initial_value * 100 if initial_value > 0 else None,
-    )
-    _save_state()
+    cprint(f"[vol_ratio] {old_val} → {_vol_ratio_current} ({reason})", Fore.CYAN)
+    _save_trade_state()   # vol_ratio 변경도 저장
 
 
-# ── 단계 상향 ─────────────────────────────────────────────
-def _enter_defense_1(reason=""):
-    """NORMAL → DEFENSE_1: 전 ETF 매도 후 현금 100%"""
-    with _defense_lock:
-        if defense_stage != "NORMAL":
-            return
-        send_msg(f"🚨 DEFENSE_1 진입 — {reason}\nETF 전량 매도 중...", force=True)
-        _sell_all_etf()
-        _set_defense_stage("DEFENSE_1", reason)
+def check_vol_ratio_adjust():
+    """무거래 감지 → 완화 제안 / 거래 회복 → 복구. 메인루프에서 주기적으로 호출."""
+    global _vol_ratio_pending, _last_adjust_ts
 
+    now      = time.time()
+    no_trade = now - _last_trade_ts
 
-def _enter_defense_2():
-    """DEFENSE_1 → DEFENSE_2: 현금 30% 인버스 매수"""
-    global inverse_peak_return
-    with _defense_lock:
-        if defense_stage != "DEFENSE_1":
-            return
-        send_msg("📉 DEFENSE_2 진입 — 인버스 30% 매수", force=True)
-        inverse_peak_return = 0.0
-        _buy_inverse_to_ratio(0.30)
-        _set_defense_stage("DEFENSE_2")
-
-
-def _enter_defense_3():
-    """DEFENSE_2 → DEFENSE_3: 인버스 50%까지 확대"""
-    with _defense_lock:
-        if defense_stage != "DEFENSE_2":
-            return
-        send_msg("📉 DEFENSE_3 진입 — 인버스 50%까지 확대", force=True)
-        _buy_inverse_to_ratio(0.50)
-        _set_defense_stage("DEFENSE_3")
-
-
-# ── 단계 하향 (루프마다 호출) ─────────────────────────────
-def _step_down_defense():
-    """단계 하향 — 1일 유지 확인 후 10%씩 단계적 매도"""
-    global defense_down_date
-    kospi_pct = get_kospi_intraday_pct()
-    today     = date.today()
-
-    if defense_stage == "DEFENSE_3":
-        if kospi_pct > D_DOWN_3TO2:
-            if defense_down_date is None:
-                defense_down_date = today
-            elif today > defense_down_date:        # 1일 유지 확인
-                inv_ratio = _current_inverse_ratio()
-                if inv_ratio > 0.40:
-                    _sell_inverse_by_ratio(0.10)
-                elif inv_ratio > 0.30:
-                    _sell_inverse_by_ratio(0.10)
-                else:
-                    _set_defense_stage("DEFENSE_2", "지수 회복")
-        else:
-            defense_down_date = None
-
-    elif defense_stage == "DEFENSE_2":
-        if kospi_pct > D_DOWN_2TO1:
-            if defense_down_date is None:
-                defense_down_date = today
-            elif today > defense_down_date:
-                inv_ratio = _current_inverse_ratio()
-                if inv_ratio > 0.20:
-                    _sell_inverse_by_ratio(0.10)
-                elif inv_ratio > 0.0:
-                    sell_etf(INVERSE_CODE, reason="단계하향완료")
-                else:
-                    _set_defense_stage("DEFENSE_1", "인버스 정리 완료")
-        else:
-            defense_down_date = None
-
-    elif defense_stage == "DEFENSE_1":
-        if kospi_pct > D_DOWN_1WAIT:
-            if defense_down_date is None:
-                defense_down_date = today
-            elif today > defense_down_date:
-                _set_defense_stage("DEFENSE_WAIT", "복귀 대기 시작")
-        else:
-            defense_down_date = None
-
-
-def _current_inverse_ratio():
-    """현재 인버스 비중 (0.0 ~ 1.0)"""
-    pos = portfolio.get(INVERSE_CODE)
-    if not pos:
-        return 0.0
-    info  = get_price_info(INVERSE_CODE)
-    price = (info.get("price", 0) if info else 0) or pos["avg_price"]
-    inv_val   = price * pos["qty"]
-    pf_val    = _calc_portfolio_value()
-    cash      = get_cash_balance()
-    total_val = pf_val + cash
-    return inv_val / total_val if total_val > 0 else 0.0
-
-
-# ── 인버스 익절 / 손절 (단계와 독립적으로 항상 체크) ────────
-def check_inverse_exit():
-    global inverse_peak_return
-    if INVERSE_CODE not in portfolio:
-        return
-    ret = _get_inverse_return_pct()
-    # 고점 갱신
-    if ret > inverse_peak_return:
-        inverse_peak_return = ret
-    # 트레일링 익절: 고점 > 0% AND 현재 <= 고점 - 2%
-    if inverse_peak_return > 0 and ret <= inverse_peak_return - INVERSE_TRAIL_GAP:
-        cprint(f"[인버스 익절] 고점:{inverse_peak_return:.1f}% 현재:{ret:.1f}%", Fore.CYAN)
+    # ── 복구 체크: 6시간 내 거래 2건 이상 ────────────────────
+    recent_count = len(_recent_trades_ts)
+    if _vol_ratio_current < VOL_RATIO_DEFAULT and recent_count >= 2:
+        new_val = min(VOL_RATIO_DEFAULT, _vol_ratio_current + VOL_RATIO_STEP)
+        _set_vol_ratio(new_val, "auto_restore")
         send_msg(
-            f"💰 인버스 트레일링 익절\n고점:{inverse_peak_return:.1f}% / 현재:{ret:.1f}%",
-            force=True,
+            f"📈 거래 회복 감지 (6h내 {recent_count}건)\n"
+            f"거래량 기준 복구: {_vol_ratio_current - VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}"
         )
-        sell_etf(INVERSE_CODE, reason="인버스익절")
-        inverse_peak_return = 0.0
-        return
-    # 손절 -4%
-    if ret <= INVERSE_STOP_LOSS:
-        cprint(f"[인버스 손절] {ret:.1f}%", Fore.RED)
-        send_msg(f"🔴 인버스 손절 {ret:.1f}%", force=True)
-        sell_etf(INVERSE_CODE, reason="인버스손절")
-        inverse_peak_return = 0.0
-
-
-# ── 단계 상향 체크 (루프마다 호출) ──────────────────────────
-def check_defense_escalate():
-    """장중 단계 상향 조건 체크"""
-    kospi_pct = get_kospi_intraday_pct()
-    pf_val    = _calc_portfolio_value()
-    cash      = get_cash_balance()
-    total_val = pf_val + cash
-    pf_ret    = (total_val - initial_value) / initial_value * 100 if initial_value > 0 else 0.0
-
-    if defense_stage == "NORMAL":
-        if kospi_pct <= D1_KOSPI_PCT and pf_ret <= D1_PF_PCT:
-            threading.Thread(
-                target=lambda: _enter_defense_1(
-                    f"코스피{kospi_pct:.1f}% / 포트{pf_ret:.1f}%"
-                ), daemon=True
-            ).start()
-
-    elif defense_stage == "DEFENSE_1":
-        if kospi_pct <= D2_KOSPI_PCT and consecutive_down_days >= D2_CONSEC:
-            # 하락 추세 확인: 코스피 현재가 < 5일 이동평균
-            ma5   = get_kospi_ma5()
-            price = get_kospi_info().get("price", 0.0)
-            if ma5 <= 0 or price < ma5:
-                threading.Thread(target=_enter_defense_2, daemon=True).start()
-
-    elif defense_stage == "DEFENSE_2":
-        if kospi_pct <= D3_KOSPI_PCT and consecutive_down_days >= D3_CONSEC:
-            ma5   = get_kospi_ma5()
-            price = get_kospi_info().get("price", 0.0)
-            if ma5 <= 0 or price < ma5:
-                threading.Thread(target=_enter_defense_3, daemon=True).start()
-
-
-# ── 복귀 ────────────────────────────────────────────────────
-def check_defense_resume():
-    """자동 복귀 조건 체크 — DEFENSE_WAIT 상태에서만. 3개 중 2개 이상 충족 시 복귀."""
-    if defense_stage != "DEFENSE_WAIT":
-        return
-    kospi_pct = get_kospi_intraday_pct()
-    vol_ratio = get_kospi_volume_ratio()
-    ma5   = get_kospi_ma5()
-    price = get_kospi_info().get("price", 0.0)
-
-    cond_kospi = kospi_pct >= RESUME_KOSPI_PCT
-    cond_vol   = vol_ratio >= RESUME_VOL_RATIO
-    cond_ma    = ma5 > 0 and price >= ma5
-
-    met = sum([cond_kospi, cond_vol, cond_ma])
-    if met < 2:
-        return
-    send_msg(
-        f"🟢 자동 복귀 조건 충족 ({met}/3) — ETF 재매수 시작\n"
-        f"코스피: {'✅' if cond_kospi else '❌'} {kospi_pct:+.1f}%  "
-        f"거래량: {'✅' if cond_vol else '❌'} {vol_ratio:.1f}배  "
-        f"5일선: {'✅' if cond_ma else '❌'}",
-        force=True
-    )
-    _do_resume()
-
-
-def _do_resume():
-    global consecutive_down_days
-    """인버스 매도 + ETF 재매수 + NORMAL 전환"""
-    if INVERSE_CODE in portfolio:
-        sell_etf(INVERSE_CODE, reason="복귀매도")
-        time.sleep(2)
-    _set_defense_stage("NORMAL", "복귀 완료")
-    consecutive_down_days = 0
-    threading.Thread(target=_do_rebalance, daemon=True).start()
-
-
-# ── (하위 호환) KOFR 대피 명령을 DEFENSE_1로 연결 ───────────
-def _evacuate_to_kofr(reason):
-    """기존 코드 호환용 — DEFENSE_1 진입으로 처리"""
-    _enter_defense_1(reason)
-
-
-# ============================================================
-# [14] 보유 포지션 모니터링 (트레일링 스탑 / 손절)
-# ============================================================
-def monitor_positions():
-    if not portfolio or not is_tradeable_time(for_buy=False):
+        _vol_ratio_pending = False
         return
 
-    for code in list(portfolio.keys()):
-        if code == INVERSE_CODE:
-            continue   # 인버스는 check_inverse_exit() 에서 별도 관리
-        pos  = portfolio.get(code)
-        if not pos:
-            continue
-        info  = get_price_info(code)
-        if not info or info["price"] <= 0:
-            continue
-
-        price   = info["price"]
-        avg     = pos["avg_price"]
-        high    = pos["high_price"]
-        pnl_pct = (price - avg) / avg * 100 if avg > 0 else 0.0
-
-        # 고점 갱신
-        if price > high:
-            portfolio[code]["high_price"] = price
-
-        # 트레일링 스탑: +6% 후 고점 대비 -2%
-        if pnl_pct >= TRAIL_START_PCT:
-            trail_price = high * (1 - TRAIL_GAP_PCT / 100)
-            if price <= trail_price:
-                name = ETF_UNIVERSE.get(code, {}).get("name", code)
-                cprint(f"[트레일링] {name} {pnl_pct:+.1f}% → 매도", Fore.CYAN)
-                send_msg(f"💰 트레일링 스탑\n{name}\n수익: {pnl_pct:+.1f}%", force=True)
-                sell_etf(code, reason="트레일링스탑")
-                continue
-
-        # 손절 -5%
-        if pnl_pct <= STOP_LOSS_PCT:
-            name = ETF_UNIVERSE.get(code, {}).get("name", code)
-            cprint(f"[손절] {name} {pnl_pct:+.1f}%", Fore.RED)
-            send_msg(f"🔴 손절\n{name}\n손실: {pnl_pct:+.1f}%", force=True)
-            sell_etf(code, reason="손절")
-            cooldown_list[code] = date.today() + timedelta(days=COOLDOWN_DAYS)
-
-
-# ============================================================
-# [15] 리밸런싱
-# ============================================================
-def _do_rebalance():
-    """모멘텀 기반 ETF 교체 — NORMAL 상태에서만 실행"""
-    global portfolio
-
-    if defense_stage != "NORMAL":
-        send_msg(f"⚠️ 리밸런싱 불가 — 현재 {defense_stage} 상태\n/resume 으로 복귀 후 재시도", force=True)
+    # 쿨다운 중이면 이하 로직 스킵
+    if now - _last_adjust_ts < _adjust_cooldown:
         return
 
-    cprint("[리밸런싱] 모멘텀 스코어 계산 시작...", Fore.CYAN, bright=True)
-    send_msg("🔄 리밸런싱 시작 — 스코어 계산 중 (약 30초)...", force=True)
-
-    scores = get_all_scores()
-    if not scores:
-        send_msg("❌ 리밸런싱 실패 — 데이터 없음", force=True)
-        return
-
-    # 필터 적용 — 과열 종목은 제외 아닌 비중 축소 태그
-    filtered = {}
-    overheat_codes = set()
-    for code, data in scores.items():
-        closes = data["closes"]
-        if is_cooldown(code, closes):
-            cprint(f"  [{code}] 쿨다운 — 제외", Fore.YELLOW)
-            continue
-        if register_cooldown_if_needed(code, closes):
-            continue
-        info = get_price_info(code)
-        if info and not check_liquidity(info, data.get("avg_vol_krw")):
-            cprint(f"  [{code}] 유동성 부족 — 제외", Fore.YELLOW)
-            continue
-        if data["score"] <= MIN_SCORE_THRESHOLD:
-            cprint(f"  [{code}] 스코어 {data['score']:.1f}% ≤ {MIN_SCORE_THRESHOLD}% — 제외", Fore.YELLOW)
-            continue
-        if is_overheat(closes):
-            cprint(f"  [{code}] 과열 — 비중 50% 축소", Fore.YELLOW)
-            overheat_codes.add(code)
-        filtered[code] = data
-
-    # 상위 TOP_N 선정
-    ranked    = sorted(filtered.items(), key=lambda x: x[1]["score"], reverse=True)
-    top_codes = [c for c, _ in ranked[:TOP_N_ETF]]
-
-    # 유효 종목이 아예 없으면 KOFR 대피
-    if not top_codes:
-        send_msg("⚠️ 유효 종목 없음 → KOFR 대피", force=True)
-        _evacuate_to_kofr("모멘텀 없음")
-        return
-
-    # 유효 종목이 TOP_N 미달이면 경고만 (있는 것만 매수)
-    if len(top_codes) < TOP_N_ETF:
-        send_msg(
-            f"⚠️ 유효 종목 {len(top_codes)}개 (기준 {TOP_N_ETF}개 미달) — 있는 것만 매수 진행",
-            force=True,
-        )
-
-    # 교체 대상 매도 — Top5에 없는 것만 매도 (기존 보유 Top5는 유지)
-    # 단, 트레일링 스탑이 이미 발동 중인 종목은 수익 극대화를 위해 유지
-    current   = [c for c in portfolio if c != KOFR_CODE]
-    to_sell   = []
-    for c in current:
-        if c in top_codes:
-            continue
-        pos = portfolio.get(c, {})
-        price_now = get_price_info(c)
-        if price_now and price_now.get("price", 0) > 0 and pos.get("avg_price", 0) > 0:
-            pnl_pct = (price_now["price"] - pos["avg_price"]) / pos["avg_price"] * 100
-            # 트레일링 활성 구간(+4% 이상)이면 리밸런싱 매도 보류
-            if pnl_pct >= TRAIL_START_PCT:
-                cprint(f"  [{c}] 트레일링 활성({pnl_pct:.1f}%) — 리밸런싱 매도 보류", Fore.CYAN)
-                continue
-        to_sell.append(c)
-
-    for code in to_sell:
-        name = ETF_UNIVERSE.get(code, {}).get("name", code)
-        cprint(f"  [교체 매도] {name}", Fore.YELLOW)
-        sell_etf(code, reason="리밸런싱")
-        time.sleep(1)
-
-    time.sleep(2)
-
-    # 신규 매수 — 과열 종목은 절반 예산만 사용
-    cash        = get_cash_balance()
-    kofr_rsv    = int(TOTAL_BUDGET * KOFR_MIN_RATIO)
-    investable  = max(0, min(cash, TOTAL_BUDGET) - kofr_rsv)
-    per_etf = investable // len(top_codes)
-    bought  = []
-    for code in top_codes:
-        if code in portfolio:
-            cprint(f"  [{code}] 이미 보유 — 건너뜀", Fore.CYAN)
-            continue
-        budget = per_etf // 2 if code in overheat_codes else per_etf
-        if budget < 5_000:
-            cprint(f"  [{code}] 예산 부족 ({budget:,}원)", Fore.YELLOW)
-            continue
-        qty = buy_etf(code, budget)
-        if qty > 0:
-            bought.append(code)
-            if code in overheat_codes:
-                send_msg(f"⚠️ {ETF_UNIVERSE.get(code,{}).get('name',code)} 과열 — 절반 예산({budget:,}원) 편입", force=True)
-        time.sleep(1)
-
-    score_lines = []
-    for code, data in ranked[:5]:
-        name = ETF_UNIVERSE.get(code, {}).get("name", code)
-        mark = "✅" if code in top_codes else "  "
-        score_lines.append(f"{mark} {name}: {data['score']:+.1f}%")
-    # 제외 종목 이유 표시
-    excluded = {c: d for c, d in filtered.items() if c not in top_codes}
-    all_universe = set(ETF_UNIVERSE.keys()) - {KOFR_CODE}
-    for code in all_universe:
-        name = ETF_UNIVERSE.get(code, {}).get("name", code)
-        if code not in filtered:
-            score_lines.append(f"  ✖ {name}: 스코어≤0 또는 유동성부족")
-
-    send_msg(
-        f"✅ 리밸런싱 완료\n"
-        f"매도: {len(to_sell)}개  매수: {len(bought)}개\n\n"
-        f"📊 스코어 TOP5:\n" + "\n".join(score_lines),
-        force=True,
-    )
-
-
-def _do_weekly_rotation():
-    """하위 50% 교체 — 스코어 차이 2% 미만이면 생략"""
-    current = [c for c in portfolio if c != KOFR_CODE]
-    if len(current) < 2:
-        return
-    scores = get_all_scores()
-    if not scores:
-        return
-
-    held_scores = {c: scores[c]["score"] for c in current if c in scores}
-    sorted_held = sorted(held_scores.items(), key=lambda x: x[1])
-    bottom      = sorted_held[:max(1, len(sorted_held) // 2)]
-    all_ranked  = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-
-    for b_code, b_score in bottom:
-        for c_code, c_data in all_ranked:
-            if c_code in current or is_cooldown(c_code):
-                continue
-            diff = c_data["score"] - b_score
-            if diff < 2.0:
-                cprint(f"[주간교체] 차이 {diff:.1f}% < 2% — 생략 ({b_code})", Fore.CYAN)
-                break
-            b_name = ETF_UNIVERSE.get(b_code, {}).get("name", b_code)
-            c_name = ETF_UNIVERSE.get(c_code, {}).get("name", c_code)
-            cprint(f"[주간교체] {b_name} → {c_name} (차이 {diff:.1f}%)", Fore.CYAN)
-            sell_etf(b_code, reason="주간교체")
-            time.sleep(2)
-            cash = get_cash_balance()
-            kofr_rsv = int(TOTAL_BUDGET * KOFR_MIN_RATIO)
-            investable = max(0, min(cash, TOTAL_BUDGET) - kofr_rsv)
-            per_etf = investable // TOP_N_ETF
-            if per_etf >= 5_000:
-                buy_etf(c_code, per_etf)
-            break
-
-
-# ============================================================
-# [16] 스케줄러
-# ============================================================
-_last_monthly_rebal = None
-_last_weekly_rebal  = None
-
-
-def check_rebalance_schedule():
-    global _last_monthly_rebal, _last_weekly_rebal
-    today = date.today()
-    now   = datetime.now()
-
-    # 9:15~9:30 사이에만 실행
-    if not (now.hour == 9 and 15 <= now.minute <= 30):
-        return
-
-    # 월 1회 전체 교체: 이달 첫 번째 월요일
-    if today.weekday() == 0 and today.day <= 7:
-        if _last_monthly_rebal != today:
-            _last_monthly_rebal = today
-            cprint("[스케줄] 월 1회 전체 리밸런싱", Fore.CYAN, bright=True)
-            threading.Thread(target=_do_rebalance, daemon=True).start()
-            return
-
-    # 주 1회 하위 50% 교체: 매주 월요일
-    if today.weekday() == 0 and _last_weekly_rebal != today:
-        _last_weekly_rebal = today
-        cprint("[스케줄] 주 1회 하위 ETF 교체", Fore.CYAN)
-        threading.Thread(target=_do_weekly_rotation, daemon=True).start()
-
-
-# ============================================================
-# [17] 일간 리셋 / 상태 메시지
-# ============================================================
-def _daily_reset():
-    global daily_pnl_krw, trade_count, last_reset_day, daily_loss_base
-    today = date.today()
-    if last_reset_day == today:
-        return
-    if last_reset_day is not None:
-        send_msg(
-            f"📊 일간 리포트 [{last_reset_day}]\n"
-            f"손익: {daily_pnl_krw:+,}원\n"
-            f"거래: {trade_count}회\n"
-            f"보유: {len(portfolio)}종목",
-            force=True,
-        )
-    daily_pnl_krw   = 0
-    trade_count     = 0
-    last_reset_day  = today
-    # 킬스위치 기준 = 당일 시작 시점 실제 총 평가액 (포트 + 현금)
-    pf_val          = _calc_portfolio_value()
-    cash            = get_cash_balance()
-    actual_total    = pf_val + cash
-    daily_loss_base = actual_total if actual_total > TOTAL_BUDGET * 0.2 else TOTAL_BUDGET
-    cprint(f"[일간 리셋] {today} / 기준액: {daily_loss_base:,}원", Fore.CYAN)
-    _save_state()
-
-
-def _send_status():
-    kospi = get_kospi_change_pct()
-    val   = _calc_portfolio_value()
-    cash  = get_cash_balance()
-    # MDD는 포트폴리오 평가액 기준 (현금 포함 시 매도 직후 튀는 문제 방지)
-    dd    = (val - peak_value) / peak_value * 100 if peak_value > 0 and portfolio else 0.0
-    lines = [
-        f"📊 섹터봇 현황 [{datetime.now().strftime('%H:%M:%S')}]",
-        f"━━━━━━━━━━━━━━━━━━",
-        f"코스피:   {kospi:+.1f}%",
-        f"포트폴리오: {val:,.0f}원",
-        f"현금:     {cash:,.0f}원",
-        f"오늘 손익: {daily_pnl_krw:+,}원",
-        f"MDD:      {dd:.1f}%",
-        f"킬스위치: {'🔴 ON' if kill_switch_active else '🟢 OFF'}",
-        f"대피단계: {defense_stage}",
-        f"━━━━━━━━━━━━━━━━━━",
-    ]
-    for code, pos in list(portfolio.items()):
-        info  = get_price_info(code)
-        price = info.get("price", pos["avg_price"]) if info else pos["avg_price"]
-        pnl_p = (price - pos["avg_price"]) / pos["avg_price"] * 100 if pos["avg_price"] > 0 else 0.0
-        name  = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        lines.append(f"  {name}: {pos['qty']}주 {pnl_p:+.1f}%")
-    send_msg("\n".join(lines), force=True)
-
-
-def _send_portfolio():
-    if not portfolio:
-        send_msg("보유 ETF 없음 (현금 대기 중)", force=True)
-        return
-    lines = ["📦 보유 ETF 현황"]
-    for code, pos in list(portfolio.items()):
-        info  = get_price_info(code)
-        price = info.get("price", pos["avg_price"]) if info else pos["avg_price"]
-        pnl_p = (price - pos["avg_price"]) / pos["avg_price"] * 100 if pos["avg_price"] > 0 else 0.0
-        pnl_w = int((price - pos["avg_price"]) * pos["qty"])
-        name  = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        lines.append(
-            f"\n{name} ({code})\n"
-            f"  {pos['qty']}주 @ 평균 {pos['avg_price']:,.0f}원\n"
-            f"  현재 {price:,}원 ({pnl_p:+.1f}% / {pnl_w:+,}원)\n"
-            f"  편입일: {pos['entry_date']}"
-        )
-    send_msg("\n".join(lines), force=True)
-
-
-def _send_scores():
-    send_msg("📊 스코어 계산 중... (약 30초)", force=True)
-    def _calc():
-        scores  = get_all_scores()
-        ranked  = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-        lines   = ["📊 모멘텀 스코어 순위\n━━━━━━━━━━━━"]
-        for i, (code, data) in enumerate(ranked, 1):
-            name = ETF_UNIVERSE.get(code, {}).get("name", code)
-            cd   = " 🚫쿨다운" if is_cooldown(code) else ""
-            held = " 📦보유" if code in portfolio else ""
-            lines.append(
-                f"{i}. {name}{cd}{held}\n"
-                f"   스코어: {data['score']:+.1f}%  5일: {data['ret5']:+.1f}%  20일: {data['ret20']:+.1f}%"
+    # ── 12시간 무거래 → 사용자에게 완화 제안 ─────────────────
+    if no_trade >= 12 * 3600 and not _vol_ratio_pending:
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            send_msg(
+                f"⚠️ 12시간 무거래 — 거래량 기준이 최저({VOL_RATIO_MIN_CAP})입니다.\n"
+                f"다른 조건(RSI·눌림)을 확인해주세요."
             )
-        send_msg("\n".join(lines), force=True)
-    threading.Thread(target=_calc, daemon=True).start()
+            _vol_ratio_pending = True   # 중복 알림 방지
+            _last_adjust_ts = now       # 쿨다운 시작
+            return
+        proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _vol_ratio_pending = True
+        snap = _snapshot_market()
+        _log_recommend(
+            current_val     = _vol_ratio_current,
+            recommended_val = proposed,
+            reason_type     = "no_trade",
+            reason_detail   = "12h_no_trade",
+            applied         = "pending",
+            snap            = snap,
+        )
+        send_msg(
+            f"⚠️ 12시간 무거래 감지\n"
+            f"거래량 기준 완화 제안: {_vol_ratio_current:.1f} → {proposed:.1f}\n"
+            f"적용하려면 /voldown 입력\n"
+            f"유지하려면 /volkeep 입력"
+        )
+        return
+
+    # ── 24시간 무거래 → 자동으로 한 단계 더 완화 ────────────
+    if no_trade >= 24 * 3600:
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            return
+        new_val = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _set_vol_ratio(new_val, "auto_24h")
+        _vol_ratio_pending = False
+        send_msg(
+            f"🔧 24시간 무거래 — 거래량 기준 자동 완화\n"
+            f"{_vol_ratio_current + VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}\n"
+            f"(최저 한도: {VOL_RATIO_MIN_CAP})"
+        )
 
 
 # ============================================================
-# [18] 메인 루프
+# [10-C] 감시 종목 목록
 # ============================================================
-def main():
-    global kospi_baseline, _kospi_baseline_set
-    cprint("=" * 52, Fore.CYAN, bright=True)
-    cprint(f"  {BOT_NAME} v{BOT_VERSION} 시작", Fore.CYAN, bright=True)
-    cprint("=" * 52, Fore.CYAN, bright=True)
+_watch_markets    = []
+_watch_markets_ts = 0.0
+
+def get_watch_markets():
+    global _watch_markets, _watch_markets_ts
+    now = time.time()
+    if now - _watch_markets_ts < 60 and _watch_markets:
+        return _watch_markets
+    try:
+        r = requests.get("https://api.upbit.com/v1/market/all?isDetails=false", timeout=5)
+        if r.status_code != 200: return _watch_markets
+        krw = [m["market"] for m in r.json()
+               if m["market"].startswith("KRW-") and m["market"] not in BLACKLIST]
+        r2 = requests.get("https://api.upbit.com/v1/ticker",
+                          params={"markets": ",".join(krw[:100])}, timeout=5)
+        if r2.status_code != 200: return _watch_markets
+        tickers = sorted(r2.json(), key=lambda x: x.get("acc_trade_price_24h", 0), reverse=True)
+        _watch_markets = [t["market"] for t in tickers if t.get("trade_price", 0) >= 100][:WATCH_COUNT]
+        _watch_markets_ts = now
+        cprint(f"[감시] {len(_watch_markets)}개 종목 갱신", Fore.CYAN)
+    except Exception as e:
+        cprint(f"[감시 목록 오류] {e}", Fore.YELLOW)
+    return _watch_markets
+
+# ============================================================
+# [11] 상태 IPC 전송
+# ============================================================
+def _write_status():
+    try:
+        with slots_lock:
+            holding = list(slots)
+        data = {
+            "holding":   len(holding) > 0,
+            "pnl_today": daily_pnl,
+            "trades":    sum(coins.get(m, {}).get("trade_count", 0) for m in coins),
+            "slots":     holding,
+            "ts":        time.time(),
+        }
+        path = os.path.join(SHARED_DIR, "status_multicoin.json")
+        tmp  = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        os.chmod(path, 0o664)
+    except Exception as e:
+        cprint(f"[상태 기록 오류] {e}", Fore.YELLOW)
+
+# ============================================================
+# [12] IPC 명령 처리
+# ============================================================
+def handle_ipc():
+    if not os.path.exists(_IPC_CMD_FILE): return
+    try:
+        tmp = _IPC_CMD_FILE + ".read"
+        os.rename(_IPC_CMD_FILE, tmp)
+        with open(tmp) as f:
+            data = json.load(f)
+        os.remove(tmp)
+        cmd    = data.get("cmd", "").strip()
+        req_id = data.get("req_id", "")
+        if cmd:
+            handle_command(cmd, req_id)
+    except Exception as e:
+        cprint(f"[IPC 처리 오류] {e}", Fore.YELLOW)
+
+def handle_command(text, req_id=""):
+    global _IPC_REQ_ID
+    _IPC_REQ_ID = req_id
+    cmd = text.strip().split()
+    if not cmd: return
+
+    if cmd[0] in ("/status", "/s", "/상태"):
+        with slots_lock:
+            holding = list(slots)
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        pri_slots = _primary_slots()
+        sec_slots = _secondary_slots()
+        trend_used = sum(1 for m in holding if coins.get(m, {}).get("is_trend", False))
+        slot_str = f"{len(holding)}/{MAX_SLOTS+TREND_SLOTS}" + (f" (역추세{pri_slots+sec_slots}+추세{TREND_SLOTS})" if sec_slots > 0 else f" (역추세{pri_slots}+추세{TREND_SLOTS})")
+        lines = [f"📊 멀티코인봇 상태", f"━━━━━━━━━━━━━━━━━━━━",
+                 f"캔들: {CANDLE_INTERVAL}분봉  장세: {regime_kor}",
+                 f"슬롯: {slot_str}  손익: {daily_pnl:+,.0f}원"]
+        import time as _t
+        for m in holding:
+            c = coins.get(m, {})
+            buy_p = c.get("buy_price", 0)
+            h = list(c.get("history", [0]))
+            cur = h[-1] if h else 0
+            pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p else 0
+            hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
+            lines.append(f"📦 {m.replace('KRW-','')}: {pnl_pct:+.2f}% ({hold_h:.1f}h보유)")
+        if not holding:
+            lines.append("⏳ 대기중")
+        _write_ipc_result("\n".join(lines), req_id)
+
+    elif cmd[0] in ("/start", "/시작"):
+        for m in list(coins.keys()):
+            coins[m]["running"] = True
+        _write_ipc_result("✅ 매매 시작", req_id)
+
+    elif cmd[0] in ("/stop", "/정지"):
+        for m in list(coins.keys()):
+            coins[m]["running"] = False
+        _write_ipc_result("⏹ 매매 정지", req_id)
+
+    elif cmd[0] == "/slots":
+        with slots_lock:
+            s = list(slots)
+        _write_ipc_result(f"슬롯 {len(s)}/{MAX_SLOTS}: {', '.join(s) or '없음'}", req_id)
+
+    elif cmd[0] == "/voldown":
+        global _vol_ratio_pending
+        if _vol_ratio_current <= VOL_RATIO_MIN_CAP:
+            _vol_ratio_pending = False
+            _write_ipc_result(f"⚠️ 이미 최저 한도({VOL_RATIO_MIN_CAP})입니다.", req_id)
+            return
+        proposed = round(_vol_ratio_current - VOL_RATIO_STEP, 2)
+        _set_vol_ratio(proposed, "manual")
+        _vol_ratio_pending = False
+        _write_ipc_result(
+            f"✅ 거래량 기준 완화 적용\n"
+            f"{_vol_ratio_current + VOL_RATIO_STEP:.1f} → {_vol_ratio_current:.1f}\n"
+            f"쿨다운: 6시간", req_id
+        )
+
+    elif cmd[0] == "/volkeep":
+        _vol_ratio_pending = False
+        _log_recommend(
+            current_val     = _vol_ratio_current,
+            recommended_val = round(_vol_ratio_current - VOL_RATIO_STEP, 2),
+            reason_type     = "no_trade",
+            reason_detail   = "12h_no_trade",
+            applied         = "N",
+        )
+        _write_ipc_result(f"✅ 거래량 기준 유지 ({_vol_ratio_current:.1f})", req_id)
+
+    elif cmd[0] == "/volstatus":
+        now = time.time()
+        no_trade_h = (now - _last_trade_ts) / 3600
+        cooldown_left = max(0, _adjust_cooldown - (now - _last_adjust_ts)) / 3600
+        _write_ipc_result(
+            f"📊 거래량 기준 현황\n"
+            f"현재: {_vol_ratio_current:.1f}  기본: {VOL_RATIO_DEFAULT:.1f}  최저: {VOL_RATIO_MIN_CAP:.1f}\n"
+            f"무거래 경과: {no_trade_h:.1f}h\n"
+            f"6h내 거래: {len(_recent_trades_ts)}건\n"
+            f"조정 쿨다운 잔여: {cooldown_left:.1f}h\n"
+            f"승인 대기중: {'✅' if _vol_ratio_pending else '없음'}", req_id
+        )
+
+    elif cmd[0] == "/sync":
+        """업비트 실제 보유 잔고 → coins/slots 강제 동기화."""
+        try:
+            h = _upbit_headers()
+            r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=5)
+            if r.status_code != 200:
+                _write_ipc_result("❌ 잔고 조회 실패", req_id)
+                return
+            accounts = r.json()
+            synced = []
+            with coins_lock:
+                # 기존 slots 초기화
+                with slots_lock:
+                    old_slots = set(slots)
+                # 실제 보유 코인 반영
+                for a in accounts:
+                    currency = a.get("currency", "")
+                    if currency == "KRW":
+                        continue
+                    market = f"KRW-{currency}"
+                    balance = float(a.get("balance", 0))
+                    avg_buy = float(a.get("avg_buy_price", 0))
+                    if balance <= 0 or avg_buy <= 0:
+                        continue
+                    # coins에 반영
+                    c = get_or_create_coin(market)
+                    c["has_stock"]     = True
+                    c["buy_price"]     = avg_buy
+                    c["filled_qty"]    = balance
+                    c["be_active"]     = False
+                    c["highest_profit"] = 0.0
+                    c["buy_time"]      = c.get("buy_time") or time.time()
+                    # slots에 반영
+                    with slots_lock:
+                        slots.add(market)
+                    synced.append(f"{currency}: {balance:.6f} @ {avg_buy:,.2f}원")
+                # 실제 없는데 slots에 있는 것 제거
+                for market in list(old_slots):
+                    found = any(f"KRW-{a.get('currency')}" == market
+                                and float(a.get("balance", 0)) > 0
+                                for a in accounts)
+                    if not found:
+                        with slots_lock:
+                            slots.discard(market)
+                        c = coins.get(market)
+                        if c:
+                            c["has_stock"] = False
+            if synced:
+                _write_ipc_result(f"✅ 동기화 완료\n" + "\n".join(synced), req_id)
+            else:
+                _write_ipc_result("✅ 동기화 완료 — 보유 코인 없음", req_id)
+            _write_status()
+        except Exception as e:
+            _write_ipc_result(f"❌ 동기화 오류: {e}", req_id)
+
+    elif cmd[0] in ("/why", "/왜"):
+        import time as _t
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        primary_c, secondary_c = get_regime_conditions()
+        cond_str = f"기본 RSI≤{primary_c['rsi_max']} 눌림≥{primary_c['drop_min']}% 변동성≥0.8% + (거래량≥1.05 OR 실체≥0.6%)"
+        if secondary_c:
+            cond_str += f"\n보조 RSI≤{secondary_c['rsi_max']} 눌림≥{secondary_c['drop_min']}%"
+        lines = ["🔍 매수 조건 요약", f"━━━━━━━━━━━━━━━━━━━━",
+                 f"장세: {regime_kor}  슬롯: {_primary_slots()}+{_secondary_slots()}개 (추세+{TREND_SLOTS})",
+                 cond_str]
+        with slots_lock:
+            holding = set(slots)
+        # 보유 중 종목
+        for m in holding:
+            c = coins.get(m, {})
+            buy_p = c.get("buy_price", 0)
+            price = list(c.get("history", [0]))[-1] if c.get("history") else 0
+            pnl = (price - buy_p) / buy_p * 100 if buy_p else 0
+            hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
+            lines.append(f"📦 {m.replace('KRW-','')}: 보유중 {pnl:+.2f}% ({hold_h:.1f}h)")
+        # 감시 중 종목 (최대 10개)
+        checked = 0
+        prob_list = []
+        with coins_lock:
+            snap = dict(coins)
+        now = _t.time()
+        for m, c in snap.items():
+            if m in holding: continue
+            if checked >= 30: break
+            h = list(c.get("history", []))
+            cnt = c.get("real_data_count", 0)
+            if cnt < REAL_DATA_MIN:
+                # 프리필 즉시 실행
+                prefill(m)
+                cnt = c.get("real_data_count", 0)
+            if cnt < REAL_DATA_MIN:
+                prob_list.append((m, 0, f"데이터 수집중 {cnt}/{REAL_DATA_MIN}"))
+                checked += 1
+                continue
+            rsi = calc_rsi(h)
+            vol = calc_vol_pct(c.get("timed", []))
+            # 시간봉 MA API 직접 조회
+            ma20, ma60 = get_hourly_ma_cached(m)
+            price = h[-1] if h else 0
+            p1 = c.get("prev_rsi")
+            p2 = c.get("prev_rsi2")
+            cooldown_left = max(0, c.get("cooldown", 0) - (now - c.get("last_sell_time", 0)))
+            # 이유 판단 (이중 트리거 기준)
+            drop_pct_w = (ma20 - price) / ma20 * 100 if ma20 and ma20 > 0 else 0
+            d_ma20_w, d_ma60_w = get_daily_ma_cached(m)
+            primary_w, secondary_w = get_regime_conditions()
+            vol_h_w = list(c.get("vol_history", []))
+            vol_ratio_w = 1.0
+            if len(vol_h_w) >= 6 and vol_h_w[-1] > 0:
+                avg5_w = sum(vol_h_w[-6:-1]) / 5
+                vol_ratio_w = vol_h_w[-1] / avg5_w if avg5_w > 0 else 1.0
+
+            def _check_trigger(cond_t):
+                if rsi > cond_t["rsi_max"]: return f"RSI {rsi:.0f}→{cond_t['rsi_max']}"
+                if ma20 is None or ma20 <= (ma60 or 0): return "MA하락"
+                if drop_pct_w < cond_t["drop_min"]: return f"눌림 {drop_pct_w:.1f}→{cond_t['drop_min']}%"
+                if vol is None or vol < 0.8: return f"변동성부족 {vol:.2f}%" if vol else "변동성없음"
+                if vol_ratio_w < 1.05 and (vol or 0) < 0.6: return f"거래량+실체 모두 부족"
+                if _market_regime == "bull" and d_ma20_w is not None and d_ma60_w is not None and d_ma20_w <= d_ma60_w:
+                    return "일봉하락추세"
+                return None
+
+            def _calc_prob(cond_t):
+                scores = []
+                rsi_target = cond_t["rsi_max"]
+                scores.append(1.0 if rsi <= rsi_target else max(0, 1.0 - (rsi - rsi_target) / (70 - rsi_target)))
+                scores.append(1.0 if (p1 is not None and rsi > p1) else 0.3)
+                if ma20 and ma60:
+                    scores.append(1.0 if ma20 > ma60 else 0.0)
+                else:
+                    scores.append(0.5)
+                drop_target = cond_t["drop_min"]
+                scores.append(1.0 if drop_pct_w >= drop_target else max(0, drop_pct_w / drop_target))
+                if vol is None:
+                    scores.append(0.2)
+                elif 1.0 <= vol <= 8.0:
+                    scores.append(1.0)
+                elif vol < 2.0:
+                    scores.append(max(0, vol / 2.0))
+                else:
+                    scores.append(max(0, 1.0 - (vol - 8.0) / 8.0))
+                vr_target = cond_t["vol_ratio_min"]
+                scores.append(1.0 if vol_ratio_w >= vr_target else max(0, vol_ratio_w / vr_target))
+                if _market_regime == "bull":
+                    if d_ma20_w and d_ma60_w:
+                        scores.append(1.0 if d_ma20_w > d_ma60_w else 0.0)
+                    else:
+                        scores.append(0.5)
+                return int(sum(scores) / len(scores) * 100)
+
+            if cooldown_left > 0:
+                prob_list.append((m, 0, f"쿨다운 {cooldown_left/3600:.1f}h 후"))
+            elif rsi is None:
+                prob_list.append((m, 0, "데이터 없음"))
+            else:
+                # 공통 필수 탈락 여부 먼저 체크
+                common_fail = []
+                if ma20 is None or ma60 is None or ma20 <= ma60:
+                    common_fail.append("MA하락")
+                if vol is None or vol < 0.8:
+                    common_fail.append(f"변동성{vol:.1f}%" if vol else "변동성없음")
+                elif vol > 8.0:
+                    common_fail.append(f"변동성과다{vol:.1f}%")
+                elif vol_ratio_w < 1.05 and (vol or 0) < 0.6:
+                    common_fail.append(f"거래량{vol_ratio_w:.1f}+실체부족")
+
+                if common_fail:
+                    prob_list.append((m, 0, ", ".join(common_fail)))
+                else:
+                    prob_pri = _calc_prob(primary_w)
+                    prob_sec = _calc_prob(secondary_w) if secondary_w else 0
+                    prob = max(prob_pri, prob_sec)
+                    best_cond = primary_w if prob_pri >= prob_sec else (secondary_w or primary_w)
+                    hints = []
+                    if rsi > best_cond["rsi_max"]:
+                        hints.append(f"RSI {rsi:.0f}→{best_cond['rsi_max']}")
+                    if drop_pct_w < best_cond["drop_min"]:
+                        hints.append(f"눌림 {drop_pct_w:.1f}→{best_cond['drop_min']}")
+                    if vol_ratio_w < 1.05 and (vol or 0) < 0.6:
+                        hints.append(f"거래량 {vol_ratio_w:.1f}OR실체부족")
+                    hint_str = ", ".join(hints[:2])
+                    prob_list.append((m, prob, hint_str))
+            checked += 1
+        hot  = sorted([(m,p,h) for m,p,h in prob_list if p >= 70], key=lambda x: x[1], reverse=True)
+        mid  = sorted([(m,p,h) for m,p,h in prob_list if 40 <= p < 70], key=lambda x: x[1], reverse=True)
+        cold = sorted([(m,p,h) for m,p,h in prob_list if p < 40], key=lambda x: x[1], reverse=True)
+        if hot:
+            lines.append("🔥 곧 살 수도 있음")
+            for m, p, h in hot:
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
+        if mid:
+            lines.append("📊 중간 정도")
+            for m, p, h in mid:
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
+        if cold:
+            lines.append("⏳ 아직 멀었음")
+            for m, p, h in cold:
+                lines.append(f"  {m.replace('KRW-','')}: {p}점" + (f" ({h})" if h else ""))
+        if not prob_list and not holding:
+            markets = get_watch_markets()
+            if markets:
+                lines.append(f"⏳ 데이터 수집 중 ({len(markets)}개 종목 — 약 5분 후 표시)")
+            else:
+                lines.append("감시 종목 없음")
+
+        # 추세추종 후보 표시
+        trend_list = []
+        with slots_lock:
+            held = set(slots)
+        for m, c in snap.items():
+            if m in held: continue
+            h = list(c.get("history", []))
+            if not h: continue
+            price = h[-1]
+            volume = list(c.get("vol_history", []))[-1] if c.get("vol_history") else 0
+            ok, score = check_trend_signal(m, price, volume)
+            if ok:
+                trend_list.append((m, int(score)))
+        trend_list.sort(key=lambda x: x[1], reverse=True)
+        if trend_list:
+            lines.append("📈 추세추종 후보")
+            for m, s in trend_list[:5]:
+                lines.append(f"  {m.replace('KRW-','')}: {s}점")
+        else:
+            lines.append("📈 추세추종 후보: 없음 (RSI 50~65 + 가격>MA20 대기)")
+
+        _write_ipc_result("\n".join(lines), req_id)
+# ============================================================
+# [13] 데이터 프리필
+# ============================================================
+def prefill(market):
+    c = get_or_create_coin(market)
+    prices = get_ohlcv(market, count=REAL_DATA_MIN + 10, interval=CANDLE_INTERVAL)
+    if prices:
+        now_ts = time.time()
+        candle_sec = CANDLE_INTERVAL * 60  # 캔들 간격(초)
+        for i, p in enumerate(prices):
+            c["history"].append(p)
+            # timed에 과거 타임스탬프로 역산해서 삽입 (변동성 계산용)
+            past_ts = now_ts - (len(prices) - 1 - i) * candle_sec
+            c["timed"].append((past_ts, p))
+        c["real_data_count"] = max(REAL_DATA_MIN, len(prices))
+        cprint(f"[프리필] {market} {len(prices)}개 로드 (timed 포함)", Fore.CYAN)
+
+# ============================================================
+# [14] 메인 루프
+# ============================================================
+_running = True
+
+def run_bot():
+    global _running, daily_pnl, _last_reset_day
 
     load_config()
-    get_kis_token()
-    _load_state()
-    _start_ipc_thread()   # 매니저 ↔ 섹터봇 IPC 수신 스레드 시작
+    _load_trade_state()   # 마지막 거래 시각 / vol_ratio 복원
 
-    # 시작 시 KIS 실제 잔고로 포트폴리오 자동 동기화
-    try:
-        real = get_kis_holdings()
-        if real:
-            valid_codes = set(ETF_UNIVERSE.keys()) | {KOFR_CODE}
-            new_portfolio = {}
-            for code, pos in real.items():
-                if code in valid_codes:
-                    old_pos = portfolio.get(code, {})
-                    new_portfolio[code] = {
-                        "qty":        pos["qty"],
-                        "avg_price":  pos["avg_price"],
-                        "high_price": max(old_pos.get("high_price", 0), pos["avg_price"]),
-                        "entry_date": old_pos.get("entry_date", str(date.today())),
-                    }
-            portfolio.clear()
-            portfolio.update(new_portfolio)
-            _save_state()
-            cprint(f"[시작 싱크] KIS 잔고 동기화 완료 — {len(portfolio)}종목", Fore.GREEN)
-        else:
-            cprint("[시작 싱크] 보유 종목 없음 또는 조회 실패", Fore.YELLOW)
-    except Exception as e:
-        cprint(f"[시작 싱크 오류] {e}", Fore.YELLOW)
+    if not JWT_OK:
+        print("❌ PyJWT 없음. pip install PyJWT"); sys.exit(1)
+
+    # IPC 스레드
+    def _ipc_loop():
+        while _running:
+            try: handle_ipc()
+            except Exception as e: cprint(f"[IPC 루프] {e}", Fore.YELLOW)
+            time.sleep(0.3)
+    threading.Thread(target=_ipc_loop, daemon=True, name="ipc").start()
 
     send_msg(
-        f"🚀 섹터로테이션 봇 v{BOT_VERSION} 시작\n"
-        f"예산: {TOTAL_BUDGET:,}원\n"
-        f"모드: {'모의투자' if IS_MOCK else '실투자'}\n"
-        f"ETF 유니버스: {len(ETF_UNIVERSE)}종\n"
-        f"상위 편입: {TOP_N_ETF}개\n\n"
-        f"/help 로 명령어 확인",
-        force=True,
+        f"🚀 멀티코인봇 v{BOT_VERSION} 시작!\n"
+        f"예산: {TOTAL_BUDGET:,}원 / 슬롯: {MAX_SLOTS}개\n"
+        f"감시 종목: {WATCH_COUNT}개"
     )
 
-    last_monitor      = 0.0
-    last_tg_poll      = 0.0
-    last_schedule     = 0.0
-    last_defense_chk  = 0.0
-    last_token_check  = time.time()
-    monitor_interval  = 120   # 포지션 모니터링 2분마다
-    defense_interval  = 300   # 대피 체크 5분마다
+    last_ticker_ts = 0.0
 
-    while True:
+    while _running:
         try:
-            now_ts = time.time()
-            now_dt = datetime.now()
+            now = time.time()
 
-            # 토큰 갱신 (10시간마다)
-            if now_ts - last_token_check > 36_000:
-                get_kis_token()
-                last_token_check = now_ts
+            # 일간 초기화
+            today = date.today()
+            if _last_reset_day != today:
+                _last_reset_day = today
+                daily_pnl = 0.0
+                for c in coins.values(): c["daily_pnl"] = 0.0
 
-            # 텔레그램 폴링 (3초마다) — 매니저 하위에서 실행 중이면 건너뜀
-            # (manager가 callback_query를 처리해야 하므로 sector_bot이 먼저 소비하면 안 됨)
-            if now_ts - last_tg_poll >= 3:
-                if not _manager_is_running():
-                    poll_telegram()
-                last_tg_poll = now_ts
+            # 장세 감지 (1시간마다 자동 갱신)
+            detect_market_regime()
 
-            # 일간 리셋
-            _daily_reset()
+            # vol_ratio 자동 조정 체크
+            check_vol_ratio_adjust()
 
-            # 장 시작 시 코스피 기준가 캡처 (9:10~9:15 사이 1회)
-            if now_dt.hour == 9 and 10 <= now_dt.minute <= 15:
-                if not _kospi_baseline_set:
-                    info = get_kospi_info()
-                    p    = info.get("price", 0.0)
-                    if p > 0:
-                        kospi_baseline      = p
-                        _kospi_baseline_set = True
-                        cprint(f"[코스피 기준가] {kospi_baseline:,.2f}", Fore.CYAN)
-                        update_consecutive_down_days()
-            elif now_dt.hour < 9:
-                _kospi_baseline_set = False   # 익일 초기화
+            # IPC 상태 주기적 전송
+            _write_status()
 
-            # 킬스위치 / MDD 체크 (1분마다)
-            if now_ts - last_monitor >= 60:
-                if not kill_switch_active:
-                    check_kill_switch()
-                if not kill_switch_active and not mdd_active:
-                    check_mdd()
+            # 감시 종목 시세 일괄 조회 (WATCH_INTERVAL초 간격)
+            if now - last_ticker_ts < WATCH_INTERVAL:
+                time.sleep(1)
+                continue
+            last_ticker_ts = now
 
-            # 장중 루틴
-            if is_tradeable_time(for_buy=False):
-                # 포지션 모니터링 (2분마다)
-                if now_ts - last_monitor >= monitor_interval:
-                    if not kill_switch_active and not mdd_active and defense_stage == "NORMAL":
-                        monitor_positions()
-                    if defense_stage != "NORMAL":
-                        check_inverse_exit()
-                    last_monitor = now_ts
+            markets = get_watch_markets()
+            if not markets:
+                time.sleep(WATCH_INTERVAL)
+                continue
 
-                # 대피 단계 체크 (5분마다)
-                if now_ts - last_defense_chk >= defense_interval:
-                    if not kill_switch_active:
-                        check_defense_escalate()
-                        _step_down_defense()
-                        check_defense_resume()
-                    last_defense_chk = now_ts
+            # 시세 일괄 조회
+            try:
+                r = requests.get("https://api.upbit.com/v1/ticker",
+                                 params={"markets": ",".join(markets)}, timeout=5)
+                if r.status_code != 200:
+                    time.sleep(WATCH_INTERVAL); continue
+                tickers = {t["market"]: t for t in r.json()}
+            except Exception as e:
+                cprint(f"[시세 조회 오류] {e}", Fore.YELLOW)
+                time.sleep(WATCH_INTERVAL); continue
 
-                # 리밸런싱 스케줄 체크 (5분마다)
-                if now_ts - last_schedule >= 300:
-                    if not kill_switch_active and not mdd_active:
-                        check_rebalance_schedule()
-                    last_schedule = now_ts
+            # ── 보유 중 종목 매도 체크 ──────────────────────
+            with slots_lock:
+                holding = list(slots)
+            for market in holding:
+                td = tickers.get(market)
+                if not td: continue
+                price = td.get("trade_price", 0)
+                if price > 0:
+                    check_sell(market, price)
 
-            time.sleep(2)
+            # ── 미보유 종목 매수 신호 수집 ───────────────────
+            with slots_lock:
+                slot_cnt = len(slots)
+            if slot_cnt >= MAX_SLOTS:
+                continue
 
-        except KeyboardInterrupt:
-            cprint("\n[종료] Ctrl+C", Fore.YELLOW)
-            send_msg("⏹ 섹터봇 수동 종료", force=True)
-            _save_state()
-            break
+            signals = []
+            for market, td in tickers.items():
+                with slots_lock:
+                    if market in slots: continue
+                price  = td.get("trade_price", 0)
+                volume = td.get("acc_trade_volume_24h", 0)
+                if price <= 0: continue
+
+                # 미등록 종목 프리필
+                c = get_or_create_coin(market)
+                if c["real_data_count"] == 0:
+                    prefill(market)
+
+                open_price = td.get("opening_price", 0)
+                ok, score = check_buy_score(market, price, volume, open_price)
+                if ok:
+                    signals.append((market, price, score))
+
+            # 추세추종 신호 수집
+            trend_signals = []
+            for market, td in tickers.items():
+                with slots_lock:
+                    if market in slots: continue
+                price  = float(td.get("trade_price", 0))
+                volume = td.get("acc_trade_volume_24h", 0)
+                if not market or price <= 0: continue
+                c = get_or_create_coin(market)
+                ok, score = check_trend_signal(market, price, volume)
+                if ok:
+                    trend_signals.append((market, price, score))
+
+            # 추세추종 매수 (1슬롯, 역추세와 종목 겹치지 않게)
+            trend_signals.sort(key=lambda x: x[2], reverse=True)
+            trend_used = sum(1 for m in slots if coins.get(m, {}).get("is_trend", False))
+            with slots_lock:
+                held = set(slots)
+            for market, price, score in trend_signals:
+                if trend_used >= _trend_slots(): break
+                if market in held: continue   # 역추세 보유 종목 제외
+                real_score = int(score)
+                coins.get(market, {})["is_trend"] = True
+                coins.get(market, {})["is_secondary"] = False
+                do_buy(market, price, f"추세추종:{real_score}점")
+                trend_used += 1
+                with slots_lock:
+                    held = set(slots)
+
+            # 점수 순 정렬 → 역추세 슬롯 분리 매수
+            signals.sort(key=lambda x: x[2], reverse=True)
+            pri_used = sum(1 for m in slots if not coins.get(m, {}).get("is_secondary", False) and not coins.get(m, {}).get("is_trend", False))
+            sec_used = sum(1 for m in slots if coins.get(m, {}).get("is_secondary", False))
+            with slots_lock:
+                held = set(slots)
+            for market, price, score in signals:
+                with slots_lock:
+                    if len(slots) >= MAX_SLOTS + TREND_SLOTS: break
+                if market in held: continue   # 추세추종 보유 종목 제외
+                is_sec = (score % 1) > 0.005
+                real_score = int(score)
+                if is_sec:
+                    if sec_used >= _secondary_slots(): continue
+                    sec_used += 1
+                    tag = f"보조:{real_score}점"
+                else:
+                    if pri_used >= _primary_slots(): continue
+                    pri_used += 1
+                    tag = f"기본:{real_score}점"
+                coins.get(market, {})["is_secondary"] = is_sec
+                coins.get(market, {})["is_trend"] = False
+                do_buy(market, price, tag)
+
         except Exception as e:
-            cprint(f"[메인 루프 오류] {e}", Fore.RED)
-            traceback.print_exc()
-            time.sleep(10)
-
+            cprint(f"[메인 루프 오류] {e}\n{traceback.format_exc()}", Fore.RED)
+            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    run_bot()
