@@ -219,13 +219,13 @@ def send_msg(text, level="normal", source="매니저", force=False, keyboard=Non
 # ── Reply Keyboard & 상단 고정 메시지 ────────────────────────
 _mgr_pinned_msg_id      = 0
 _mgr_pinned_last_update = 0.0
-MGR_PINNED_INTERVAL     = 86400  # 사실상 비활성 — 변동 시 수동 호출로만 업데이트
+MGR_PINNED_INTERVAL     = 60  # 60초마다 자동 갱신
 
 MGR_REPLY_KEYBOARD = {
     "keyboard": [
-        ["📊 전체현황",  "🪙 코인봇",   "📊 섹터봇"],
-        ["⏯ 시작/정지", "🔴 전체정지", "💰 예산"],
-        ["⚙️ 설정",      "📋 메뉴",     "🔍 왜안사?"],
+        ["📊 전체현황",  "🪙 멀티코인",  "📊 섹터봇"],
+        ["🔍 왜안사?",   "📈 추세후보",  "🔴 전체정지"],
+        ["⚙️ 시스템",    "📋 메뉴",      "💰 예산"],
     ],
     "resize_keyboard": True,
     "persistent":      True,
@@ -233,15 +233,15 @@ MGR_REPLY_KEYBOARD = {
 }
 
 MGR_REPLY_CMD_MAP = {
-    "📊 전체현황":  "/s status",
-    "🪙 코인봇":    "/bot_menu coin",
+    "📊 전체현황":  "/status",
+    "🪙 멀티코인":  "/bot_menu coin",
     "📊 섹터봇":    "/bot_menu stock",
-    "⏯ 시작/정지": "/s start",
+    "🔍 왜안사?":   "/bot_cmd multicoin why",
+    "📈 추세후보":  "/bot_cmd multicoin trend",
     "🔴 전체정지":  "/stop_all",
-    "💰 예산":      "/budget_menu",
-    "⚙️ 설정":      "/sys_menu",
+    "⚙️ 시스템":    "/sys_menu",
     "📋 메뉴":      "/menu",
-    "🔍 왜안사?":   "/c why",
+    "💰 예산":      "/budget_menu",
 }
 
 
@@ -293,9 +293,28 @@ def _build_mgr_pinned_text() -> str:
         f"💰 오늘 {daily_total_pnl:+,}원  |  이번주 {weekly_total_pnl:+,}원",
         f"━━━━━━━━━━━━━━",
     ]
+
+    # 멀티코인 상태 파일에서 슬롯/보유 정보 읽기
+    mc_status = _read_bot_status("status_multicoin.json")
+    if mc_status:
+        slots     = mc_status.get("slots", [])
+        pnl_mc    = mc_status.get("pnl_today", 0)
+        hold_icon = "📦" if slots else "⏳"
+        slot_str  = f"[{', '.join(m.replace('KRW-','') for m in slots)}]" if slots else "대기중"
+        lines.append(f"{hold_icon} MULTI-COIN: {pnl_mc:+,}원  {slot_str}")
+    else:
+        for wid, st in states.items():
+            if wid == "MULTI-COIN":
+                hold_s = "📦" if st.get("holding") else "⏳"
+                lines.append(f"{hold_s} {wid}: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
+
+    # 주식봇 등 나머지
     for wid, st in states.items():
+        if wid == "MULTI-COIN":
+            continue
         hold_s = "📦" if st.get("holding") else "⏳"
         lines.append(f"{hold_s} {wid}: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
+
     lines.append(f"🕐 {datetime.now().strftime('%H:%M:%S')} 업데이트")
     return "\n".join(lines)
 
@@ -355,15 +374,15 @@ KB_MAIN = [
      {"text": "🔴 전체정지",    "callback_data": "/stop_all"}],
 ]
 
-# 코인봇 메뉴: 상태조회 먼저, 조작 다음
+# 코인봇 메뉴: 멀티코인봇 전용 (종목변경/공격모드/수치설정 제거)
 KB_COIN_BOT = [
     [{"text": "📊 상태조회",    "callback_data": "/bot_cmd multicoin status"},
      {"text": "🔍 왜 안사?",    "callback_data": "/bot_cmd multicoin why"}],
-    [{"text": "⏯ 시작/정지",   "callback_data": "/bot_cmd multicoin start"},
-     {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd multicoin sell"},
-     {"text": "⚡ 공격모드",    "callback_data": "/bot_cmd multicoin aggressive"}],
-    [{"text": "🔁 종목변경",    "callback_data": "/coin_switch_menu"},
-     {"text": "⚙️ 수치설정",    "callback_data": "/coin_set_menu"},
+    [{"text": "⏯ 시작",        "callback_data": "/multicoin_start"},
+     {"text": "⏹ 정지",        "callback_data": "/multicoin_stop"},
+     {"text": "🔴 즉시매도",    "callback_data": "/bot_cmd multicoin sell"}],
+    [{"text": "📈 추세후보",    "callback_data": "/bot_cmd multicoin trend"},
+     {"text": "📋 감시종목",    "callback_data": "/bot_cmd multicoin watchlist"},
      {"text": "🔍 분석",        "callback_data": "/analyze_menu"}],
     [{"text": "◀️ 메인",        "callback_data": "/menu"}],
 ]
@@ -1404,8 +1423,12 @@ def _handle_command_inner(text):
         _forward_to_bot("coin", sub)
         return
     elif cmd[0] == "/s":
-        # /s → 주식봇으로 명령 전달 (/s status, /s sell 등)
+        # /s status → 전체현황, 나머지 → 주식봇 전달
         sub = " ".join(cmd[1:]) if len(cmd) > 1 else "status"
+        if sub == "status":
+            # 전체현황으로 리디렉트
+            _handle_command_inner("/status")
+            return
         _forward_to_bot("stock", sub)
         return
 
@@ -1567,23 +1590,46 @@ def _handle_command_inner(text):
         return
 
     # ── 현황 ─────────────────────────────────────────────────
-    elif cmd[0] in ("/s status", "/상태"):
-        # 매니저 전체현황 먼저
+    elif cmd[0] in ("/status", "/상태") or (cmd[0] == "/s" and len(cmd) > 1 and cmd[1] == "status"):
+        # 매니저 전체현황 + 각 봇 상세
         _send_status()
-        # 각 봇 상세 상태도 함께 조회
         workers_snap = list(_workers)
-        for w in [w for w in workers_snap if isinstance(w, CoinWorker)]:
-            _send_ipc_cmd(w.market, "/s status")
-            result = _read_ipc_result(w.market, timeout=5.0)
+        # 멀티코인봇 상태
+        mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
+        if mc_workers:
+            import uuid as _uuid2
+            req_id2 = _uuid2.uuid4().hex[:8]
+            _send_ipc_cmd("multicoin", "/status", req_id=req_id2)
+            result = _read_ipc_result("multicoin", timeout=8.0, req_id=req_id2)
             if result:
-                clean = result.replace("[critical] ", "").replace("[normal] ", "").replace("[silent] ", "")
-                send_msg(clean, level="normal", source=f"🪙{w.market}", force=True, keyboard=KB_COIN_BOT)
+                clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+                send_msg(clean, level="normal", source="🪙멀티코인", force=True, keyboard=KB_COIN_BOT)
+        # 주식봇 상태
         for w in [w for w in workers_snap if isinstance(w, StockWorker)]:
-            _send_ipc_cmd("stock", "/s status")
+            _send_ipc_cmd("stock", "/status")
             result = _read_ipc_result("stock", timeout=5.0)
             if result:
                 clean = result.replace("[critical] ", "").replace("[normal] ", "").replace("[silent] ", "")
                 send_msg(clean, level="normal", source="📈주식봇", force=True, keyboard=KB_STOCK_BOT)
+        return
+
+    # ── 멀티코인 시작/정지 ────────────────────────────────────
+    elif cmd[0] == "/multicoin_start":
+        import uuid as _uuid3
+        req_id3 = _uuid3.uuid4().hex[:8]
+        _send_ipc_cmd("multicoin", "/start", req_id=req_id3)
+        result = _read_ipc_result("multicoin", timeout=5.0, req_id=req_id3)
+        clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","") if result else "✅ 멀티코인봇 시작 신호 전송"
+        send_msg(clean, level="normal", source="🪙멀티코인", force=True, keyboard=KB_COIN_BOT)
+        return
+
+    elif cmd[0] == "/multicoin_stop":
+        import uuid as _uuid4
+        req_id4 = _uuid4.uuid4().hex[:8]
+        _send_ipc_cmd("multicoin", "/stop", req_id=req_id4)
+        result = _read_ipc_result("multicoin", timeout=5.0, req_id=req_id4)
+        clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","") if result else "⏹ 멀티코인봇 정지 신호 전송"
+        send_msg(clean, level="normal", source="🪙멀티코인", force=True, keyboard=KB_COIN_BOT)
         return
 
     # ── 요약 ─────────────────────────────────────────────────
@@ -1785,10 +1831,17 @@ def _handle_command_inner(text):
         workers_snap = list(_workers)
         mc_workers = [w for w in workers_snap if isinstance(w, MultiCoinWorker)]
         if not mc_workers:
-            send_msg("🪙 실행 중인 코인봇 없음", level="normal", source="매니저", force=True)
+            send_msg("🪙 실행 중인 멀티코인봇 없음", level="normal", source="매니저", force=True)
             return
-        _send_ipc_cmd("multicoin", "/why")
-        send_msg("🔍 분석 시작...", level="normal", source="매니저", force=True)
+        import uuid as _uuid5
+        req_id5 = _uuid5.uuid4().hex[:8]
+        _send_ipc_cmd("multicoin", "/why", req_id=req_id5)
+        result = _read_ipc_result("multicoin", timeout=12.0, req_id=req_id5)
+        if result:
+            clean = result.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+            send_msg(clean, level="normal", source="🪙멀티코인", force=True, keyboard=KB_COIN_BOT)
+        else:
+            send_msg("⚠️ 멀티코인봇 응답 없음", level="normal", source="매니저", force=True)
 
     elif cmd[0] == "/analyze_menu_stock":
         workers_snap = list(_workers)

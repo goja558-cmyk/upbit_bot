@@ -1556,6 +1556,127 @@ def handle_command(text, req_id=""):
             lines.append("📈 추세추종 후보: 없음 (RSI 50~65 + 가격>MA20 대기)")
 
         _write_ipc_result("\n".join(lines), req_id)
+
+    elif cmd[0] in ("/trend", "/추세"):
+        with coins_lock:
+            snap = dict(coins)
+        with slots_lock:
+            held = set(slots)
+        trend_list = []
+        for m, c in snap.items():
+            if m in held: continue
+            h = list(c.get("history", []))
+            if not h: continue
+            price = h[-1]
+            volume = list(c.get("vol_history", []))[-1] if c.get("vol_history") else 0
+            ok, score = check_trend_signal(m, price, volume)
+            if ok:
+                trend_list.append((m, int(score)))
+        trend_list.sort(key=lambda x: x[1], reverse=True)
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        lines = [f"📈 추세추종 후보 ({regime_kor})"]
+        if trend_list:
+            for m, s in trend_list[:10]:
+                lines.append(f"  {m.replace('KRW-','')}: {s}점")
+        else:
+            lines.append("없음 (RSI 50~65 + 가격>MA20 + RSI상승 조건 대기)")
+        _write_ipc_result("\n".join(lines), req_id)
+
+    elif cmd[0] in ("/watchlist", "/감시"):
+        markets = get_watch_markets()
+        with slots_lock:
+            held = list(slots)
+        lines = [
+            f"👁 감시 종목 ({len(markets)}개)",
+            f"보유: {', '.join(m.replace('KRW-','') for m in held) or '없음'}",
+            "─────────────────",
+        ]
+        for m in markets:
+            c = coins.get(m, {})
+            cnt = c.get("real_data_count", 0)
+            status = "📦" if m in held else ("✅" if cnt >= REAL_DATA_MIN else f"⏳{cnt}")
+            lines.append(f"{status} {m.replace('KRW-','')}")
+        _write_ipc_result("\n".join(lines), req_id)
+
+    elif cmd[0] in ("/sell", "/매도"):
+        with slots_lock:
+            holding = list(slots)
+        if not holding:
+            _write_ipc_result("⏳ 보유 종목 없음", req_id)
+            return
+        lines = ["🔴 즉시 매도 실행"]
+        for m in holding:
+            c = coins.get(m, {})
+            qty = c.get("filled_qty", 0)
+            if qty > 0:
+                filled, avg = send_order("SELL", m, qty)
+                if filled:
+                    pnl_pct = (avg - c.get("buy_price", avg)) / c.get("buy_price", avg) * 100 if c.get("buy_price") else 0
+                    lines.append(f"✅ {m.replace('KRW-','')}: {pnl_pct:+.2f}% 매도완료")
+                    c["has_stock"] = False
+                    with slots_lock:
+                        slots.discard(m)
+                else:
+                    lines.append(f"❌ {m.replace('KRW-','')}: 매도 실패")
+            else:
+                lines.append(f"⚠️ {m.replace('KRW-','')}: 수량 없음")
+        _write_ipc_result("\n".join(lines), req_id)
+
+
+    """1시간마다 텔레그램에 현황 보고."""
+    import time as _t
+    try:
+        with slots_lock:
+            holding = list(slots)
+        regime_kor = {"bull": "📈상승장", "neutral": "➖중립장", "bear": "📉하락장"}.get(_market_regime, "?")
+        slot_str = f"{len(holding)}/{MAX_SLOTS + TREND_SLOTS}"
+        lines = [
+            f"🕐 1시간 보고 ({datetime.now().strftime('%H:%M')})",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"장세: {regime_kor}  슬롯: {slot_str}",
+            f"일간손익: {daily_pnl:+,.0f}원",
+        ]
+
+        if holding:
+            lines.append("📦 보유 중")
+            for m in holding:
+                c = coins.get(m, {})
+                buy_p = c.get("buy_price", 0)
+                h = list(c.get("history", [0]))
+                cur = h[-1] if h else 0
+                pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p else 0
+                hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
+                tag = "추세" if c.get("is_trend") else ("보조" if c.get("is_secondary") else "기본")
+                lines.append(f"  {m.replace('KRW-','')}: {pnl_pct:+.2f}% ({hold_h:.1f}h, {tag})")
+        else:
+            lines.append("⏳ 보유 종목 없음")
+
+        # 감시 중 근접 종목 (near) 상위 3개
+        snap = dict(coins)
+        near_list = []
+        with slots_lock:
+            held = set(slots)
+        for m, c in snap.items():
+            if m in held: continue
+            h = list(c.get("history", []))
+            if not h: continue
+            price = h[-1]
+            volume = list(c.get("vol_history", []))[-1] if c.get("vol_history") else 0
+            open_price = 0
+            ok, score = check_buy_score(m, price, volume, open_price)
+            if score > 0:
+                near_list.append((m, int(score)))
+        near_list.sort(key=lambda x: x[1], reverse=True)
+        if near_list:
+            lines.append("🔍 근접 후보 (역추세)")
+            for m, s in near_list[:3]:
+                lines.append(f"  {m.replace('KRW-','')}: {s}점")
+
+        send_msg("\n".join(lines))
+    except Exception as e:
+        cprint(f"[시간보고 오류] {e}", Fore.YELLOW)
+
+
 # ============================================================
 # [13] 데이터 프리필
 # ============================================================
@@ -1601,7 +1722,8 @@ def run_bot():
         f"감시 종목: {WATCH_COUNT}개"
     )
 
-    last_ticker_ts = 0.0
+    last_ticker_ts  = 0.0
+    last_report_ts  = 0.0   # 1시간 주기 텔레그램 보고
 
     while _running:
         try:
@@ -1622,6 +1744,11 @@ def run_bot():
 
             # IPC 상태 주기적 전송
             _write_status()
+
+            # 1시간마다 텔레그램 보고
+            if now - last_report_ts >= 3600:
+                last_report_ts = now
+                _send_hourly_report()
 
             # 감시 종목 시세 일괄 조회 (WATCH_INTERVAL초 간격)
             if now - last_ticker_ts < WATCH_INTERVAL:
