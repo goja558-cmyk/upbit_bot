@@ -581,6 +581,7 @@ def _make_coin_state(market):
         "be_active":      False,
         "prev_rsi":       None,
         "prev_rsi2":      None,
+        "trend_prev_rsi": None,
         "highest_profit": 0.0,
         "buy_time":       0.0,
         "last_sell_time": 0.0,
@@ -962,7 +963,12 @@ def check_trend_signal(market, price, volume):
     vol    = calc_vol_pct(c["timed"])
     ma20, ma60 = get_hourly_ma_cached(market)
 
-    if rsi is None or ma20 is None: return False, 0
+    # trend_prev_rsi 항상 갱신 (조건 탈락 여부와 무관하게 RSI 추이 추적)
+    prev_rsi = c.get("trend_prev_rsi")
+    if rsi is None or ma20 is None:
+        c["trend_prev_rsi"] = rsi
+        return False, 0
+    c["trend_prev_rsi"] = rsi
 
     # RSI 50~65 구간 (과열 전 추세 초입)
     if not (50 <= rsi <= 65): return False, 0
@@ -980,8 +986,7 @@ def check_trend_signal(market, price, volume):
     had_below = any(p < ma20 for p in recent5)
     if not had_below: return False, 0   # 이탈 이력 없으면 탈락
 
-    # MA20 상승 중 (RSI 상승으로 대리 판단)
-    prev_rsi = c.get("prev_rsi")
+    # MA20 상승 중 (RSI 상승으로 대리 판단) — trend_prev_rsi 기준
     if prev_rsi is None or rsi <= prev_rsi: return False, 0
 
     # 변동성 필터
