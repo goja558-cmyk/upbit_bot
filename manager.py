@@ -2354,7 +2354,7 @@ def check_heartbeat():
 VERSION_FILE = os.path.join(BASE_DIR, ".manager_version.json")
 
 # 관리 대상 파일 목록 (레포에서 다운로드할 파일들)
-MANAGED_FILES = ["upbit_bot.py", "sector_bot.py", "manager.py"]
+MANAGED_FILES = ["multi_coin_bot.py", "sector_bot.py", "manager.py"]
 
 
 def _gh_headers():

@@ -675,6 +675,8 @@ def do_buy(market, price, reason):
 
     filled, avg_p = send_order("BUY", market, order_krw)
     if filled <= 0 or avg_p <= 0:
+        cprint(f"[매수 실패] {market} 주문 미체결 (filled={filled:.6f}, avg={avg_p:.2f})", Fore.RED)
+        send_msg(f"⚠️ {market} 매수 실패 — 체결 미확인", market=market, level="normal")
         return False
 
     c.update({
