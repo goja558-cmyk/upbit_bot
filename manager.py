@@ -291,7 +291,7 @@ def _build_mgr_pinned_text() -> str:
     lines = [
         f"🤖 매니저 v{MANAGER_VERSION}  {'🟢' if not _global_stop else '🔴'}",
         f"━━━━━━━━━━━━━━",
-        f"💰 오늘 {daily_total_pnl:+,}원  |  이번주 {weekly_total_pnl:+,}원",
+        f"💰 오늘 {int(daily_total_pnl):+,}원  |  이번주 {int(weekly_total_pnl):+,}원",
         f"━━━━━━━━━━━━━━",
     ]
 
@@ -306,8 +306,8 @@ def _build_mgr_pinned_text() -> str:
         hold_str  = ", ".join(m.replace("KRW-", "") for m in holding_slots) if holding_slots else "대기중"
         near_count = mc_status.get("near_count", None)
         near_str   = f"  근접{near_count}개" if near_count else ""
-        unr_str    = f" (미실현{unrealized:+,.0f})" if unrealized != 0 else ""
-        lines.append(f"{hold_icon} 멀티코인: {pnl_total:+,.0f}원{unr_str}  {hold_str}{near_str}")
+        unr_str    = f" (실현{int(pnl_realized):+,}/미실현{int(unrealized):+,})" if pnl_realized != 0 and unrealized != 0 else ""
+        lines.append(f"{hold_icon} 멀티코인: {int(pnl_total):+,}원{unr_str}  {hold_str}{near_str}")
     else:
         st = states.get("MULTI-COIN", {})
         hold_icon = "📦" if st.get("holding") else "⏳"
@@ -321,8 +321,8 @@ def _build_mgr_pinned_text() -> str:
         unrealized   = sector_status.get("unrealized", 0)
         holdings     = sector_status.get("holdings", [])
         hold_icon    = "📦" if holdings else "⏳"
-        unr_str      = f" (미실현{unrealized:+,.0f})" if unrealized != 0 else ""
-        lines.append(f"{hold_icon} 섹터봇: {pnl_total:+,.0f}원{unr_str}")
+        unr_str      = f" (실현{int(pnl_realized):+,}/미실현{int(unrealized):+,})" if pnl_realized != 0 and unrealized != 0 else ""
+        lines.append(f"{hold_icon} 섹터봇: {int(pnl_total):+,}원{unr_str}")
         for h in holdings:
             name  = h.get("name", "?")
             avg_p = h.get("avg_price", 0)

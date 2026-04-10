@@ -158,6 +158,39 @@ _defense_lock    = threading.Lock()   # 대피 단계 진입 중복 방지
 # KIS 인증
 _access_token    = ""
 _token_expire    = 0.0
+_TOKEN_FILE      = os.path.join(BASE_DIR, "shared", "kis_token.json")
+
+
+def _save_kis_token():
+    """발급된 토큰을 파일에 저장 — 재시작/장외에도 재사용 가능."""
+    try:
+        tmp = _TOKEN_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"token": _access_token, "expire": _token_expire}, f)
+        os.replace(tmp, _TOKEN_FILE)
+    except Exception as e:
+        cprint(f"[토큰 저장 오류] {e}", Fore.YELLOW)
+
+
+def _load_kis_token():
+    """파일에서 토큰 복원 — 유효기간 내면 재사용."""
+    global _access_token, _token_expire
+    if not os.path.exists(_TOKEN_FILE):
+        return
+    try:
+        with open(_TOKEN_FILE) as f:
+            data = json.load(f)
+        token  = data.get("token", "")
+        expire = float(data.get("expire", 0))
+        if token and time.time() < expire:
+            _access_token = token
+            _token_expire = expire
+            remain = (expire - time.time()) / 3600
+            cprint(f"✅ KIS 토큰 파일 복원 (잔여 {remain:.1f}h)", Fore.CYAN)
+        else:
+            cprint("[토큰] 파일 토큰 만료 — 재발급 필요", Fore.YELLOW)
+    except Exception as e:
+        cprint(f"[토큰 복원 오류] {e}", Fore.YELLOW)
 
 # Rate limit
 _bucket_tokens   = 4.0
@@ -599,32 +632,56 @@ def _market_url():
 
 def get_kis_token():
     global _access_token, _token_expire
-    # 기존 토큰 유효하면 재사용
+    # 메모리 토큰 유효하면 재사용
     if _access_token and time.time() < _token_expire:
         return _access_token
-    # 장 시간(평일 8:00~16:00)에만 토큰 발급 시도
+
     now_dt = datetime.now()
-    is_weekday = now_dt.weekday() < 5  # 월~금
+    is_weekday    = now_dt.weekday() < 5
     is_market_hours = 8 <= now_dt.hour < 16
-    if not (is_weekday and is_market_hours):
+
+    # 장중(평일 8~16시): 신규 발급
+    if is_weekday and is_market_hours:
+        res = api_call("post", f"{_prod_url()}/oauth2/tokenP", json={
+            "grant_type": "client_credentials",
+            "appkey":     _cfg.get("app_key", ""),
+            "appsecret":  _cfg.get("app_secret", ""),
+        })
+        _access_token = res.get("access_token", "")
+        _token_expire = time.time() + 3600 * 23   # 23시간 — 주말 포함 다음날까지 유지
         if _access_token:
-            cprint(f"[토큰] 장외 시간 — 기존 토큰 유지 (만료: {datetime.fromtimestamp(_token_expire).strftime('%H:%M')})", Fore.CYAN)
-            return _access_token
+            cprint("✅ KIS 토큰 발급 성공", Fore.GREEN)
+            _save_kis_token()
         else:
-            cprint("[토큰] 장외 시간 — 토큰 발급 건너뜀", Fore.YELLOW)
-            return ""
-    res = api_call("post", f"{_prod_url()}/oauth2/tokenP", json={
-        "grant_type": "client_credentials",
-        "appkey":     _cfg.get("app_key", ""),
-        "appsecret":  _cfg.get("app_secret", ""),
-    })
-    _access_token = res.get("access_token", "")
-    _token_expire = time.time() + 3600 * 11
-    if _access_token:
-        cprint("✅ KIS 토큰 발급 성공", Fore.GREEN)
-    else:
-        cprint("❌ KIS 토큰 발급 실패 — API 키를 확인하세요", Fore.RED)
-    return _access_token
+            cprint("❌ KIS 토큰 발급 실패", Fore.RED)
+        return _access_token
+
+    # 장외/주말: 파일에서 복원 시도
+    if not _access_token:
+        _load_kis_token()
+
+    # 파일 토큰도 만료됐으면 장외에서도 재발급 시도 (하루 1회)
+    if not _access_token or time.time() >= _token_expire:
+        cprint("[토큰] 만료 — 장외 재발급 시도", Fore.YELLOW)
+        res = api_call("post", f"{_prod_url()}/oauth2/tokenP", json={
+            "grant_type": "client_credentials",
+            "appkey":     _cfg.get("app_key", ""),
+            "appsecret":  _cfg.get("app_secret", ""),
+        })
+        _access_token = res.get("access_token", "")
+        _token_expire = time.time() + 3600 * 23
+        if _access_token:
+            cprint("✅ KIS 토큰 장외 발급 성공", Fore.GREEN)
+            _save_kis_token()
+        else:
+            cprint("❌ KIS 토큰 장외 발급 실패", Fore.RED)
+
+    if _access_token and time.time() < _token_expire:
+        remain = (_token_expire - time.time()) / 3600
+        cprint(f"[토큰] 사용 중 (잔여 {remain:.1f}h)", Fore.CYAN)
+        return _access_token
+
+    return ""
 
 
 def kis_headers(tr_id):
@@ -2484,7 +2541,8 @@ def main():
     cprint("=" * 52, Fore.CYAN, bright=True)
 
     load_config()
-    get_kis_token()
+    _load_kis_token()   # 파일 토큰 먼저 복원 (재시작/장외 대비)
+    get_kis_token()     # 장중이면 신규 발급, 장외면 파일 토큰 그대로 사용
     _load_state()
     _start_ipc_thread()   # 매니저 ↔ 섹터봇 IPC 수신 스레드 시작
 
@@ -2548,8 +2606,8 @@ def main():
                 last_snapshot_day = now_dt.date()
                 threading.Thread(target=_log_daily_snapshot, daemon=True).start()
 
-            # 토큰 갱신 (10시간마다)
-            if now_ts - last_token_check > 36_000:
+            # 토큰 갱신 (23시간마다 — 장외/주말 포함)
+            if now_ts - last_token_check > 3600 * 23:
                 get_kis_token()
                 last_token_check = now_ts
 
