@@ -400,14 +400,59 @@ def _handle_ipc_cmd(text):
         _write_ipc_result(f"[normal] ⚠️ 알 수 없는 명령: {text}")
 
 
-def _ipc_send_status():
+def _write_sector_status():
+    """shared/status_sector.json — 매니저 pinned 메시지용.
+    장 마감 후 KIS 토큰 없으면 _price_cache(마지막 종가) 사용."""
+    try:
+        holdings = []
+        unrealized = 0.0
+        for code, pos in list(portfolio.items()):
+            name  = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+            avg_p = pos["avg_price"]
+            qty   = pos["qty"]
+            # 현재가: KIS → 캐시 순으로 시도
+            cur_p = 0
+            h = kis_headers("FHKST01010100")
+            if h:
+                info = get_price_info(code)
+                cur_p = info.get("price", 0)
+            if cur_p <= 0:
+                cached = _price_cache.get(code)
+                if cached:
+                    cur_p = cached["price"]
+            if avg_p > 0 and cur_p > 0 and qty > 0:
+                unrealized += (cur_p - avg_p) * qty
+            holdings.append({
+                "name":      name,
+                "avg_price": avg_p,
+                "cur_price": cur_p,
+                "qty":       qty,
+            })
+        pnl_total = daily_pnl_krw + unrealized
+        data = {
+            "holding":    len(portfolio) > 0,
+            "pnl_today":  daily_pnl_krw,   # 실현 손익
+            "pnl_total":  pnl_total,        # 실현 + 미실현
+            "unrealized": unrealized,
+            "trades":     trade_count,
+            "holdings":   holdings,
+            "ts":         time.time(),
+        }
+        path = os.path.join(SHARED_DIR, "status_sector.json")
+        tmp  = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        cprint(f"[status_sector 오류] {e}", Fore.YELLOW)
+
+
+
     global peak_value
     val  = _calc_portfolio_value()
     cash = get_cash_balance()
-    # peak_value 초기화 — portfolio도 없고 peak도 0일 때만 (최초 1회)
     if peak_value <= 0 and not portfolio:
         peak_value = TOTAL_BUDGET
-    # MDD는 포트폴리오 평가액 기준 (현금 포함 시 매도 직후 튀는 문제 방지)
     dd   = (val - peak_value) / peak_value * 100 if peak_value > 0 and portfolio else 0.0
     lines = [
         f"📊 섹터봇 현황",
@@ -421,8 +466,24 @@ def _ipc_send_status():
         f"보유:       {len(portfolio)}종목",
     ]
     for code, pos in list(portfolio.items()):
-        name = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
-        lines.append(f"  {name}: {pos['qty']}주 @ {pos['avg_price']:,.0f}원")
+        name    = ETF_UNIVERSE.get(code, {}).get("name", KOFR_NAME if code == KOFR_CODE else code)
+        avg_p   = pos["avg_price"]
+        qty     = pos["qty"]
+        info    = get_price_info(code)
+        cur_p   = info.get("price", 0) if info else 0
+        if cur_p <= 0:
+            cached = _price_cache.get(code)
+            if cached:
+                cur_p = cached["price"]
+        if cur_p > 0 and avg_p > 0:
+            diff_pct = (cur_p - avg_p) / avg_p * 100
+            diff_krw = (cur_p - avg_p) * qty
+            lines.append(
+                f"  {name}: {avg_p:,.0f}→{cur_p:,.0f}원 "
+                f"{diff_pct:+.1f}% ({diff_krw:+,.0f}원)"
+            )
+        else:
+            lines.append(f"  {name}: {qty}주 @ {avg_p:,.0f}원")
     _write_ipc_result("[normal] " + "\n".join(lines))
 
 
@@ -732,34 +793,67 @@ def _handle_cmd(cmd):
 # ============================================================
 # [8] 시장 데이터
 # ============================================================
-def get_price_info(code):
-    """현재가, 전일종가, 거래대금, 호가 조회"""
-    h = kis_headers("FHKST01010100")
-    if not h:
-        return {}
-    res = api_call(
-        "get",
-        f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-price",
-        headers=h,
-        params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code},
-    )
-    out = res.get("output", {})
-    if not out:
-        return {}
+_price_cache: dict = {}   # {code: {"price": int, "ts": float}} — 마지막 성공 가격 캐시
+
+def _get_price_naver(code: str) -> int:
+    """네이버 금융에서 현재가(또는 종가) 조회 — KIS 토큰 없을 때 fallback."""
     try:
-        return {
-            "price":      int(out.get("stck_prpr",    0) or 0),
-            "prev_close": int(out.get("stck_sdpr",    0) or 0),
-            "bid":        int(out.get("bidp",          0) or 0),
-            "ask":        int(out.get("askp",          0) or 0),
-            "volume_krw": int(out.get("acml_tr_pbmn",  0) or 0),
-            "open":       int(out.get("stck_oprc",     0) or 0),
-            "high":       int(out.get("stck_hgpr",     0) or 0),
-            "low":        int(out.get("stck_lwpr",     0) or 0),
-        }
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if res.status_code != 200:
+            return 0
+        import re
+        # <p class="no_today"><em ...><span class="blind">현재가</span>10,245</em>
+        m = re.search(r'no_today[^"]*"[^>]*>.*?<span class="blind">[^<]+</span>([\d,]+)', res.text, re.S)
+        if m:
+            return int(m.group(1).replace(",", ""))
     except Exception as e:
-        cprint(f"[가격 파싱 오류 {code}] {e}", Fore.YELLOW)
-        return {}
+        cprint(f"[네이버 가격 오류 {code}] {e}", Fore.YELLOW)
+    return 0
+
+
+def get_price_info(code):
+    """현재가, 전일종가, 거래대금, 호가 조회.
+    KIS 토큰이 없거나 장 마감 후에는 네이버 금융 → 캐시 순으로 fallback."""
+    h = kis_headers("FHKST01010100")
+    if h:
+        res = api_call(
+            "get",
+            f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-price",
+            headers=h,
+            params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code},
+        )
+        out = res.get("output", {})
+        if out:
+            try:
+                info = {
+                    "price":      int(out.get("stck_prpr",    0) or 0),
+                    "prev_close": int(out.get("stck_sdpr",    0) or 0),
+                    "bid":        int(out.get("bidp",          0) or 0),
+                    "ask":        int(out.get("askp",          0) or 0),
+                    "volume_krw": int(out.get("acml_tr_pbmn",  0) or 0),
+                    "open":       int(out.get("stck_oprc",     0) or 0),
+                    "high":       int(out.get("stck_hgpr",     0) or 0),
+                    "low":        int(out.get("stck_lwpr",     0) or 0),
+                }
+                if info["price"] > 0:
+                    _price_cache[code] = {"price": info["price"], "ts": time.time()}
+                return info
+            except Exception as e:
+                cprint(f"[가격 파싱 오류 {code}] {e}", Fore.YELLOW)
+
+    # KIS 실패 → 네이버 fallback
+    naver_price = _get_price_naver(code)
+    if naver_price > 0:
+        _price_cache[code] = {"price": naver_price, "ts": time.time()}
+        return {"price": naver_price}
+
+    # 네이버도 실패 → 캐시 사용
+    cached = _price_cache.get(code)
+    if cached:
+        return {"price": cached["price"]}
+
+    return {}
 
 
 def get_daily_chart(code, n_days=70):
@@ -1410,6 +1504,82 @@ def _log_defense(old_stage, new_stage, reason="", kospi_pct=None, pf_ret=None):
         "consecutive_down_days": consecutive_down_days,
         "regime":                _market_regime or "",
     })
+
+
+def _log_scores(scores: dict, trigger: str = "schedule"):
+    """ETF 전체 스코어를 날짜별 로그에 기록 (리밸런싱 체크마다)."""
+    dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for code, d in scores.items():
+        name = ETF_UNIVERSE.get(code, {}).get("name", code)
+        held = code in portfolio
+        _write_sector_log({
+            "dt":       dt_str,
+            "log_type": "score",
+            "code":     code,
+            "name":     name,
+            "score":    round(d["score"], 2),
+            "reason":   trigger,
+            "side":     "HOLD" if held else "",
+            "regime":   _market_regime or "",
+            "kospi_pct": "",
+        })
+
+
+def _log_daily_snapshot():
+    """장마감 후 1회 — 포트폴리오 상태 + 전 ETF 스코어 스냅샷.
+    logs/sector/snapshot_YYYY-MM-DD.csv 에 기록."""
+    snap_dir  = os.path.join(LOG_DIR, "snapshots")
+    os.makedirs(snap_dir, exist_ok=True)
+    snap_path = os.path.join(snap_dir, f"snapshot_{date.today().strftime('%Y-%m-%d')}.csv")
+    cols = [
+        "dt", "code", "name", "held", "qty", "avg_price", "cur_price",
+        "pnl_pct", "score", "ret5", "ret20", "defense_stage",
+        "kill_switch", "mdd_active", "daily_pnl_krw", "peak_value",
+    ]
+    try:
+        scores = get_all_scores()
+        dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows   = []
+        for code in ETF_UNIVERSE:
+            name   = ETF_UNIVERSE[code]["name"]
+            pos    = portfolio.get(code, {})
+            held   = code in portfolio
+            qty    = pos.get("qty", 0)
+            avg_p  = pos.get("avg_price", 0)
+            info   = get_price_info(code)
+            cur_p  = info.get("price", 0) if info else 0
+            if cur_p <= 0:
+                cached = _price_cache.get(code)
+                cur_p  = cached["price"] if cached else 0
+            pnl_pct = round((cur_p - avg_p) / avg_p * 100, 2) if avg_p > 0 and cur_p > 0 else ""
+            sc      = scores.get(code, {})
+            rows.append({
+                "dt":            dt_str,
+                "code":          code,
+                "name":          name,
+                "held":          "Y" if held else "N",
+                "qty":           qty,
+                "avg_price":     avg_p,
+                "cur_price":     cur_p,
+                "pnl_pct":       pnl_pct,
+                "score":         round(sc.get("score", 0), 2) if sc else "",
+                "ret5":          round(sc.get("ret5",  0), 2) if sc else "",
+                "ret20":         round(sc.get("ret20", 0), 2) if sc else "",
+                "defense_stage": defense_stage,
+                "kill_switch":   "Y" if kill_switch_active else "N",
+                "mdd_active":    "Y" if mdd_active else "N",
+                "daily_pnl_krw": daily_pnl_krw,
+                "peak_value":    round(peak_value, 0),
+            })
+        header = not os.path.exists(snap_path)
+        with open(snap_path, "a", encoding="utf-8") as f:
+            if header:
+                f.write(",".join(cols) + "\n")
+            for row in rows:
+                f.write(",".join(str(row.get(c, "")) for c in cols) + "\n")
+        cprint(f"[스냅샷] {snap_path} 기록 완료 ({len(rows)}종목)", Fore.CYAN)
+    except Exception as e:
+        cprint(f"[스냅샷 오류] {e}", Fore.YELLOW)
 
 
 def _log_trailing(code, trigger_type, entry_price, high_price, exit_price,
@@ -2190,6 +2360,12 @@ def check_rebalance_schedule():
     if not (now.hour == 9 and 15 <= now.minute <= 30):
         return
 
+    # 스코어 계산 및 로그 기록 (매주 월요일 9:15~9:30)
+    if today.weekday() == 0:
+        scores = get_all_scores()
+        if scores:
+            _log_scores(scores, trigger="weekly_check")
+
     # 월 1회 전체 교체: 이달 첫 번째 월요일
     if today.weekday() == 0 and today.day <= 7:
         if _last_monthly_rebal != today:
@@ -2351,13 +2527,26 @@ def main():
     last_schedule     = 0.0
     last_defense_chk  = 0.0
     last_token_check  = time.time()
-    monitor_interval  = 120   # 포지션 모니터링 2분마다
-    defense_interval  = 300   # 대피 체크 5분마다
+    last_status_write = 0.0
+    last_snapshot_day = None   # 장마감 스냅샷 날짜 (하루 1회)
+    monitor_interval  = 120
+    defense_interval  = 300
 
     while True:
         try:
             now_ts = time.time()
             now_dt = datetime.now()
+
+            # 상태 파일 기록 (60초마다)
+            if now_ts - last_status_write >= 60:
+                _write_sector_status()
+                last_status_write = now_ts
+
+            # 장마감 스냅샷 (평일 15:35 이후 하루 1회)
+            if (now_dt.weekday() < 5 and now_dt.hour == 15 and now_dt.minute >= 35
+                    and last_snapshot_day != now_dt.date()):
+                last_snapshot_day = now_dt.date()
+                threading.Thread(target=_log_daily_snapshot, daemon=True).start()
 
             # 토큰 갱신 (10시간마다)
             if now_ts - last_token_check > 36_000:

@@ -219,6 +219,7 @@ def send_msg(text, level="normal", source="매니저", force=False, keyboard=Non
 # ── Reply Keyboard & 상단 고정 메시지 ────────────────────────
 _mgr_pinned_msg_id      = 0
 _mgr_pinned_last_update = 0.0
+_mgr_pinned_last_text   = ""   # 마지막 전송 텍스트 (변경 감지용)
 MGR_PINNED_INTERVAL     = 60  # 60초마다 자동 갱신
 
 MGR_REPLY_KEYBOARD = {
@@ -284,7 +285,7 @@ def _read_bot_status(filename):
 
 
 def _build_mgr_pinned_text() -> str:
-    """매니저 고정 메시지 수치 텍스트."""
+    """매니저 고정 메시지 — 내용 변경시만 edit."""
     with _state_lock:
         states = dict(_worker_states)
     lines = [
@@ -294,23 +295,53 @@ def _build_mgr_pinned_text() -> str:
         f"━━━━━━━━━━━━━━",
     ]
 
-    # 멀티코인 상태 파일에서 슬롯/보유 정보 읽기
+    # ── 멀티코인봇 ──────────────────────────────────────────────
     mc_status = _read_bot_status("status_multicoin.json")
     if mc_status:
-        slots     = mc_status.get("slots", [])
-        pnl_mc    = mc_status.get("pnl_today", 0)
-        hold_icon = "📦" if slots else "⏳"
-        slot_str  = f"[{', '.join(m.replace('KRW-','') for m in slots)}]" if slots else "대기중"
-        lines.append(f"{hold_icon} MULTI-COIN: {pnl_mc:+,}원  {slot_str}")
+        holding_slots = mc_status.get("slots", [])
+        pnl_realized  = mc_status.get("pnl_today", 0)
+        pnl_total     = mc_status.get("pnl_total", pnl_realized)
+        unrealized    = mc_status.get("unrealized", 0)
+        hold_icon = "📦" if holding_slots else "⏳"
+        hold_str  = ", ".join(m.replace("KRW-", "") for m in holding_slots) if holding_slots else "대기중"
+        near_count = mc_status.get("near_count", None)
+        near_str   = f"  근접{near_count}개" if near_count else ""
+        unr_str    = f" (미실현{unrealized:+,.0f})" if unrealized != 0 else ""
+        lines.append(f"{hold_icon} 멀티코인: {pnl_total:+,.0f}원{unr_str}  {hold_str}{near_str}")
     else:
-        for wid, st in states.items():
-            if wid == "MULTI-COIN":
-                hold_s = "📦" if st.get("holding") else "⏳"
-                lines.append(f"{hold_s} {wid}: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
+        st = states.get("MULTI-COIN", {})
+        hold_icon = "📦" if st.get("holding") else "⏳"
+        lines.append(f"{hold_icon} 멀티코인: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
 
-    # 주식봇 등 나머지
+    # ── 섹터봇 ─────────────────────────────────────────────────
+    sector_status = _read_bot_status("status_sector.json")
+    if sector_status:
+        pnl_realized = sector_status.get("pnl_today", 0)
+        pnl_total    = sector_status.get("pnl_total", pnl_realized)
+        unrealized   = sector_status.get("unrealized", 0)
+        holdings     = sector_status.get("holdings", [])
+        hold_icon    = "📦" if holdings else "⏳"
+        unr_str      = f" (미실현{unrealized:+,.0f})" if unrealized != 0 else ""
+        lines.append(f"{hold_icon} 섹터봇: {pnl_total:+,.0f}원{unr_str}")
+        for h in holdings:
+            name  = h.get("name", "?")
+            avg_p = h.get("avg_price", 0)
+            cur_p = h.get("cur_price", 0)
+            qty   = h.get("qty", 0)
+            if avg_p > 0 and cur_p > 0:
+                diff_pct = (cur_p - avg_p) / avg_p * 100
+                diff_krw = (cur_p - avg_p) * qty
+                lines.append(f"  {name}: {diff_pct:+.1f}% ({diff_krw:+,.0f}원)")
+            else:
+                lines.append(f"  {name}: {qty}주")
+    else:
+        st = states.get("KIS-STOCK", {})
+        hold_icon = "📦" if st.get("holding") else "⏳"
+        lines.append(f"{hold_icon} 섹터봇: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
+
+    # ── 나머지 워커 (인버스 등) ──────────────────────────────────
     for wid, st in states.items():
-        if wid == "MULTI-COIN":
+        if wid in ("MULTI-COIN", "KIS-STOCK"):
             continue
         hold_s = "📦" if st.get("holding") else "⏳"
         lines.append(f"{hold_s} {wid}: {st.get('pnl_today', 0):+,}원 ({st.get('trades', 0)}회)")
@@ -340,25 +371,33 @@ def init_mgr_pinned_message():
 def notify_pinned_update():
     """상태 변동 시 호출 — 고정 메시지 즉시 갱신."""
     global _mgr_pinned_last_update
-    _mgr_pinned_last_update = 0.0  # 강제 갱신 트리거
+    _mgr_pinned_last_update = 0.0
     update_mgr_pinned_message()
 
 def update_mgr_pinned_message():
-    global _mgr_pinned_msg_id, _mgr_pinned_last_update
-    if not _mgr_pinned_msg_id:
-        return
+    global _mgr_pinned_msg_id, _mgr_pinned_last_update, _mgr_pinned_last_text
     now = time.time()
     if now - _mgr_pinned_last_update < MGR_PINNED_INTERVAL:
         return
     _mgr_pinned_last_update = now
-    res = _tg_api("editMessageText", chat_id=CHAT_ID,
-                  message_id=_mgr_pinned_msg_id, text=_build_mgr_pinned_text())
-    if not res.get("ok"):
-        _mgr_pinned_msg_id = 0
-        # TickerWatcher 비활성 (멀티코인봇으로 대체)
-    pass
 
-    init_mgr_pinned_message()
+    # msg_id 없으면 재생성
+    if not _mgr_pinned_msg_id:
+        init_mgr_pinned_message()
+        return
+
+    new_text = _build_mgr_pinned_text()
+    if new_text == _mgr_pinned_last_text:
+        return
+    _mgr_pinned_last_text = new_text
+    res = _tg_api("editMessageText", chat_id=CHAT_ID,
+                  message_id=_mgr_pinned_msg_id, text=new_text)
+    if not res.get("ok"):
+        err = res.get("description", "")
+        if "not modified" in err.lower():
+            return
+        cprint(f"[pinned edit 실패] {err}", Fore.YELLOW)
+        _mgr_pinned_msg_id = 0
 
 
 # ── 텔레그램 인라인 키보드 ─────────────────────────────────────
@@ -611,6 +650,54 @@ def check_daily_reset():
             for st in _worker_states.values():
                 st["pnl_today"] = 0
         cprint("🔄 일간 손익 초기화", Fore.CYAN)
+
+
+_last_pnl_sync_ts = 0.0
+
+def sync_pnl_from_status():
+    """각 봇의 status 파일에서 실현+미실현 통합 손익을 읽어 daily_total_pnl 갱신.
+    60초마다 호출."""
+    global daily_total_pnl, weekly_total_pnl, _last_pnl_sync_ts, _global_stop
+    now = time.time()
+    if now - _last_pnl_sync_ts < 60:
+        return
+    _last_pnl_sync_ts = now
+
+    total = 0.0
+    # 멀티코인봇
+    mc = _read_bot_status("status_multicoin.json")
+    if mc:
+        mc_pnl = mc.get("pnl_total", mc.get("pnl_today", 0))
+        total += mc_pnl
+        with _state_lock:
+            if "MULTI-COIN" in _worker_states:
+                _worker_states["MULTI-COIN"]["pnl_today"] = mc_pnl
+
+    # 섹터봇
+    sc = _read_bot_status("status_sector.json")
+    if sc:
+        sc_pnl = sc.get("pnl_total", sc.get("pnl_today", 0))
+        total += sc_pnl
+        with _state_lock:
+            if "KIS-STOCK" in _worker_states:
+                _worker_states["KIS-STOCK"]["pnl_today"] = sc_pnl
+
+    prev_daily      = daily_total_pnl
+    daily_total_pnl = total
+
+    # 주간 손익: 일간 변화분만큼 누적 (미실현 포함이므로 절대값 교체가 맞음)
+    # 단순하게 daily 기준으로 교체 — 주간 리셋은 check_weekly_reset()에서 처리
+    weekly_total_pnl = weekly_total_pnl + (total - prev_daily)
+
+    # 일간 손실 한도 체크
+    if daily_total_pnl <= TOTAL_DAILY_LOSS and not _global_stop:
+        _global_stop = True
+        send_msg(
+            f"🚨 전체 일일 손실 한도 초과!\n"
+            f"손실: {daily_total_pnl:+,.0f}원 / 한도: {TOTAL_DAILY_LOSS:,}원\n"
+            f"→ 모든 봇 신규 매수 정지",
+            level="critical", source="매니저", force=True
+        )
 
 
 def check_weekly_reset():
@@ -2356,9 +2443,6 @@ def _poll_ipc_results():
 # ============================================================
 # [9] 하트비트
 # ============================================================
-_last_heartbeat_hour = -1
-
-
 _bot_crash_alerted: dict = {}   # {worker_id: last_alert_ts}
 
 def _check_bot_health():
@@ -2368,26 +2452,64 @@ def _check_bot_health():
         wid = w.worker_id
         proc_alive = w.process and w.process.poll() is None
         thread_alive = w.thread and w.thread.is_alive()
-
         if not proc_alive and thread_alive:
-            # 프로세스는 죽었지만 감시 스레드는 살아있음 (재시작 중일 수 있음)
             last = _bot_crash_alerted.get(wid, 0)
-            if now - last > 180:   # 3분에 한 번만 알림
+            if now - last > 180:
                 _bot_crash_alerted[wid] = now
                 label = f"🪙{w.market}" if isinstance(w, CoinWorker) else "📈주식봇"
                 send_msg(
-                    f"⚠️ {label} 프로세스 크래시 감지\n"
-                    f"감시 스레드가 자동 재시작 시도 중...",
+                    f"⚠️ {label} 프로세스 크래시 감지\n감시 스레드가 자동 재시작 시도 중...",
                     level="critical", source="매니저", force=True
                 )
         elif proc_alive:
-            # 정상 → 알림 초기화
             _bot_crash_alerted.pop(wid, None)
 
 
+_last_heartbeat_hour  = -1
+_last_close_report_day = None   # 장마감 보고 날짜 (하루 1회)
+
+
+def _send_sector_close_report():
+    """평일 15:30 장마감 섹터봇 상세 보고."""
+    workers_snap = list(_workers)
+    stock_workers = [w for w in workers_snap if isinstance(w, StockWorker)]
+    if not stock_workers:
+        return
+    import uuid as _uuid
+    # status
+    req_id = _uuid.uuid4().hex[:8]
+    _send_ipc_cmd("stock", "/status", req_id=req_id)
+    status_result = _read_ipc_result("stock", timeout=8.0, req_id=req_id)
+    # portfolio
+    req_id2 = _uuid.uuid4().hex[:8]
+    _send_ipc_cmd("stock", "/portfolio", req_id=req_id2)
+    port_result = _read_ipc_result("stock", timeout=8.0, req_id=req_id2)
+    # scores
+    req_id3 = _uuid.uuid4().hex[:8]
+    _send_ipc_cmd("stock", "/scores", req_id=req_id3)
+    score_result = _read_ipc_result("stock", timeout=10.0, req_id=req_id3)
+
+    lines = [f"📊 장마감 섹터봇 보고 [{datetime.now().strftime('%m/%d %H:%M')}]",
+             "━━━━━━━━━━━━━━━━━━━━"]
+    for r in [status_result, port_result, score_result]:
+        if r:
+            clean = r.replace("[critical] ","").replace("[normal] ","").replace("[silent] ","")
+            lines.append(clean)
+            lines.append("─────────────────")
+    send_msg("\n".join(lines), level="normal", source="매니저", force=True)
+
+
 def check_heartbeat():
-    global _last_heartbeat_hour
+    global _last_heartbeat_hour, _last_close_report_day
     now = datetime.now()
+
+    # 평일 15:30 장마감 보고 (하루 1회)
+    if (now.weekday() < 5 and now.hour == 15 and now.minute >= 30
+            and _last_close_report_day != now.date()):
+        _last_close_report_day = now.date()
+        threading.Thread(target=_send_sector_close_report, daemon=True).start()
+
+    # 일반 하트비트
     if now.hour != _last_heartbeat_hour and now.hour in [9, 12, 18, 21]:
         _last_heartbeat_hour = now.hour
         if HEARTBEAT_ALERT:
@@ -2947,12 +3069,25 @@ def run_manager():
     init_mgr_pinned_message()
     setup_manager_reply_keyboard()   # 키보드는 마지막에
 
+    bot_names = []
+    for w in list(_workers):
+        if isinstance(w, MultiCoinWorker):
+            bot_names.append("🪙 멀티코인봇")
+        elif isinstance(w, StockWorker):
+            bot_names.append("📊 섹터봇")
+        elif isinstance(w, InverseWorker):
+            bot_names.append("📉 인버스봇")
+        elif isinstance(w, CoinWorker):
+            bot_names.append(f"🪙 {w.market}")
+
     send_msg(
         f"🚀 통합 매니저 v{MANAGER_VERSION} 시작!\n"
-        f"실행 봇: {len(_workers)}개\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"실행 봇 ({len(_workers)}개):\n" +
+        "\n".join(f"  {n}" for n in bot_names) +
+        f"\n─────────────────\n"
         f"전체 예산: {TOTAL_BUDGET:,}원\n"
-        f"일간 손실 한도: {TOTAL_DAILY_LOSS:,}원\n"
-        f"버튼 메뉴가 하단에 고정됐습니다 👇",
+        f"일간 손실 한도: {TOTAL_DAILY_LOSS:,}원",
         level="critical", source="매니저", force=True
     )
 
@@ -2961,6 +3096,7 @@ def run_manager():
         while True:
             check_daily_reset()
             check_weekly_reset()
+            sync_pnl_from_status()
             check_heartbeat()
             poll_telegram()
             _poll_ipc_results()

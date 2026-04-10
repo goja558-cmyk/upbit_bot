@@ -1211,12 +1211,46 @@ def _write_status():
     try:
         with slots_lock:
             holding = list(slots)
+
+        # 실현 손익 + 미실현 손익 합산
+        unrealized = 0.0
+        for m in holding:
+            c = coins.get(m, {})
+            buy_p = c.get("buy_price", 0)
+            qty   = c.get("filled_qty", 0)
+            h     = list(c.get("history", []))
+            cur_p = h[-1] if h else 0
+            if buy_p > 0 and qty > 0 and cur_p > 0:
+                unrealized += (cur_p - buy_p) * qty
+        pnl_total = daily_pnl + unrealized
+
+        # 근접 종목 수 계산 (check_buy_score score > 0인 종목)
+        near_count = 0
+        try:
+            with coins_lock:
+                snap = dict(coins)
+            held_set = set(holding)
+            for m, c in snap.items():
+                if m in held_set: continue
+                h = list(c.get("history", []))
+                if not h: continue
+                vol_h = list(c.get("vol_history", []))
+                vol = vol_h[-1] if vol_h else 0
+                ok, score = check_buy_score(m, h[-1], vol, 0)
+                if score > 0:
+                    near_count += 1
+        except Exception:
+            pass
+
         data = {
-            "holding":   len(holding) > 0,
-            "pnl_today": daily_pnl,
-            "trades":    sum(coins.get(m, {}).get("trade_count", 0) for m in coins),
-            "slots":     holding,
-            "ts":        time.time(),
+            "holding":    len(holding) > 0,
+            "pnl_today":  daily_pnl,       # 실현 손익
+            "pnl_total":  pnl_total,        # 실현 + 미실현
+            "unrealized": unrealized,
+            "trades":     sum(coins.get(m, {}).get("trade_count", 0) for m in coins),
+            "slots":      holding,
+            "near_count": near_count,
+            "ts":         time.time(),
         }
         path = os.path.join(SHARED_DIR, "status_multicoin.json")
         tmp  = path + ".tmp"
@@ -1246,7 +1280,7 @@ def handle_ipc():
         cprint(f"[IPC 처리 오류] {e}", Fore.YELLOW)
 
 def handle_command(text, req_id=""):
-    global _IPC_REQ_ID
+    global _IPC_REQ_ID, _trading_paused
     _IPC_REQ_ID = req_id
     cmd = text.strip().split()
     if not cmd: return
@@ -1261,7 +1295,8 @@ def handle_command(text, req_id=""):
         slot_str = f"{len(holding)}/{MAX_SLOTS+TREND_SLOTS}" + (f" (역추세{pri_slots+sec_slots}+추세{TREND_SLOTS})" if sec_slots > 0 else f" (역추세{pri_slots}+추세{TREND_SLOTS})")
         lines = [f"📊 멀티코인봇 상태", f"━━━━━━━━━━━━━━━━━━━━",
                  f"캔들: {CANDLE_INTERVAL}분봉  장세: {regime_kor}",
-                 f"슬롯: {slot_str}  손익: {daily_pnl:+,.0f}원"]
+                 f"슬롯: {slot_str}  손익: {daily_pnl:+,.0f}원",
+                 f"매수: {'⏹ 정지중' if _trading_paused else '🟢 활성'}"]
         import time as _t
         for m in holding:
             c = coins.get(m, {})
@@ -1276,14 +1311,15 @@ def handle_command(text, req_id=""):
         _write_ipc_result("\n".join(lines), req_id)
 
     elif cmd[0] in ("/start", "/시작"):
-        for m in list(coins.keys()):
-            coins[m]["running"] = True
-        _write_ipc_result("✅ 매매 시작", req_id)
+        _trading_paused = False
+        _write_ipc_result("✅ 매매 재개 — 신규 매수 활성화", req_id)
 
     elif cmd[0] in ("/stop", "/정지"):
-        for m in list(coins.keys()):
-            coins[m]["running"] = False
-        _write_ipc_result("⏹ 매매 정지", req_id)
+        _trading_paused = True
+        with slots_lock:
+            holding = list(slots)
+        hold_str = f"\n보유 중: {', '.join(m.replace('KRW-','') for m in holding)}" if holding else ""
+        _write_ipc_result(f"⏹ 매매 정지 — 신규 매수 중단 (매도는 계속){hold_str}", req_id)
 
     elif cmd[0] == "/slots":
         with slots_lock:
@@ -1672,6 +1708,31 @@ def handle_command(text, req_id=""):
             for m, s in near_list[:3]:
                 lines.append(f"  {m.replace('KRW-','')}: {s}점")
 
+        # 추세추종 후보 요약
+        with slots_lock:
+            held2 = set(slots)
+        trend_list = []
+        for m, c in snap.items():
+            if m in held2: continue
+            h2 = list(c.get("history", []))
+            if not h2: continue
+            p2 = h2[-1]
+            v2 = list(c.get("vol_history", []))[-1] if c.get("vol_history") else 0
+            ok2, sc2 = check_trend_signal(m, p2, v2)
+            if ok2:
+                trend_list.append((m, int(sc2)))
+        trend_list.sort(key=lambda x: x[1], reverse=True)
+        if trend_list:
+            lines.append("📈 추세후보")
+            for m, s in trend_list[:3]:
+                lines.append(f"  {m.replace('KRW-','')}: {s}점")
+        else:
+            lines.append("📈 추세후보: 없음")
+
+        # 매매 정지 상태 표시
+        if _trading_paused:
+            lines.append("⏹ 현재 매수 정지 중")
+
         send_msg("\n".join(lines))
     except Exception as e:
         cprint(f"[시간보고 오류] {e}", Fore.YELLOW)
@@ -1697,7 +1758,8 @@ def prefill(market):
 # ============================================================
 # [14] 메인 루프
 # ============================================================
-_running = True
+_running        = True
+_trading_paused = False   # /stop 으로 매수 일시정지 (매도는 계속)
 
 def run_bot():
     global _running, daily_pnl, _last_reset_day
@@ -1786,6 +1848,9 @@ def run_bot():
             with slots_lock:
                 slot_cnt = len(slots)
             if slot_cnt >= MAX_SLOTS:
+                continue
+
+            if _trading_paused:
                 continue
 
             signals = []
