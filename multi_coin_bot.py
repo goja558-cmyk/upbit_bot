@@ -102,6 +102,25 @@ _last_adjust_ts    = 0.0                 # 마지막 조정 시각
 _adjust_cooldown   = 6 * 3600           # 조정 후 쿨다운 (6시간)
 _recent_trades_ts  = []                  # 최근 거래 시각 목록 (복구 판단용)
 VOL_RATIO_LOG_FILE = os.path.join(BASE_DIR, "vol_ratio_log.csv")
+
+def _log_trade(side, market, price, qty, pnl=0.0, reason="", buy_price=0.0):
+    """매수/매도 이벤트를 인디케이터 날짜별 파일에 기록."""
+    try:
+        path = _get_indicator_log_path()
+        row  = (
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},"
+            f"{market},{price:.4f},{datetime.now().hour},"
+            f",,,,,,,,,,"           # rsi~near_trigger 빈칸
+            f","                    # signal_score
+            f","                    # entry_possible
+            f"trade_{side.lower()},"  # log_type
+            f","                    # regime
+            f",,,0,"               # fwd_return_5m,10m,fwd_ts,fwd_filled
+            f"{qty:.6f},{int(pnl)},{buy_price:.4f},{reason}"
+        )
+        _write_indicator_row(path, row)
+    except Exception as e:
+        cprint(f"[매매로그 오류] {e}", Fore.YELLOW)
 _TRADE_STATE_FILE  = os.path.join(BASE_DIR, "vol_trade_state.json")
 
 
@@ -209,7 +228,8 @@ def _write_indicator_row(path, row):
                     "datetime,market,price,hour,rsi,drop_pct,vol_ratio,vol_pct,"
                     "h_ma20,h_ma60,d_ma20,d_ma60,near_trigger,signal_score,"
                     "entry_possible,log_type,regime,"
-                    "fwd_return_5m,fwd_return_10m,fwd_ts,fwd_filled\n"
+                    "fwd_return_5m,fwd_return_10m,fwd_ts,fwd_filled,"
+                    "qty,pnl_krw,buy_price,reason\n"
                 )
             f.write(row + "\n")
     except Exception as e:
@@ -612,8 +632,9 @@ _last_reset_day  = date.today()
 _last_reset_week = date.today().isocalendar()[:2]
 _last_reset_month= (date.today().year, date.today().month)
 
-# 미체결 주문 재확인 큐 {uuid: {market, order_krw, reason, ts}}
+# 미체결 주문 재확인 큐 {uuid: {market, order_krw, reason, ts, side}}
 _pending_orders: dict = {}
+_pending_sells:  dict = {}   # {uuid: {market, qty, buy_price, reason, ts}}
 
 # 파라미터 프로파일 — 1시간봉 + 복합 점수제 기준
 COIN_PROFILES = {
@@ -760,6 +781,7 @@ def do_buy(market, price, reason):
 
     target_p = avg_p * (1 + c["target"] / 100)
     stop_p   = avg_p * (1 + c["max_loss"] / 100)
+    _log_trade("BUY", market, avg_p, filled, reason=reason)
     send_msg(
         f"🛒 매수 완료!\n"
         f"매수가: {avg_p:,.2f}원  수량: {filled:.6f}\n"
@@ -774,9 +796,27 @@ def do_sell(market, price, reason):
     c = get_or_create_coin(market)
     if not c["has_stock"]: return False
 
-    (filled, avg_p), _ = send_order("SELL", market, c["filled_qty"])
+    buy_price_snapshot = c["buy_price"]
+    filled_qty_snapshot = c["filled_qty"]
+
+    (filled, avg_p), order_uuid = send_order("SELL", market, filled_qty_snapshot)
     if filled <= 0:
-        send_msg(f"🚨 매도 실패! 직접 매도하세요.\n이유: {reason}", market=market, level="critical")
+        if order_uuid:
+            # uuid 있으면 재확인 큐에 등록
+            _pending_sells[order_uuid] = {
+                "market":    market,
+                "qty":       filled_qty_snapshot,
+                "buy_price": buy_price_snapshot,
+                "reason":    reason,
+                "ts":        time.time(),
+            }
+            send_msg(
+                f"⚠️ {market} 매도 체결 미확인 — 자동 재확인 중\n"
+                f"(10분 내 체결되면 자동 처리)",
+                market=market, level="critical"
+            )
+        else:
+            send_msg(f"🚨 매도 실패! 직접 매도하세요.\n이유: {reason}", market=market, level="critical")
         return False
 
     actual = avg_p if avg_p > 0 else price
@@ -798,6 +838,7 @@ def do_sell(market, price, reason):
     _recent_trades_ts.append(time.time())
     _recent_trades_ts = [t for t in _recent_trades_ts if time.time() - t <= 6 * 3600]
     _save_trade_state()   # 재시작 후 복원용
+    _log_trade("SELL", market, actual, filled, pnl=pnl, reason=reason, buy_price=c["buy_price"])
     c.update({"has_stock": False, "buy_price": 0.0, "filled_qty": 0.0,
                "be_active": False, "highest_profit": 0.0, "buy_time": 0.0})
 
@@ -820,8 +861,14 @@ def check_sell(market, price):
     c = coins.get(market)
     if not c or not c["has_stock"]: return
 
-    buy_p  = c["buy_price"]
-    qty    = c["filled_qty"]
+    buy_p = c["buy_price"]
+    qty   = c["filled_qty"]
+
+    # 매수가 0이면 매도 판단 불가 — 자동 싱크가 복구할 때까지 대기
+    if buy_p <= 0:
+        cprint(f"[check_sell] {market} buy_price=0 — 싱크 대기", Fore.YELLOW)
+        return
+
     pnl_pct = (price - buy_p) / buy_p * 100
 
     # 트레일링 스탑
@@ -830,10 +877,11 @@ def check_sell(market, price):
     trail_trigger = c["highest_profit"] >= c["trail_start"]
     trail_stop    = c["highest_profit"] - c["trail_gap"]
 
-    # 본절 보호
+    # 본절 보호 — 수수료(매수0.05%+매도0.05%) 감안해서 +0.15% 이상일 때 활성화
+    FEE_BUFFER = FEE_RATE * 2 * 100 + 0.05   # 약 0.15%
     if pnl_pct >= c["be_trigger"]:
         c["be_active"] = True
-    be_stop = pnl_pct <= 0 and c["be_active"]
+    be_stop = pnl_pct <= FEE_BUFFER and c["be_active"]
 
     # 익절
     if pnl_pct >= c["target"]:
@@ -1282,15 +1330,15 @@ def get_watch_markets():
 # [11] 상태 IPC 전송
 # ============================================================
 def _check_pending_orders():
-    """매수 실패로 등록된 미체결 주문을 주기적으로 재확인해서 자동 복구."""
-    if not _pending_orders:
-        return
+    """미체결 매수/매도 주문을 주기적으로 재확인해서 자동 복구."""
+    global daily_pnl, weekly_pnl, monthly_pnl, total_pnl
     now = time.time()
+
+    # ── 매수 재확인 ─────────────────────────────────────────────
     to_del = []
     for order_uuid, info in list(_pending_orders.items()):
-        # 10분 이상 지나면 포기
         if now - info["ts"] > 600:
-            cprint(f"[미체결 포기] {info['market']} uuid={order_uuid}", Fore.YELLOW)
+            cprint(f"[매수 미체결 포기] {info['market']} uuid={order_uuid}", Fore.YELLOW)
             to_del.append(order_uuid)
             continue
         try:
@@ -1307,31 +1355,169 @@ def _check_pending_orders():
             if state in ("done", "cancel") and filled > 0 and avg_p > 0:
                 market = info["market"]
                 c = get_or_create_coin(market)
-                if not c["has_stock"]:
-                    c.update({
-                        "has_stock": True, "buy_price": avg_p,
-                        "filled_qty": filled, "be_active": False,
-                        "highest_profit": 0.0, "buy_time": now,
-                    })
-                    with slots_lock:
-                        slots.add(market)
-                    target_p = avg_p * (1 + c["target"] / 100)
-                    stop_p   = avg_p * (1 + c["max_loss"] / 100)
-                    send_msg(
-                        f"✅ {market} 미체결 주문 자동 복구!\n"
-                        f"매수가: {avg_p:,.2f}원  수량: {filled:.6f}\n"
-                        f"목표가: {target_p:,.2f}원  손절가: {stop_p:,.2f}원",
-                        market=market, level="critical"
-                    )
-                    _write_status()
+                prev_price = c.get("buy_price", 0)
+                c.update({
+                    "has_stock":      True,
+                    "buy_price":      avg_p,
+                    "filled_qty":     filled,
+                    "be_active":      False,
+                    "highest_profit": 0.0,
+                    "buy_time":       c.get("buy_time") or now,
+                })
+                with slots_lock:
+                    slots.add(market)
+                target_p = avg_p * (1 + c["target"] / 100)
+                stop_p   = avg_p * (1 + c["max_loss"] / 100)
+                cprint(f"[매수복구] {market} {filled:.6f}개 @ {avg_p:,.2f}원", Fore.GREEN)
+                send_msg(
+                    f"✅ {market} 매수 체결 확인!\n"
+                    f"매수가: {avg_p:,.2f}원  수량: {filled:.6f}\n"
+                    f"목표가: {target_p:,.2f}원  손절가: {stop_p:,.2f}원",
+                    market=market, level="critical"
+                )
+                _log_trade("BUY", market, avg_p, filled, reason=info.get("reason", "auto"))
+                _write_status()
                 to_del.append(order_uuid)
             elif state == "cancel" and filled == 0:
-                cprint(f"[미체결 취소확인] {info['market']} uuid={order_uuid}", Fore.YELLOW)
                 to_del.append(order_uuid)
         except Exception as e:
-            cprint(f"[미체결 재확인 오류] {e}", Fore.YELLOW)
+            cprint(f"[매수 재확인 오류] {e}", Fore.YELLOW)
     for uid in to_del:
         _pending_orders.pop(uid, None)
+
+    # ── 매도 재확인 ─────────────────────────────────────────────
+    to_del_s = []
+    for order_uuid, info in list(_pending_sells.items()):
+        if now - info["ts"] > 600:
+            cprint(f"[매도 미체결 포기] {info['market']} uuid={order_uuid}", Fore.YELLOW)
+            send_msg(
+                f"🚨 {info['market']} 매도 10분 초과 — 직접 확인 필요",
+                market=info["market"], level="critical"
+            )
+            to_del_s.append(order_uuid)
+            continue
+        try:
+            h = _upbit_headers()
+            r = requests.get(f"{UPBIT_BASE}/order", headers=h,
+                             params={"uuid": order_uuid}, timeout=5)
+            if r.status_code != 200:
+                continue
+            d      = r.json()
+            state  = d.get("state")
+            filled = float(d.get("executed_volume", 0))
+            funds  = float(d.get("executed_funds", 0))
+            avg_p  = funds / filled if filled > 0 else 0
+            if state in ("done", "cancel") and filled > 0:
+                market    = info["market"]
+                buy_price = info["buy_price"]
+                qty       = info["qty"]
+                actual    = avg_p if avg_p > 0 else 0
+                fee       = (buy_price * qty + actual * filled) * FEE_RATE if actual > 0 else 0
+                pnl       = (actual - buy_price) * filled - fee if actual > 0 else 0
+                daily_pnl   += pnl
+                weekly_pnl  += pnl
+                monthly_pnl += pnl
+                total_pnl   += pnl
+                c = coins.get(market, {})
+                if c:
+                    c["daily_pnl"]      = c.get("daily_pnl", 0) + pnl
+                    c["trade_count"]    = c.get("trade_count", 0) + 1
+                    c["last_sell_time"] = now
+                    c.update({"has_stock": False, "buy_price": 0.0, "filled_qty": 0.0,
+                               "be_active": False, "highest_profit": 0.0, "buy_time": 0.0})
+                with slots_lock:
+                    slots.discard(market)
+                _save_pnl_state()
+                _log_trade("SELL", market, actual, filled, pnl=pnl,
+                           reason=info.get("reason", "auto"), buy_price=buy_price)
+                cprint(f"[매도복구] {market} {filled:.6f}개 @ {actual:,.2f}원 pnl={pnl:+,.0f}", Fore.GREEN)
+                send_msg(
+                    f"{'🟢 익절' if pnl >= 0 else '🔴 손절'} {market} 매도 체결 확인!\n"
+                    f"매도가: {actual:,.2f}원\n"
+                    f"이번 손익: {pnl:+,.0f}원\n"
+                    f"이유: {info.get('reason', '')}",
+                    market=market, level="critical"
+                )
+                _write_status()
+                to_del_s.append(order_uuid)
+        except Exception as e:
+            cprint(f"[매도 재확인 오류] {e}", Fore.YELLOW)
+    for uid in to_del_s:
+        _pending_sells.pop(uid, None)
+
+
+_last_balance_check_ts = 0.0
+_BALANCE_CHECK_INTERVAL = 300   # 5분마다 잔고 폴링
+
+def _auto_sync_holdings():
+    """5분마다 업비트 실제 잔고를 폴링해서 봇이 모르는 보유 코인 자동 등록.
+    uuid 추적 실패, confirm_order 타임아웃 등 모든 케이스를 커버."""
+    global _last_balance_check_ts
+    now = time.time()
+    if now - _last_balance_check_ts < _BALANCE_CHECK_INTERVAL:
+        return
+    _last_balance_check_ts = now
+    try:
+        h = _upbit_headers()
+        r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=5)
+        if r.status_code != 200:
+            return
+        accounts = r.json()
+        with slots_lock:
+            current_slots = set(slots)
+
+        for a in accounts:
+            currency = a.get("currency", "")
+            if currency == "KRW":
+                continue
+            market  = f"KRW-{currency}"
+            balance = float(a.get("balance", 0))
+            avg_buy = float(a.get("avg_buy_price", 0))
+
+            # 먼지 수량 필터
+            if avg_buy <= 0 or balance * avg_buy < MIN_ORDER_KRW / 4:
+                continue
+
+            # pending_orders에 있는 종목은 uuid 조회가 더 정확하므로 건너뜀
+            pending_markets = {info["market"] for info in _pending_orders.values()}
+            if market in pending_markets:
+                continue
+
+            # 봇이 모르거나 매수가가 0인 보유 코인 발견 시 등록/수정
+            c = get_or_create_coin(market)
+            # has_stock 여부, buy_price 값과 무관하게 항상 최신 잔고로 동기화
+            prev_price = c.get("buy_price", 0)
+            c["has_stock"]      = True
+            c["buy_price"]      = avg_buy
+            c["filled_qty"]     = balance
+            c["be_active"]      = c.get("be_active", False)
+            c["highest_profit"] = c.get("highest_profit", 0.0)
+            c["buy_time"]       = c.get("buy_time") or now
+            with slots_lock:
+                slots.add(market)
+
+            # 매수가가 새로 등록되거나 0에서 정상화된 경우만 알림
+            if prev_price <= 0 and avg_buy > 0:
+                target_p = avg_buy * (1 + c["target"] / 100)
+                stop_p   = avg_buy * (1 + c["max_loss"] / 100)
+                cprint(f"[자동싱크] {market} {balance:.6f}개 @ {avg_buy:,.0f}원 등록/수정", Fore.GREEN)
+                send_msg(
+                    f"🔄 {market} 자동 싱크\n"
+                    f"매수가: {avg_buy:,.0f}원  수량: {balance:.6f}\n"
+                    f"목표가: {target_p:,.0f}원  손절가: {stop_p:,.0f}원",
+                    market=market, level="critical"
+                )
+            _write_status()
+
+        # pending_orders 중 이미 잔고에 반영된 것 정리
+        synced = {f"KRW-{a.get('currency')}" for a in accounts
+                  if float(a.get("balance", 0)) * float(a.get("avg_buy_price", 0)) >= MIN_ORDER_KRW / 4}
+        for uid in list(_pending_orders.keys()):
+            if _pending_orders[uid]["market"] in synced:
+                _pending_orders.pop(uid, None)
+
+    except Exception as e:
+        cprint(f"[자동싱크 오류] {e}", Fore.YELLOW)
 
 
 def _write_status():
@@ -1439,9 +1625,15 @@ def handle_command(text, req_id=""):
         for m in holding:
             c = coins.get(m, {})
             buy_p = c.get("buy_price", 0)
-            h = list(c.get("history", [0]))
+            h = list(c.get("history", []))
             cur = h[-1] if h else 0
-            pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p else 0
+            # history 없으면 현재가 직접 조회
+            if cur <= 0:
+                try:
+                    cur, _ = get_price_and_volume(m)
+                except Exception:
+                    cur = 0
+            pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p and cur else 0
             hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
             lines.append(f"📦 {m.replace('KRW-','')}: {pnl_pct:+.2f}% ({hold_h:.1f}h보유)")
         if not holding:
@@ -1850,9 +2042,14 @@ def _send_hourly_report():
             for m in holding:
                 c = coins.get(m, {})
                 buy_p = c.get("buy_price", 0)
-                h = list(c.get("history", [0]))
+                h = list(c.get("history", []))
                 cur = h[-1] if h else 0
-                pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p else 0
+                if cur <= 0:
+                    try:
+                        cur, _ = get_price_and_volume(m)
+                    except Exception:
+                        cur = 0
+                pnl_pct = (cur - buy_p) / buy_p * 100 if buy_p and cur else 0
                 hold_h = (_t.time() - c.get("buy_time", _t.time())) / 3600
                 tag = "추세" if c.get("is_trend") else ("보조" if c.get("is_secondary") else "기본")
                 lines.append(f"  {m.replace('KRW-','')}: {pnl_pct:+.2f}% ({hold_h:.1f}h, {tag})")
@@ -1940,6 +2137,9 @@ def run_bot():
     load_config()
     _load_trade_state()
     _load_pnl_state()
+    # 시작 직후 잔고 자동 싱크 (이전 미등록/매수가0 포지션 즉시 복구)
+    global _last_balance_check_ts
+    _last_balance_check_ts = 0.0
 
     if not JWT_OK:
         print("❌ PyJWT 없음. pip install PyJWT"); sys.exit(1)
@@ -1985,8 +2185,11 @@ def run_bot():
                 monthly_pnl = 0.0
                 _save_pnl_state()
 
-            # 미체결 주문 재확인 (매수 실패 후 자동 복구)
+            # 미체결 주문 재확인 (uuid 기반)
             _check_pending_orders()
+
+            # 잔고 자동 폴링 — 봇이 모르는 보유 코인 자동 등록 (5분마다)
+            _auto_sync_holdings()
 
             # 장세 감지 (1시간마다 자동 갱신)
             detect_market_regime()

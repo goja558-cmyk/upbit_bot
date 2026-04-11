@@ -155,6 +155,16 @@ _last_update_id  = 0
 _tg_lock         = threading.Lock()
 _defense_lock    = threading.Lock()   # 대피 단계 진입 중복 방지
 
+# ── /hold 수동 포지션 ─────────────────────────────────────
+# {code: {qty, avg_price, high_price, entry_date,
+#          sl_type, sl_val,          # 손절: "pct"/-5.0 or "price"/48000
+#          tp_type, tp_val,          # 익절: "trail"/"trail_be"/"pct"/"price"
+#          trail_start, trail_gap,   # 트레일링 시작%, 간격%
+#          be_pct, be_active,        # 본절 기준%, 활성화여부
+#          name}}
+hold_positions = {}
+_hold_session  = {}   # 등록 단계별 임시 저장
+
 # KIS 인증
 _access_token    = ""
 _token_expire    = 0.0
@@ -728,6 +738,45 @@ def send_msg(text, force=False):
             time.sleep(1)
 
 
+def send_msg_kb(text: str, keyboard: list = None, force: bool = False) -> int:
+    """인라인 키보드 포함 메시지 전송. keyboard=None 이면 send_msg 동일."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        cprint(f"[TG 미설정] {text[:80]}", Fore.YELLOW)
+        return 0
+    h = datetime.now().hour
+    if 2 <= h < 7 and not force:
+        return 0
+    tagged  = f"[{BOT_TAG}]\n{text}"
+    payload = {"chat_id": CHAT_ID, "text": tagged[:4000]}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    with _tg_lock:
+        for attempt in range(2):
+            try:
+                res = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json=payload, timeout=5,
+                )
+                if res.status_code == 200:
+                    return res.json().get("result", {}).get("message_id", 0)
+            except Exception as e:
+                cprint(f"[TG 오류] {e}", Fore.YELLOW)
+            time.sleep(1)
+    return 0
+
+
+def answer_callback(callback_query_id: str, text: str = ""):
+    """버튼 콜백 응답 — 스피너 제거"""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
 def poll_telegram():
     global _last_update_id
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -742,6 +791,17 @@ def poll_telegram():
             return
         for upd in res.json().get("result", []):
             _last_update_id = upd["update_id"]
+            # ── 인라인 버튼 콜백 처리 ──────────────────────
+            callback = upd.get("callback_query", {})
+            if callback:
+                cq_id   = callback.get("id", "")
+                cq_data = callback.get("data", "")
+                cq_chat = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+                if cq_chat == CHAT_ID and cq_data:
+                    answer_callback(cq_id)
+                    _handle_callback(cq_data)
+                continue
+            # ── 일반 텍스트 메시지 처리 ────────────────────
             msg  = upd.get("message", {})
             text = msg.get("text", "").strip()
             if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
@@ -756,6 +816,12 @@ def _handle_cmd(cmd):
     global kill_switch_active   # elif 블록 안 global은 Python 오류 — 최상단 선언 필수
     if not cmd:
         return
+
+    # /hold 세션 진행 중이면 숫자 입력을 세션으로 라우팅
+    if _hold_session.get("step") and not cmd[0].startswith("/"):
+        _hold_text_input(" ".join(cmd))
+        return
+
     c = cmd[0].lower()
 
     if c in ("/status", "/s", "/상태"):
@@ -842,9 +908,14 @@ def _handle_cmd(cmd):
             "/resume    — 복귀 (ETF 재매수)\n"
             "/kill      — 킬 스위치 ON\n"
             "/unkill    — 킬 스위치 OFF\n"
-            "/sync      — KIS 실제 잔고로 동기화",
+            "/sync      — KIS 실제 잔고로 동기화\n"
+            "/hold      — 수동 포지션 목록\n"
+            "/hold 코드 가격 수량 — 수동 포지션 등록",
             force=True,
         )
+
+    elif c == "/hold":
+        _cmd_hold(cmd)
 
 
 # ============================================================
@@ -1660,6 +1731,7 @@ def _log_trailing(code, trigger_type, entry_price, high_price, exit_price,
 def _save_state():
     data = {
         "portfolio":            portfolio,
+        "hold_positions":       hold_positions,
         "cooldown_list":        {k: str(v) for k, v in cooldown_list.items()},
         "kill_switch":          kill_switch_active,
         "mdd_active":           mdd_active,
@@ -1684,12 +1756,14 @@ def _load_state():
     global portfolio, cooldown_list, kill_switch_active, mdd_active
     global peak_value, initial_value, daily_pnl_krw, trade_count, last_reset_day
     global defense_stage, consecutive_down_days, inverse_peak_return, defense_down_date
+    global hold_positions
     if not os.path.exists(STATE_FILE):
         return
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         portfolio             = data.get("portfolio", {})
+        hold_positions        = data.get("hold_positions", {})
         raw_cd                = data.get("cooldown_list", {})
         cooldown_list         = {k: date.fromisoformat(v) for k, v in raw_cd.items()}
         kill_switch_active    = data.get("kill_switch", False)
@@ -2647,6 +2721,7 @@ def main():
                 if now_ts - last_monitor >= monitor_interval:
                     if not kill_switch_active and not mdd_active and defense_stage == "NORMAL":
                         monitor_positions()
+                    monitor_hold_positions()   # 수동 포지션은 항상 감시
                     if defense_stage != "NORMAL":
                         check_inverse_exit()
                     last_monitor = now_ts
@@ -2676,6 +2751,759 @@ def main():
             cprint(f"[메인 루프 오류] {e}", Fore.RED)
             traceback.print_exc()
             time.sleep(10)
+
+
+# ============================================================
+# [HOLD] 수동 포지션 관리 — /hold 명령어 기반 단계별 등록
+# ============================================================
+
+def _auto_params(price: float) -> dict:
+    """주가 구간별 자동 손/익절 파라미터"""
+    if price < 5_000:
+        return {"sl": -7.0, "trail_start": 5.0, "trail_gap": 3.0}
+    elif price < 20_000:
+        return {"sl": -5.0, "trail_start": 4.0, "trail_gap": 2.0}
+    elif price < 100_000:
+        return {"sl": -4.0, "trail_start": 3.0, "trail_gap": 1.5}
+    else:
+        return {"sl": -3.0, "trail_start": 2.5, "trail_gap": 1.2}
+
+
+def _get_stock_name(code: str) -> str:
+    """KIS API로 종목명 조회 — ETF 유니버스 우선, 실패 시 코드 반환"""
+    if code in ETF_UNIVERSE:
+        return ETF_UNIVERSE[code]["name"]
+    if code == KOFR_CODE:
+        return KOFR_NAME
+    h = kis_headers("FHKST01010100")
+    if not h:
+        return code
+    try:
+        res = api_call(
+            "get",
+            f"{_prod_url()}/uapi/domestic-stock/v1/quotations/inquire-price",
+            headers=h,
+            params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code},
+        )
+        name = res.get("output", {}).get("hts_kor_isnm", "").strip()
+        return name if name else code
+    except Exception:
+        return code
+
+
+# ── 단계별 플로우 ─────────────────────────────────────────
+
+def _hold_step1_ask_sl():
+    """1단계: 손절 방식 선택"""
+    avg  = _hold_session.get("avg_price", 0)
+    auto = _auto_params(avg)
+    send_msg_kb(
+        f"📌 손절 방식을 선택하세요\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"매수가: {avg:,.0f}원\n\n"
+        f"🤖 자동 → 주가구간 기준 자동 적용\n"
+        f"   ({avg:,.0f}원 기준: {auto['sl']:+.1f}%  →  {avg*(1+auto['sl']/100):,.0f}원)\n\n"
+        f"📉 비율 → 직접 % 입력\n"
+        f"💰 가격 → 특정 가격 지정",
+        keyboard=[
+            [
+                {"text": f"🤖 자동 ({auto['sl']:+.1f}%)", "callback_data": "hold_sl_auto"},
+                {"text": "📉 비율 (%)",                    "callback_data": "hold_sl_pct"},
+                {"text": "💰 가격 지정",                    "callback_data": "hold_sl_price"},
+            ],
+            [{"text": "❌ 취소", "callback_data": "hold_cancel"}],
+        ],
+        force=True,
+    )
+    _hold_session["step"] = "sl_type"
+
+
+def _hold_step2_ask_tp():
+    """2단계: 익절 방식 선택"""
+    avg  = _hold_session.get("avg_price", 0)
+    auto = _auto_params(avg)
+    sl_t = _hold_session.get("sl_type", "auto")
+    if sl_t == "auto":
+        sl_desc = f"자동 {auto['sl']:+.1f}% ({avg*(1+auto['sl']/100):,.0f}원)"
+    elif sl_t == "pct":
+        v = _hold_session.get("sl_val", 0)
+        sl_desc = f"{v:+.1f}% ({avg*(1+v/100):,.0f}원)"
+    else:
+        v = _hold_session.get("sl_val", 0)
+        sl_desc = f"{v:,.0f}원 ({(v-avg)/avg*100:+.1f}%)"
+
+    send_msg_kb(
+        f"📌 익절 방식을 선택하세요\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"손절: {sl_desc} ✅\n\n"
+        f"📈 트레일링 → 고점 추적 자동 매도\n"
+        f"   자동 기준: +{auto['trail_start']}% 후 고점-{auto['trail_gap']}%\n\n"
+        f"🎯 비율 → 수익 X%에 즉시 매도\n"
+        f"💰 가격 → 특정 가격에 즉시 매도\n"
+        f"🔀 트레일링+본절 → 트레일링 + 본전보호 함께",
+        keyboard=[
+            [
+                {"text": "📈 트레일링",      "callback_data": "hold_tp_trail"},
+                {"text": "🎯 비율 (%)",       "callback_data": "hold_tp_pct"},
+                {"text": "💰 가격 지정",       "callback_data": "hold_tp_price"},
+            ],
+            [
+                {"text": "🔀 트레일링+본절",  "callback_data": "hold_tp_trail_be"},
+                {"text": "❌ 취소",           "callback_data": "hold_cancel"},
+            ],
+        ],
+        force=True,
+    )
+    _hold_session["step"] = "tp_type"
+
+
+def _hold_step3_confirm():
+    """3단계: 최종 확인"""
+    s    = _hold_session
+    avg  = s.get("avg_price", 0)
+    qty  = s.get("qty", 0)
+    name = s.get("name", s.get("code", ""))
+    auto = _auto_params(avg)
+
+    # 손절 설명
+    sl_t = s.get("sl_type", "auto")
+    if sl_t == "auto":
+        sl_pct   = auto["sl"]
+        sl_price = avg * (1 + sl_pct / 100)
+        sl_desc  = f"자동 {sl_pct:+.1f}% → {sl_price:,.0f}원"
+    elif sl_t == "pct":
+        sl_pct   = s["sl_val"]
+        sl_price = avg * (1 + sl_pct / 100)
+        sl_desc  = f"{sl_pct:+.1f}% → {sl_price:,.0f}원"
+    else:
+        sl_price = s["sl_val"]
+        sl_pct   = (sl_price - avg) / avg * 100
+        sl_desc  = f"{sl_price:,.0f}원 ({sl_pct:+.1f}%)"
+
+    # 익절 설명
+    tp_t = s.get("tp_type", "trail")
+    ts   = s.get("trail_start", auto["trail_start"])
+    tg   = s.get("trail_gap",   auto["trail_gap"])
+    be   = s.get("be_pct", 0.0)
+    if tp_t == "trail":
+        tp_desc = f"트레일링: +{ts}% 후 고점-{tg}%"
+    elif tp_t == "trail_be":
+        tp_desc = f"트레일링: +{ts}% 후 고점-{tg}%\n본절보호: +{be}% 후 매수가 이하 즉시매도"
+    elif tp_t == "pct":
+        v = s.get("tp_val", 0)
+        tp_desc = f"익절 +{v}% → {avg*(1+v/100):,.0f}원"
+    else:
+        v = s.get("tp_val", 0)
+        tp_desc = f"익절 {v:,.0f}원 ({(v-avg)/avg*100:+.1f}%)"
+
+    send_msg_kb(
+        f"✅ 포지션 등록 확인\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"종목: {name} ({s.get('code','')})\n"
+        f"매수가: {avg:,.0f}원 / {qty}주\n"
+        f"투자금: {avg*qty:,.0f}원\n"
+        f"─────────────────\n"
+        f"손절: {sl_desc}\n"
+        f"익절: {tp_desc}\n"
+        f"─────────────────\n"
+        f"등록하면 봇이 자동으로 감시합니다.",
+        keyboard=[
+            [
+                {"text": "✅ 등록",  "callback_data": "hold_confirm"},
+                {"text": "❌ 취소", "callback_data": "hold_cancel"},
+            ]
+        ],
+        force=True,
+    )
+    _hold_session["step"] = "confirm"
+
+
+def _hold_register():
+    """최종 등록"""
+    s    = _hold_session
+    code = s.get("code", "")
+    avg  = s.get("avg_price", 0.0)
+    qty  = s.get("qty", 0)
+    name = s.get("name", code)
+    auto = _auto_params(avg)
+
+    sl_type = s.get("sl_type", "auto")
+    if sl_type == "auto":
+        sl_type = "pct"
+        sl_val  = auto["sl"]
+    else:
+        sl_val = s.get("sl_val", auto["sl"])
+
+    tp_type     = s.get("tp_type", "trail")
+    tp_val      = s.get("tp_val", None)
+    trail_start = s.get("trail_start", auto["trail_start"])
+    trail_gap   = s.get("trail_gap",   auto["trail_gap"])
+    be_pct      = s.get("be_pct", 0.0)
+
+    hold_positions[code] = {
+        "qty":         qty,
+        "avg_price":   avg,
+        "high_price":  avg,
+        "entry_date":  str(date.today()),
+        "sl_type":     sl_type,
+        "sl_val":      sl_val,
+        "tp_type":     tp_type,
+        "tp_val":      tp_val,
+        "trail_start": trail_start,
+        "trail_gap":   trail_gap,
+        "be_pct":      be_pct,
+        "be_active":   False,
+        "name":        name,
+    }
+    _save_state()
+    _hold_session.clear()
+
+    # 손절 요약
+    if sl_type == "pct":
+        sl_desc = f"{sl_val:+.1f}% ({avg*(1+sl_val/100):,.0f}원)"
+    else:
+        sl_desc = f"{sl_val:,.0f}원"
+
+    # 익절 요약
+    if tp_type in ("trail", "trail_be"):
+        tp_desc = f"트레일링 +{trail_start}%→고점-{trail_gap}%"
+        if tp_type == "trail_be":
+            tp_desc += f" + 본절+{be_pct}%"
+    elif tp_type == "pct":
+        tp_desc = f"+{tp_val}% ({avg*(1+tp_val/100):,.0f}원)"
+    else:
+        tp_desc = f"{tp_val:,.0f}원"
+
+    send_msg(
+        f"✅ 포지션 등록 완료!\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"종목: {name} ({code})\n"
+        f"매수가: {avg:,.0f}원 / {qty}주\n"
+        f"─────────────────\n"
+        f"손절: {sl_desc}\n"
+        f"익절: {tp_desc}\n"
+        f"─────────────────\n"
+        f"지금부터 자동 감시 시작! 🔍",
+        force=True,
+    )
+    cprint(f"[HOLD 등록] {name}({code}) {qty}주 @ {avg:,.0f}원", Fore.GREEN, bright=True)
+
+
+# ── 콜백 처리 ────────────────────────────────────────────
+
+def _handle_callback(data: str):
+    """인라인 버튼 콜백 전체 처리"""
+    s    = _hold_session
+    avg  = s.get("avg_price", 0.0)
+    auto = _auto_params(avg)
+
+    # 취소
+    if data == "hold_cancel":
+        _hold_session.clear()
+        send_msg("❌ 포지션 등록 취소됨", force=True)
+        return
+
+    # ── 손절 방식 ────────────────────────────────────────
+    if data == "hold_sl_auto":
+        s["sl_type"] = "auto"
+        _hold_step2_ask_tp()
+
+    elif data == "hold_sl_pct":
+        s["sl_type"] = "pct"
+        s["step"]    = "sl_val_pct"
+        send_msg(
+            f"📉 손절 비율 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"숫자만 입력하세요 (예: 5 → -5%)\n"
+            f"매수가 {avg:,.0f}원 기준\n"
+            f"  3% → {avg*0.97:,.0f}원\n"
+            f"  5% → {avg*0.95:,.0f}원\n"
+            f"  7% → {avg*0.93:,.0f}원",
+            force=True,
+        )
+
+    elif data == "hold_sl_price":
+        s["sl_type"] = "price"
+        s["step"]    = "sl_val_price"
+        send_msg(
+            f"💰 손절 가격 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"숫자만 입력하세요 (예: 48500)\n"
+            f"매수가: {avg:,.0f}원",
+            force=True,
+        )
+
+    # ── 익절 방식 ────────────────────────────────────────
+    elif data == "hold_tp_trail":
+        s["tp_type"]     = "trail"
+        s["trail_start"] = auto["trail_start"]
+        s["trail_gap"]   = auto["trail_gap"]
+        s["be_pct"]      = 0.0
+        s["step"]        = "trail_custom"
+        send_msg_kb(
+            f"📈 트레일링 스탑\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"고점을 추적하다가 X% 빠지면 자동 매도\n\n"
+            f"자동 기준: +{auto['trail_start']}% 후 고점-{auto['trail_gap']}%\n"
+            f"  ({avg:,.0f}원 기준 +{auto['trail_start']}% = {avg*(1+auto['trail_start']/100):,.0f}원)",
+            keyboard=[
+                [
+                    {"text": f"✅ 자동 (+{auto['trail_start']}% / -{auto['trail_gap']}%)",
+                     "callback_data": "hold_trail_auto"},
+                    {"text": "✏️ 직접 설정",
+                     "callback_data": "hold_trail_custom"},
+                ],
+                [{"text": "❌ 취소", "callback_data": "hold_cancel"}],
+            ],
+            force=True,
+        )
+
+    elif data == "hold_tp_pct":
+        s["tp_type"] = "pct"
+        s["step"]    = "tp_val_pct"
+        send_msg(
+            f"🎯 익절 비율 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"숫자만 입력하세요 (예: 3 → +3%)\n"
+            f"매수가 {avg:,.0f}원 기준\n"
+            f"  3% → {avg*1.03:,.0f}원\n"
+            f"  5% → {avg*1.05:,.0f}원\n"
+            f" 10% → {avg*1.10:,.0f}원",
+            force=True,
+        )
+
+    elif data == "hold_tp_price":
+        s["tp_type"] = "price"
+        s["step"]    = "tp_val_price"
+        send_msg(
+            f"💰 익절 가격 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"숫자만 입력하세요 (예: 55000)\n"
+            f"매수가: {avg:,.0f}원",
+            force=True,
+        )
+
+    elif data == "hold_tp_trail_be":
+        s["tp_type"]     = "trail_be"
+        s["trail_start"] = auto["trail_start"]
+        s["trail_gap"]   = auto["trail_gap"]
+        s["step"]        = "trail_be_custom"
+        send_msg_kb(
+            f"🔀 트레일링 + 본절 보호\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• 트레일링: 수익이 X% 나면 고점 추적 시작\n"
+            f"• 본절보호: 수익이 Y% 났다가 매수가 이하로 내려오면 즉시 매도\n\n"
+            f"자동 기준:\n"
+            f"  트레일링: +{auto['trail_start']}% 후 고점-{auto['trail_gap']}%\n"
+            f"  본절보호: +1.0% 이상 후 활성화",
+            keyboard=[
+                [
+                    {"text": f"✅ 자동 (트레일링+본절 1%)",
+                     "callback_data": "hold_trail_be_auto"},
+                    {"text": "✏️ 직접 설정",
+                     "callback_data": "hold_trail_be_custom"},
+                ],
+                [{"text": "❌ 취소", "callback_data": "hold_cancel"}],
+            ],
+            force=True,
+        )
+
+    # ── 트레일링 자동/직접 ───────────────────────────────
+    elif data == "hold_trail_auto":
+        _hold_step3_confirm()
+
+    elif data == "hold_trail_custom":
+        s["step"] = "trail_start_val"
+        send_msg(
+            f"✏️ 트레일링 시작 수익률 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"고점 추적을 시작할 수익률 (%)\n"
+            f"숫자만 입력 (예: 3 → +3%)\n"
+            f"추천: {auto['trail_start']}%",
+            force=True,
+        )
+
+    elif data == "hold_trail_be_auto":
+        s["be_pct"] = 1.0
+        _hold_step3_confirm()
+
+    elif data == "hold_trail_be_custom":
+        s["step"] = "be_val"
+        send_msg(
+            f"✏️ 본절 보호 기준 수익률 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"수익이 X% 이상 났을 때 본절 보호 ON\n"
+            f"숫자만 입력 (예: 1 → +1%)\n"
+            f"추천: 1.0%",
+            force=True,
+        )
+
+    # ── 최종 확인/등록 ───────────────────────────────────
+    elif data == "hold_confirm":
+        _hold_register()
+
+    # ── 즉시 매도 ────────────────────────────────────────
+    elif data.startswith("hold_sell_"):
+        code = data.replace("hold_sell_", "")
+        pos  = hold_positions.get(code)
+        if pos:
+            name = pos.get("name", code)
+            ok   = send_order(code, "SELL", pos["qty"], 0)
+            if ok:
+                pnl_krw = 0
+                info    = get_price_info(code)
+                if info and info.get("price", 0) > 0:
+                    pnl_krw = int((info["price"] - pos["avg_price"]) * pos["qty"])
+                _log_trade(code, "SELL", pos["qty"], info.get("price", 0) if info else 0,
+                           pnl=pnl_krw, reason="수동즉시매도")
+                del hold_positions[code]
+                _save_state()
+                send_msg(f"✅ [{name}] 즉시 매도 완료\n손익: {pnl_krw:+,}원", force=True)
+            else:
+                send_msg(f"❌ [{name}] 매도 주문 실패", force=True)
+
+    elif data.startswith("hold_del_"):
+        code = data.replace("hold_del_", "")
+        if code in hold_positions:
+            name = hold_positions[code].get("name", code)
+            del hold_positions[code]
+            _save_state()
+            send_msg(f"🗑 [{name}] 포지션 등록 삭제됨 (매도 없이)", force=True)
+
+
+# ── 텍스트 숫자 입력 처리 ────────────────────────────────
+
+def _hold_text_input(text: str):
+    """진행 중인 /hold 세션에서 숫자 텍스트 처리"""
+    s    = _hold_session
+    step = s.get("step", "")
+    avg  = s.get("avg_price", 0.0)
+    auto = _auto_params(avg)
+
+    try:
+        val = float(text.replace(",", "").replace("원", "").replace("%", "").strip())
+    except ValueError:
+        send_msg(f"⚠️ 숫자만 입력해 주세요\n입력값: {text}", force=True)
+        return
+
+    if step == "sl_val_pct":
+        s["sl_val"] = -abs(val)
+        _hold_step2_ask_tp()
+
+    elif step == "sl_val_price":
+        if val >= avg:
+            send_msg(
+                f"⚠️ 손절 가격이 매수가보다 높습니다\n"
+                f"손절가: {val:,.0f}원 / 매수가: {avg:,.0f}원\n"
+                f"다시 입력해 주세요.",
+                force=True,
+            )
+            return
+        s["sl_val"] = val
+        _hold_step2_ask_tp()
+
+    elif step == "tp_val_pct":
+        s["tp_val"] = abs(val)
+        _hold_step3_confirm()
+
+    elif step == "tp_val_price":
+        if val <= avg:
+            send_msg(
+                f"⚠️ 익절 가격이 매수가보다 낮습니다\n"
+                f"익절가: {val:,.0f}원 / 매수가: {avg:,.0f}원\n"
+                f"다시 입력해 주세요.",
+                force=True,
+            )
+            return
+        s["tp_val"] = val
+        _hold_step3_confirm()
+
+    elif step == "trail_start_val":
+        s["trail_start"] = abs(val)
+        s["step"]        = "trail_gap_val"
+        send_msg(
+            f"✏️ 트레일링 간격 입력\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"시작 수익률: +{abs(val):.1f}% ✅\n\n"
+            f"고점 대비 X% 빠지면 매도\n"
+            f"숫자만 입력 (예: 2 → 고점-2%)\n"
+            f"추천: {auto['trail_gap']}%",
+            force=True,
+        )
+
+    elif step == "trail_gap_val":
+        s["trail_gap"] = abs(val)
+        _hold_step3_confirm()
+
+    elif step == "be_val":
+        s["be_pct"]      = abs(val)
+        s["trail_start"] = auto["trail_start"]
+        s["trail_gap"]   = auto["trail_gap"]
+        s["step"]        = "be_trail_ask"
+        send_msg_kb(
+            f"✅ 본절 기준: +{abs(val):.1f}% 설정됨\n\n"
+            f"트레일링 기준은 어떻게 설정할까요?",
+            keyboard=[
+                [
+                    {"text": f"✅ 자동 (+{auto['trail_start']}% / -{auto['trail_gap']}%)",
+                     "callback_data": "hold_trail_be_auto"},
+                    {"text": "✏️ 직접 설정",
+                     "callback_data": "hold_trail_custom"},
+                ],
+            ],
+            force=True,
+        )
+
+    else:
+        send_msg("⚠️ 예상치 못한 입력입니다.\n/hold 로 다시 시작해 주세요.", force=True)
+        _hold_session.clear()
+
+
+# ── /hold 명령 처리 ──────────────────────────────────────
+
+def _cmd_hold(cmd: list):
+    """/hold  또는  /hold 종목코드 매수가 수량"""
+    if len(cmd) == 1:
+        _send_hold_list()
+        return
+
+    if len(cmd) < 4:
+        send_msg(
+            "📌 수동 포지션 등록\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "사용법: /hold 종목코드 매수가 수량\n\n"
+            "예시:\n"
+            "  /hold 005930 50000 10\n"
+            "  /hold 000660 120000 5\n\n"
+            "입력 후 버튼으로 손/익절 기준을 설정합니다.\n\n"
+            "/hold → 등록된 포지션 목록 보기",
+            force=True,
+        )
+        return
+
+    code = cmd[1].strip().upper()
+    try:
+        avg_price = float(cmd[2].replace(",", "").replace("원", ""))
+        qty       = int(cmd[3].replace(",", "").replace("주", ""))
+    except ValueError:
+        send_msg(
+            "⚠️ 입력 형식 오류\n"
+            "사용법: /hold 종목코드 매수가 수량\n"
+            "예: /hold 005930 50000 10",
+            force=True,
+        )
+        return
+
+    if avg_price <= 0 or qty <= 0:
+        send_msg("⚠️ 매수가와 수량은 0보다 커야 합니다.", force=True)
+        return
+
+    if avg_price < qty and qty > 50:
+        send_msg(
+            f"⚠️ 혹시 가격과 수량이 바뀐 건 아닌가요?\n"
+            f"입력값: 가격 {avg_price:,.0f}원 / 수량 {qty}주\n\n"
+            f"올바른 순서: /hold 종목코드 가격 수량\n"
+            f"예: /hold 005930 50000 10",
+            force=True,
+        )
+        return
+
+    send_msg(f"🔍 종목 조회 중... ({code})", force=True)
+    name = _get_stock_name(code)
+
+    _hold_session.clear()
+    _hold_session.update({
+        "code":      code,
+        "avg_price": avg_price,
+        "qty":       qty,
+        "name":      name,
+    })
+    _hold_step1_ask_sl()
+
+
+def _send_hold_list():
+    """수동 포지션 목록 + 관리 버튼"""
+    if not hold_positions:
+        send_msg(
+            "📋 등록된 수동 포지션 없음\n\n"
+            "/hold 종목코드 매수가 수량\n"
+            "으로 등록하세요.\n\n"
+            "예: /hold 005930 50000 10",
+            force=True,
+        )
+        return
+
+    lines = ["📋 수동 포지션 현황\n━━━━━━━━━━━━━━━━━━━━"]
+    kb    = []
+
+    for code, pos in list(hold_positions.items()):
+        name  = pos.get("name", code)
+        avg   = pos["avg_price"]
+        qty   = pos["qty"]
+        high  = pos.get("high_price", avg)
+        info  = get_price_info(code)
+        cur   = info.get("price", 0) if info else 0
+
+        if cur > 0:
+            pnl_pct = (cur - avg) / avg * 100
+            pnl_krw = int((cur - avg) * qty)
+            lines.append(
+                f"\n{name} ({code})\n"
+                f"  {qty}주 @ 매수 {avg:,.0f}원\n"
+                f"  현재 {cur:,.0f}원  {pnl_pct:+.1f}%  ({pnl_krw:+,}원)\n"
+                f"  고점: {high:,.0f}원"
+            )
+        else:
+            lines.append(f"\n{name} ({code})\n  {qty}주 @ {avg:,.0f}원")
+
+        # 손절 요약
+        if pos["sl_type"] == "pct":
+            sl_p = avg * (1 + pos["sl_val"] / 100)
+            lines.append(f"  손절: {pos['sl_val']:+.1f}% → {sl_p:,.0f}원")
+        else:
+            lines.append(f"  손절: {pos['sl_val']:,.0f}원")
+
+        # 익절 요약
+        tp_t = pos.get("tp_type", "trail")
+        if tp_t in ("trail", "trail_be"):
+            be_txt = f" + 본절+{pos['be_pct']}%" if tp_t == "trail_be" else ""
+            lines.append(f"  익절: 트레일링 +{pos['trail_start']}%→-{pos['trail_gap']}%{be_txt}")
+        elif tp_t == "pct":
+            tp_p = avg * (1 + pos["tp_val"] / 100)
+            lines.append(f"  익절: +{pos['tp_val']}% → {tp_p:,.0f}원")
+        else:
+            lines.append(f"  익절: {pos['tp_val']:,.0f}원")
+
+        kb.append([
+            {"text": f"🔴 {name} 즉시매도", "callback_data": f"hold_sell_{code}"},
+            {"text": "🗑 등록삭제",          "callback_data": f"hold_del_{code}"},
+        ])
+
+    send_msg_kb("\n".join(lines), keyboard=kb, force=True)
+
+
+# ── 수동 포지션 감시 루프 ─────────────────────────────────
+
+def monitor_hold_positions():
+    """수동 등록 포지션 감시 — 손절/익절/트레일링 자동 처리"""
+    if not hold_positions or not is_tradeable_time(for_buy=False):
+        return
+
+    for code in list(hold_positions.keys()):
+        pos  = hold_positions.get(code)
+        if not pos:
+            continue
+        info = get_price_info(code)
+        if not info or info.get("price", 0) <= 0:
+            continue
+
+        price   = info["price"]
+        avg     = pos["avg_price"]
+        high    = pos.get("high_price", avg)
+        name    = pos.get("name", code)
+        qty     = pos["qty"]
+        pnl_pct = (price - avg) / avg * 100 if avg > 0 else 0.0
+        pnl_krw = int((price - avg) * qty)
+
+        # 고점 갱신
+        if price > high:
+            hold_positions[code]["high_price"] = price
+            high = price
+
+        triggered = False
+        reason    = ""
+
+        # ── 손절 ─────────────────────────────────────────
+        if pos["sl_type"] == "pct":
+            sl_hit = pnl_pct <= pos["sl_val"]
+        else:
+            sl_hit = price <= pos["sl_val"]
+
+        if sl_hit:
+            triggered = True
+            reason    = "수동손절"
+            cprint(f"[HOLD 손절] {name} {pnl_pct:+.1f}%", Fore.RED, bright=True)
+            send_msg(
+                f"🔴 수동 포지션 손절\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"종목: {name} ({code})\n"
+                f"현재: {price:,}원  손익: {pnl_pct:+.1f}% ({pnl_krw:+,}원)",
+                force=True,
+            )
+
+        # ── 비율/가격 익절 ───────────────────────────────
+        elif pos["tp_type"] == "pct" and pnl_pct >= pos["tp_val"]:
+            triggered = True
+            reason    = "수동익절"
+            cprint(f"[HOLD 익절] {name} {pnl_pct:+.1f}%", Fore.GREEN, bright=True)
+            send_msg(
+                f"💰 수동 포지션 익절\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"종목: {name} ({code})\n"
+                f"현재: {price:,}원  손익: {pnl_pct:+.1f}% ({pnl_krw:+,}원)",
+                force=True,
+            )
+
+        elif pos["tp_type"] == "price" and price >= pos["tp_val"]:
+            triggered = True
+            reason    = "수동익절"
+            cprint(f"[HOLD 익절가] {name} {price:,}원", Fore.GREEN, bright=True)
+            send_msg(
+                f"💰 수동 포지션 익절\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"종목: {name} ({code})\n"
+                f"목표: {pos['tp_val']:,.0f}원 → 현재: {price:,}원\n"
+                f"손익: {pnl_pct:+.1f}% ({pnl_krw:+,}원)",
+                force=True,
+            )
+
+        # ── 트레일링 (+ 본절) ────────────────────────────
+        elif pos["tp_type"] in ("trail", "trail_be"):
+
+            # 본절 보호 활성화 체크
+            if pos["tp_type"] == "trail_be" and pos.get("be_pct", 0) > 0:
+                if pnl_pct >= pos["be_pct"] and not pos.get("be_active"):
+                    hold_positions[code]["be_active"] = True
+                    cprint(f"[HOLD 본절 ON] {name} +{pnl_pct:.1f}%", Fore.CYAN)
+
+                if pos.get("be_active") and price <= avg:
+                    triggered = True
+                    reason    = "수동본절"
+                    cprint(f"[HOLD 본절] {name} {pnl_pct:+.1f}%", Fore.YELLOW)
+                    send_msg(
+                        f"🛡 수동 포지션 본절 보호\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"종목: {name} ({code})\n"
+                        f"현재: {price:,}원  손익: {pnl_pct:+.1f}% ({pnl_krw:+,}원)",
+                        force=True,
+                    )
+
+            # 트레일링 스탑
+            if not triggered and pnl_pct >= pos["trail_start"]:
+                trail_price = high * (1 - pos["trail_gap"] / 100)
+                if price <= trail_price:
+                    triggered = True
+                    reason    = "수동트레일링"
+                    cprint(f"[HOLD 트레일링] {name} 고점:{high:,}→기준:{trail_price:,.0f} 현재:{price:,}", Fore.CYAN)
+                    send_msg(
+                        f"📉 수동 포지션 트레일링 스탑\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"종목: {name} ({code})\n"
+                        f"고점: {high:,}원 → 기준가: {trail_price:,.0f}원\n"
+                        f"현재: {price:,}원  손익: {pnl_pct:+.1f}% ({pnl_krw:+,}원)",
+                        force=True,
+                    )
+
+        # ── 매도 실행 ─────────────────────────────────────
+        if triggered:
+            ok = send_order(code, "SELL", qty, 0)  # 시장가
+            if ok:
+                _log_trade(code, "SELL", qty, price, pnl=pnl_krw, reason=reason)
+                del hold_positions[code]
+                _save_state()
+                cprint(f"[HOLD 매도완료] {name} {pnl_krw:+,}원", Fore.GREEN)
+            else:
+                send_msg(f"❌ [{name}] 매도 주문 실패 — 수동 확인 필요!", force=True)
 
 
 if __name__ == "__main__":
