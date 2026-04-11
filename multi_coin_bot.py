@@ -319,13 +319,16 @@ def send_order(side, market, qty_or_price):
         h = _upbit_headers(body)
         r = requests.post(f"{UPBIT_BASE}/orders", headers=h, json=body, timeout=10)
         if r.status_code in (200, 201):
-            return confirm_order(r.json().get("uuid", ""))
+            uuid = r.json().get("uuid", "")
+            cprint(f"[주문] {side} {market} uuid={uuid}", Fore.CYAN)
+            return confirm_order(uuid)
     except Exception as e:
         cprint(f"[주문 오류] {e}", Fore.RED)
     return 0, 0
 
-def confirm_order(uuid, retry=15):
-    """주문 체결 확인. done/cancel이면 반환, wait이면 재시도."""
+def confirm_order(uuid, retry=30):
+    """주문 체결 확인. done/cancel이면 반환, wait이면 재시도.
+    시장가 매수는 보통 즉시 체결되나 API 응답 지연 대비 30회(30초) 대기."""
     for i in range(retry):
         try:
             h = _upbit_headers()
@@ -339,13 +342,13 @@ def confirm_order(uuid, retry=15):
                 avg_p  = funds / filled if filled > 0 else 0
                 if state in ("done", "cancel"):
                     return filled, avg_p
-                # wait 상태지만 일부 체결된 경우 — 마지막 시도에서 반환
-                if state == "wait" and filled > 0 and i >= retry - 3:
+                # wait 상태지만 일부 체결 — 마지막 5회 안에서 반환
+                if state == "wait" and filled > 0 and i >= retry - 5:
                     cprint(f"[주문 부분체결] {uuid} filled={filled:.6f}", Fore.YELLOW)
                     return filled, avg_p
-        except Exception:
-            pass
-        time.sleep(0.5)
+        except Exception as e:
+            cprint(f"[체결 확인 오류] {e}", Fore.YELLOW)
+        time.sleep(1)
     return 0, 0
 
 def get_ohlcv(market, count=200, interval=None):
@@ -677,7 +680,11 @@ def do_buy(market, price, reason):
     filled, avg_p = send_order("BUY", market, order_krw)
     if filled <= 0 or avg_p <= 0:
         cprint(f"[매수 실패] {market} 주문 미체결 (filled={filled:.6f}, avg={avg_p:.2f})", Fore.RED)
-        send_msg(f"⚠️ {market} 매수 실패 — 체결 미확인", market=market, level="normal")
+        send_msg(
+            f"⚠️ {market} 매수 실패 — 체결 미확인\n"
+            f"업비트 앱에서 미체결 주문 확인 후 수동 처리 필요",
+            market=market, level="normal"
+        )
         return False
 
     c.update({
@@ -1275,7 +1282,10 @@ def handle_ipc():
         cmd    = data.get("cmd", "").strip()
         req_id = data.get("req_id", "")
         if cmd:
-            handle_command(cmd, req_id)
+            # API 호출이 포함될 수 있는 명령은 별도 스레드로 실행 (IPC 루프 블로킹 방지)
+            threading.Thread(
+                target=handle_command, args=(cmd, req_id), daemon=True, name="ipc-cmd"
+            ).start()
     except Exception as e:
         cprint(f"[IPC 처리 오류] {e}", Fore.YELLOW)
 
@@ -1366,57 +1376,89 @@ def handle_command(text, req_id=""):
         )
 
     elif cmd[0] == "/sync":
-        """업비트 실제 보유 잔고 → coins/slots 강제 동기화."""
+        """/sync       — 잔고 확인 후 적용 목록 보고 (dry-run)
+           /sync apply — 실제 적용"""
+        dry_run = not (len(cmd) >= 2 and cmd[1].lower() == "apply")
         try:
             h = _upbit_headers()
-            r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=5)
+            r = requests.get(f"{UPBIT_BASE}/accounts", headers=h, timeout=10)
             if r.status_code != 200:
                 _write_ipc_result("❌ 잔고 조회 실패", req_id)
                 return
             accounts = r.json()
-            synced = []
-            with coins_lock:
-                # 기존 slots 초기화
+
+            to_add    = []   # (market, balance, avg_buy)
+            to_remove = []   # market
+
+            # 현재 슬롯
+            with slots_lock:
+                old_slots = set(slots)
+
+            for a in accounts:
+                currency = a.get("currency", "")
+                if currency == "KRW":
+                    continue
+                market  = f"KRW-{currency}"
+                balance = float(a.get("balance", 0))
+                avg_buy = float(a.get("avg_buy_price", 0))
+
+                # 먼지 수량 필터: 평가금액 5,000원 미만이면 무시
+                if avg_buy <= 0 or balance * avg_buy < MIN_ORDER_KRW / 4:
+                    continue
+
+                to_add.append((market, balance, avg_buy))
+
+            synced_markets = {m for m, _, _ in to_add}
+            for market in old_slots:
+                if market not in synced_markets:
+                    to_remove.append(market)
+
+            # dry-run: 적용 목록만 보고
+            if dry_run:
+                lines = ["🔍 싱크 미리보기 (적용하려면 /sync apply)"]
+                if to_add:
+                    lines.append("➕ 추가될 종목:")
+                    for m, bal, avg in to_add:
+                        val = int(bal * avg)
+                        lines.append(f"  {m.replace('KRW-','')}: {bal:.6f}개 @ {avg:,.0f}원 (평가 {val:,}원)")
+                if to_remove:
+                    lines.append("➖ 제거될 종목:")
+                    for m in to_remove:
+                        lines.append(f"  {m.replace('KRW-','')}")
+                if not to_add and not to_remove:
+                    lines.append("변경사항 없음")
+                _write_ipc_result("\n".join(lines), req_id)
+                return
+
+            # apply: 실제 적용
+            for market, balance, avg_buy in to_add:
+                c = get_or_create_coin(market)
+                c["has_stock"]      = True
+                c["buy_price"]      = avg_buy
+                c["filled_qty"]     = balance
+                c["be_active"]      = False
+                c["highest_profit"] = 0.0
+                c["buy_time"]       = c.get("buy_time") or time.time()
                 with slots_lock:
-                    old_slots = set(slots)
-                # 실제 보유 코인 반영
-                for a in accounts:
-                    currency = a.get("currency", "")
-                    if currency == "KRW":
-                        continue
-                    market = f"KRW-{currency}"
-                    balance = float(a.get("balance", 0))
-                    avg_buy = float(a.get("avg_buy_price", 0))
-                    if balance <= 0 or avg_buy <= 0:
-                        continue
-                    # coins에 반영
-                    c = get_or_create_coin(market)
-                    c["has_stock"]     = True
-                    c["buy_price"]     = avg_buy
-                    c["filled_qty"]    = balance
-                    c["be_active"]     = False
-                    c["highest_profit"] = 0.0
-                    c["buy_time"]      = c.get("buy_time") or time.time()
-                    # slots에 반영
-                    with slots_lock:
-                        slots.add(market)
-                    synced.append(f"{currency}: {balance:.6f} @ {avg_buy:,.2f}원")
-                # 실제 없는데 slots에 있는 것 제거
-                for market in list(old_slots):
-                    found = any(f"KRW-{a.get('currency')}" == market
-                                and float(a.get("balance", 0)) > 0
-                                for a in accounts)
-                    if not found:
-                        with slots_lock:
-                            slots.discard(market)
-                        c = coins.get(market)
-                        if c:
-                            c["has_stock"] = False
-            if synced:
-                _write_ipc_result(f"✅ 동기화 완료\n" + "\n".join(synced), req_id)
-            else:
-                _write_ipc_result("✅ 동기화 완료 — 보유 코인 없음", req_id)
+                    slots.add(market)
+
+            for market in to_remove:
+                with slots_lock:
+                    slots.discard(market)
+                c = coins.get(market)
+                if c:
+                    c["has_stock"] = False
+
+            lines = ["✅ 동기화 완료"]
+            for m, bal, avg in to_add:
+                lines.append(f"  {m.replace('KRW-','')}: {bal:.6f}개 @ {avg:,.0f}원")
+            for m in to_remove:
+                lines.append(f"  {m.replace('KRW-','')} 제거")
+            if not to_add and not to_remove:
+                lines.append("보유 코인 없음")
+            _write_ipc_result("\n".join(lines), req_id)
             _write_status()
+
         except Exception as e:
             _write_ipc_result(f"❌ 동기화 오류: {e}", req_id)
 
@@ -1659,6 +1701,7 @@ def handle_command(text, req_id=""):
         _write_ipc_result("\n".join(lines), req_id)
 
 
+def _send_hourly_report():
     """1시간마다 텔레그램에 현황 보고."""
     import time as _t
     try:

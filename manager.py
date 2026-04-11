@@ -423,7 +423,8 @@ KB_COIN_BOT = [
     [{"text": "📈 추세후보",    "callback_data": "/bot_cmd multicoin trend"},
      {"text": "📋 감시종목",    "callback_data": "/bot_cmd multicoin watchlist"},
      {"text": "🔍 분석",        "callback_data": "/analyze_menu"}],
-    [{"text": "◀️ 메인",        "callback_data": "/menu"}],
+    [{"text": "🔄 잔고싱크",    "callback_data": "/bot_cmd multicoin sync"},
+     {"text": "◀️ 메인",        "callback_data": "/menu"}],
 ]
 
 # 섹터봇 메뉴
@@ -1583,9 +1584,9 @@ def _handle_command_inner(text):
         import uuid as _uuid
         target  = cmd[1]
         sub_cmd = "/" + " ".join(cmd[2:])
-        slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly", "/train")
+        slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly", "/train", "/sync")
         no_kb_cmds = ("/aggressive", "/normal", "/paper", "/test", "/reload", "/s start", "/stop", "/pause")
-        timeout = 20.0 if sub_cmd.startswith("/balance") else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
+        timeout = 20.0 if sub_cmd.startswith(("/balance", "/sync")) else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
         use_kb = not any(sub_cmd.startswith(c) for c in no_kb_cmds)
         req_id  = _uuid.uuid4().hex[:8]
         workers_snap = list(_workers)
@@ -2293,9 +2294,9 @@ def _forward_to_bot(target, sub_cmd_str):
     """코인봇(/c) 또는 주식봇(/s) 으로 명령 전달."""
     import uuid as _uuid
     sub_cmd = "/" + sub_cmd_str
-    slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly")
+    slow_cmds = ("/analyze", "/why", "/s status", "/balance", "/report", "/weekly", "/sync")
     no_kb_cmds = ("/aggressive", "/normal", "/test", "/reload", "/s start", "/stop", "/pause")
-    timeout = 20.0 if sub_cmd.startswith("/balance") else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
+    timeout = 20.0 if sub_cmd.startswith(("/balance", "/sync")) else 12.0 if any(sub_cmd.startswith(c) for c in slow_cmds) else 5.0
     use_kb = not any(sub_cmd.startswith(c) for c in no_kb_cmds)
     req_id = _uuid.uuid4().hex[:8]
     workers_snap = list(_workers)

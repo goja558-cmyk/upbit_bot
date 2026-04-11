@@ -480,7 +480,7 @@ def _write_sector_status():
         cprint(f"[status_sector 오류] {e}", Fore.YELLOW)
 
 
-
+def _ipc_send_status():
     global peak_value
     val  = _calc_portfolio_value()
     cash = get_cash_balance()
