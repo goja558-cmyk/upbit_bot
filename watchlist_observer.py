@@ -41,6 +41,13 @@ FIELDS = [
     "state",
 ]
 
+# Expanded individual-stock watchlist; observation only, no order endpoint.
+WATCHLIST.update({
+    "005930": "Samsung Electronics", "000660": "SK hynix", "005380": "Hyundai Motor",
+    "329180": "HD Hyundai Heavy Industries", "012450": "Hanwha Aerospace",
+    "010120": "LS ELECTRIC", "068270": "Celltrion", "035420": "NAVER",
+})
+
 
 def _default_config() -> dict:
     return {
@@ -286,6 +293,25 @@ def _telegram(text: str, cfg: dict) -> None:
         raise RuntimeError(f"텔레그램 HTTP {r.status_code}: {r.text[:200]}")
 
 
+def _send_trend_transitions(rows: list[dict], cfg: dict, previous: dict[str, str]) -> None:
+    """Send one Telegram message per stock only when its trend state changes."""
+    for row in rows:
+        code = row["code"]
+        current = row.get("state", "")
+        old = previous.get(code)
+        previous[code] = current
+        if old is None or old == current:
+            continue
+        icon = "📈" if row.get("since_last_pct", 0) >= 0 else "⚠️"
+        _telegram(
+            f"{icon} [{row['name']} {code}] 추세 전환\n"
+            f"이전: {old}\n현재: {current}\n"
+            f"현재가: {int(row['price']):,}원 ({row['change_pct']:+.2f}%)\n"
+            f"직전 1분: {row['since_last_pct']:+.2f}%\n시각: {row['timestamp']}",
+            cfg,
+        )
+
+
 def _kis_holdings(cfg: dict, token: str) -> dict | None:
     """KIS 잔고를 읽기 전용으로 조회한다. 주문 API는 호출하지 않는다."""
     account = str(cfg.get("account_no", cfg.get("account_number", ""))).replace("-", "").strip()
@@ -355,11 +381,16 @@ def main() -> None:
         return
     last_daily_refresh = None
     last_report = 0.0
+    last_midnight_summary_day = None
+    trend_states: dict[str, str] = {}
     print("관찰 수집기 시작: 주문 API 미사용 / Ctrl+C로 종료")
     while True:
         now = now_kst()
         session, interval = session_at(now, observer_cfg)
         try:
+            if now.hour == 0 and last_midnight_summary_day != now.date():
+                emit_daily_summary(now.date() - timedelta(days=1), cfg, observer_cfg)
+                last_midnight_summary_day = now.date()
             if last_daily_refresh != now.date() and now.time() >= dt_time(15, 35):
                 refresh_daily_cache(token, cfg)
                 emit_daily_summary(now.date(), cfg, observer_cfg)
@@ -367,7 +398,10 @@ def main() -> None:
             if session != "closed":
                 rows = capture(token, cfg, session)
                 print(f"[{now.strftime('%H:%M:%S')}] {session} " + " | ".join(f"{r['name']} {r['price']:,}" for r in rows))
-                holdings = _kis_holdings(cfg, token)
+                _send_trend_transitions(rows, cfg, trend_states)
+                # Disable the legacy holdings-based digest below; trend alerts are event-driven.
+                last_report = time.time()
+                holdings = None  # No holdings API call for the observe-only trend notifier.
                 if holdings is not None:
                     interval = 900 if holdings else 21600
                     if time.time() - last_report >= interval:

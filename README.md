@@ -72,10 +72,12 @@ first API/strategy sanity check, not as evidence for live trading.
 
 ## Four-stock observer (no orders)
 
-`watchlist_observer.py` observes Dongjin Semichem, Silicon2, Classys, and JYP
-Ent. It has no order endpoint or automatic trading function. It records
-one-minute snapshots from 10:00 to 14:20 KST and five-minute snapshots near
-the open and close. Raw files are kept in `data/watchlist_observer/`.
+`watchlist_observer.py` observes 12 individual Korean stocks. It has no order
+endpoint or automatic trading function. It records one-minute snapshots from
+10:00 to 14:20 KST and five-minute snapshots near the open and close. Telegram
+sends one message per stock when its trend state changes, with no six-hour
+digest. At midnight it sends the previous day's summary. Raw files are kept in
+`data/watchlist_observer/`.
 
 ```bash
 python3 watchlist_observer.py --once
