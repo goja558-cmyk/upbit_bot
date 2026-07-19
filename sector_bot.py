@@ -3356,6 +3356,7 @@ def main():
             _save_state()
             break
         except Exception as e:
+            _telegram_logger.exception("main loop exception: %s", e)
             cprint(f"[메인 루프 오류] {e}", Fore.RED)
             traceback.print_exc()
             now_err = time.time()

@@ -13,3 +13,10 @@
 - 수정 내용: Telegram 전송 시도·성공·실패와 HTTP 응답을 `logs/sector/telegram.log`, `logs/manager_telegram.log`에 기록한다.
 - 영향: 주식 봇 알림 누락 시 전송 경로와 실패 원인을 확인할 수 있다.
 - 검증: Python 구문 검증 완료.
+
+## 2026-07-20 (follow-up)
+
+- 변경 파일: `sector_bot.py`
+- 수정 내용: 메인 루프 예외를 `logs/sector/telegram.log`에 기록한다.
+- 영향: 주식 봇이 반복 실행 중 멈추거나 알림 경로를 건너뛴 원인을 확인할 수 있다.
+- 검증: Python 구문 검증 완료.
