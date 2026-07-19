@@ -318,6 +318,12 @@ def main() -> None:
         ap.error("--once, --daemon, --refresh-daily, --daily-summary 중 하나가 필요합니다.")
     observer_cfg = load_config()  # 사용자가 수동 보유수량을 적을 기본 YAML을 만든다.
     cfg, token = _load_cfg(), _token(_load_cfg())
+    if args.daemon:
+        try:
+            _telegram("✅ 주식 감시 봇 정상 작동 중\n시장 관찰을 시작했습니다.", cfg)
+            print("텔레그램 시작 알림 전송 완료")
+        except Exception as exc:
+            print(f"[텔레그램 시작 알림 오류] {exc}")
     if args.refresh_daily:
         refresh_daily_cache(token, cfg)
         print("일봉 캐시 갱신 완료")
