@@ -21,11 +21,14 @@ MANAGER_VERSION = "2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_FILE = os.path.join(BASE_DIR, "manager_cfg.yaml")
 SHARED_DIR = os.path.join(BASE_DIR, "shared")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+TELEGRAM_LOG_FILE = os.path.join(LOG_DIR, "manager_telegram.log")
 PID_FILE = os.path.join(SHARED_DIR, "manager.pid")
 OFFSET_FILE = os.path.join(SHARED_DIR, "manager_tg_offset.json")
 STATUS_FILE = os.path.join(SHARED_DIR, "status_sector.json")
 CMD_FILE = os.path.join(SHARED_DIR, "cmd_stock.json")
 os.makedirs(SHARED_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 TELEGRAM_TOKEN = ""
 CHAT_ID = ""
@@ -98,10 +101,13 @@ def telegram(method, *, timeout=8, **payload):
 
 
 def send_message(text, keyboard=None):
+    cprint(f"Telegram send attempt chars={len(text)}")
     payload = {"chat_id": CHAT_ID, "text": text[:4000]}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
-    telegram("sendMessage", **payload)
+    result = telegram("sendMessage", **payload)
+    with open(TELEGRAM_LOG_FILE, "a", encoding="utf-8") as log:
+        log.write(f"{datetime.now().isoformat()} {'success' if result else 'failed'} chars={len(text)}\n")
 
 
 def stock_keyboard():

@@ -31,6 +31,7 @@ BOT_NAME    = "섹터로테이션봇"
 BOT_TAG     = "📊 섹터"
 
 import os, sys, time, json, yaml, requests, threading, math, traceback, csv
+import logging
 from datetime import datetime, date, timedelta
 from colorama import Fore, Style, init as colorama_init
 
@@ -45,10 +46,18 @@ LOG_FILE      = os.path.join(BASE_DIR, "sector_trade_log.csv")
 STATE_FILE    = os.path.join(BASE_DIR, "sector_state.json")
 SHARED_DIR    = os.path.join(BASE_DIR, "shared")
 LOG_DIR       = os.path.join(BASE_DIR, "logs", "sector")
+TELEGRAM_LOG_FILE = os.path.join(LOG_DIR, "telegram.log")
 MARKET_LOG_DIR = os.path.join(LOG_DIR, "market_snapshots")
 os.makedirs(SHARED_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MARKET_LOG_DIR, exist_ok=True)
+
+_telegram_logger = logging.getLogger("sector_bot.telegram")
+_telegram_logger.setLevel(logging.INFO)
+if not _telegram_logger.handlers:
+    _telegram_handler = logging.FileHandler(TELEGRAM_LOG_FILE, encoding="utf-8")
+    _telegram_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _telegram_logger.addHandler(_telegram_handler)
 
 
 def cprint(msg, color=Fore.WHITE, bright=False):
@@ -824,6 +833,7 @@ def _acnt():
 # [7] 텔레그램
 # ============================================================
 def send_msg(text, force=False):
+    _telegram_logger.info("send attempt force=%s chars=%d", force, len(text))
     if not TELEGRAM_TOKEN or not CHAT_ID:
         cprint(f"[TG 미설정] {text[:80]}", Fore.YELLOW)
         return
@@ -840,7 +850,9 @@ def send_msg(text, force=False):
                     timeout=5,
                 )
                 if res.status_code == 200:
+                    _telegram_logger.info("send success status=%s", res.status_code)
                     return
+                _telegram_logger.error("send failed status=%s response=%s", res.status_code, res.text[:300])
             except Exception as e:
                 cprint(f"[TG 오류] {e}", Fore.YELLOW)
             time.sleep(1)
@@ -848,6 +860,7 @@ def send_msg(text, force=False):
 
 def send_msg_kb(text: str, keyboard: list = None, force: bool = False) -> int:
     """인라인 키보드 포함 메시지 전송. keyboard=None 이면 send_msg 동일."""
+    _telegram_logger.info("send attempt keyboard=%s force=%s chars=%d", bool(keyboard), force, len(text))
     if not TELEGRAM_TOKEN or not CHAT_ID:
         cprint(f"[TG 미설정] {text[:80]}", Fore.YELLOW)
         return 0
@@ -866,7 +879,9 @@ def send_msg_kb(text: str, keyboard: list = None, force: bool = False) -> int:
                     json=payload, timeout=5,
                 )
                 if res.status_code == 200:
+                    _telegram_logger.info("send success status=%s", res.status_code)
                     return res.json().get("result", {}).get("message_id", 0)
+                _telegram_logger.error("send failed status=%s response=%s", res.status_code, res.text[:300])
             except Exception as e:
                 cprint(f"[TG 오류] {e}", Fore.YELLOW)
             time.sleep(1)
