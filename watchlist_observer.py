@@ -286,6 +286,23 @@ def _telegram(text: str, cfg: dict) -> None:
         raise RuntimeError(f"텔레그램 HTTP {r.status_code}: {r.text[:200]}")
 
 
+def _kis_holdings(cfg: dict, token: str) -> dict | None:
+    """KIS 잔고를 읽기 전용으로 조회한다. 주문 API는 호출하지 않는다."""
+    account = str(cfg.get("account_no", cfg.get("account_number", ""))).replace("-", "").strip()
+    product = str(cfg.get("account_product_code", "01")).strip()
+    if len(account) < 8 or not cfg.get("app_key") or not cfg.get("app_secret"):
+        return None
+    headers = {"content-type": "application/json; charset=utf-8", "authorization": f"Bearer {token}",
+               "appkey": cfg["app_key"], "appsecret": cfg["app_secret"], "tr_id": "VTTC8434R"}
+    params = {"CANO": account[:8], "ACNT_PRDT_CD": product, "AFHR_FLPR_YN": "N", "OFL_YN": "",
+              "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
+              "PRCS_DVSN": "01", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+    r = requests.get("https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance",
+                     headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    return {x.get("pdno", ""): x for x in (r.json().get("output1") or []) if int(x.get("hldg_qty", 0) or 0) > 0}
+
+
 def emit_daily_summary(day: date, cfg: dict, observer_cfg: dict, *, force_send: bool = False) -> None:
     # 주말·공휴일에는 장중 스냅샷 자체가 없으므로 빈 요약/텔레그램을 만들지 않는다.
     if not any(r.get("session") != "closed" for r in _snapshots_for(day)):
@@ -337,6 +354,7 @@ def main() -> None:
             print(f"{row['name']} {row['price']:,}원 {row['change_pct']:+.2f}% {row['state']}")
         return
     last_daily_refresh = None
+    last_report = 0.0
     print("관찰 수집기 시작: 주문 API 미사용 / Ctrl+C로 종료")
     while True:
         now = now_kst()
@@ -349,6 +367,13 @@ def main() -> None:
             if session != "closed":
                 rows = capture(token, cfg, session)
                 print(f"[{now.strftime('%H:%M:%S')}] {session} " + " | ".join(f"{r['name']} {r['price']:,}" for r in rows))
+                holdings = _kis_holdings(cfg, token)
+                if holdings is not None:
+                    interval = 900 if holdings else 21600
+                    if time.time() - last_report >= interval:
+                        direction = " / ".join(f"{r['name']} {r['change_pct']:+.2f}%" for r in rows)
+                        _telegram(f"📈 주식 추이 ({now.strftime('%Y-%m-%d %H:%M:%S KST')})\n보유: {len(holdings)}종목\n{direction}", cfg)
+                        last_report = time.time()
         except KeyboardInterrupt:
             raise
         except Exception as exc:
