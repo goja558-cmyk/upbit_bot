@@ -32,7 +32,7 @@ KST = ZoneInfo("Asia/Seoul")
 API_URL = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-price"
 
 WATCHLIST = {
-    "005290": "동진쎄미켐", "257720": "실리콘투", "214150": "클래시스", "035900": "JYP Ent.",
+    "005290": "동진쎄미켐", "257720": "실리콘투", "214150": "클래시스", "035900": "JYP엔터테인먼트",
 }
 FIELDS = [
     "timestamp", "session", "code", "name", "price", "prev_close", "change_pct", "open", "high", "low",
@@ -43,9 +43,9 @@ FIELDS = [
 
 # Expanded individual-stock watchlist; observation only, no order endpoint.
 WATCHLIST.update({
-    "005930": "Samsung Electronics", "000660": "SK hynix", "005380": "Hyundai Motor",
-    "329180": "HD Hyundai Heavy Industries", "012450": "Hanwha Aerospace",
-    "010120": "LS ELECTRIC", "068270": "Celltrion", "035420": "NAVER",
+    "005930": "삼성전자", "000660": "SK하이닉스", "005380": "현대차",
+    "329180": "HD현대중공업", "012450": "한화에어로스페이스",
+    "010120": "LS ELECTRIC", "068270": "셀트리온", "035420": "NAVER",
 })
 
 
